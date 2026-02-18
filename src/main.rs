@@ -12,7 +12,9 @@ use axum::{
     Router,
 };
 use config::Config;
-use exchanges::{hyperliquid::HyperliquidExchange, registry::ExchangeRegistry};
+use exchanges::{
+    binance::BinanceExchange, hyperliquid::HyperliquidExchange, registry::ExchangeRegistry,
+};
 use tokio::signal;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::{info, Level};
@@ -26,6 +28,7 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::from_env().context("failed to load configuration")?;
 
     let mut registry = ExchangeRegistry::new();
+    registry.register(Arc::new(BinanceExchange::new(config.request_timeout_ms)?));
     registry.register(Arc::new(HyperliquidExchange::new(
         config.hyperliquid_base_url.clone(),
         config.request_timeout_ms,
