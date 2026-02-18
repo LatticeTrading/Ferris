@@ -20,9 +20,9 @@ WORKDIR /app
 COPY --from=builder /app/target/release/ferris-market-data-backend /usr/local/bin/ferris-market-data-backend
 
 ENV HOST=0.0.0.0
-ENV PORT=8080
+ENV PORT=8787
 
-EXPOSE 8080
+EXPOSE 8787
 
 USER app
 

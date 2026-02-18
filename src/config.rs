@@ -23,7 +23,7 @@ impl Config {
                 .trim()
                 .parse::<u16>()
                 .with_context(|| format!("invalid PORT value: {value}"))?,
-            Err(_) => 8080,
+            Err(_) => 8787,
         };
 
         let hyperliquid_base_url = std::env::var("HYPERLIQUID_BASE_URL")

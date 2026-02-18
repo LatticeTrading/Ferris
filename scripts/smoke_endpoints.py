@@ -163,7 +163,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Smoke test Ferris market-data endpoints against a running server."
     )
-    parser.add_argument("--base-url", default="http://127.0.0.1:8080")
+    parser.add_argument("--base-url", default="http://127.0.0.1:8787")
     parser.add_argument("--exchange", default="hyperliquid")
     parser.add_argument("--symbol", default="BTC/USDC:USDC")
     parser.add_argument("--timeout", type=int, default=20)

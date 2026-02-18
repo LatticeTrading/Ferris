@@ -2,6 +2,8 @@
 
 Open-source Rust backend that gives your frontend a CCXT-like way to query exchange data.
 
+Planning and delivery tracking lives in `ROADMAP.md`.
+
 This first version focuses on:
 
 - unified endpoint shapes (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`)
@@ -153,19 +155,59 @@ cargo run
 Defaults:
 
 - host: `0.0.0.0`
-- port: `8080`
+- port: `8787`
 - Hyperliquid base URL: `https://api.hyperliquid.xyz`
 
 ## Environment variables
 
 - `HOST` (default: `0.0.0.0`)
-- `PORT` (default: `8080`)
+- `PORT` (default: `8787`)
 - `HYPERLIQUID_BASE_URL` (default: `https://api.hyperliquid.xyz`)
 - `REQUEST_TIMEOUT_MS` (default: `10000`)
 - `TRADE_CACHE_CAPACITY_PER_COIN` (default: `5000`)
 - `TRADE_CACHE_RETENTION_MS` (default: `86400000`)
 - `TRADE_COLLECTOR_ENABLED` (default: `true`)
 - `RUST_LOG` (default: `info`)
+
+## Terminal stream viewers
+
+These helpers are separate from the main server runtime and are meant for quick manual checks against a running backend.
+
+Trades stream (prints only newly seen trades each poll):
+
+```bash
+cargo run --bin market_stream -- trades --symbol BTC/USDC:USDC --poll-ms 500
+```
+
+Order book stream (lightweight terminal redraw):
+
+```bash
+cargo run --bin market_stream -- orderbook --symbol BTC/USDC:USDC --levels 10 --poll-ms 800
+```
+
+Websocket order book stream (instant event-driven updates, no polling):
+
+```bash
+cargo run --bin market_stream -- orderbook --transport ws --coin BTC --render-ms 16
+```
+
+Websocket trades stream (instant event-driven updates, no polling):
+
+```bash
+cargo run --bin market_stream -- trades --transport ws --coin BTC
+```
+
+Useful optional flags:
+
+- `--base-url` (default `http://127.0.0.1:8787`)
+- `--exchange` (default `hyperliquid`)
+- `--transport` (`poll` or `ws`, default `poll`)
+- `--ws-url` (default `wss://api.hyperliquid.xyz/ws`)
+- `--coin` (optional websocket coin override)
+- `--duration-secs` (stop automatically after N seconds)
+- `--iterations` (stop after N iterations)
+
+`--transport ws` currently targets Hyperliquid directly and is useful for socket-focused terminal testing; `--transport poll` continues to test your backend HTTP endpoints.
 
 ## Testing against a running server
 
@@ -174,19 +216,19 @@ These checks assume the backend is already running.
 Quick smoke test script:
 
 ```bash
-python scripts/smoke_endpoints.py --base-url http://127.0.0.1:8080
+python scripts/smoke_endpoints.py --base-url http://127.0.0.1:8787
 ```
 
 PowerShell-native smoke test (recommended on pure Windows):
 
 ```powershell
-./scripts/smoke_endpoints.ps1 -BaseUrl http://127.0.0.1:8080
+./scripts/smoke_endpoints.ps1 -BaseUrl http://127.0.0.1:8787
 ```
 
 To print sample returned data (not just pass/fail checks):
 
 ```powershell
-./scripts/smoke_endpoints.ps1 -BaseUrl http://127.0.0.1:8080 -ShowData
+./scripts/smoke_endpoints.ps1 -BaseUrl http://127.0.0.1:8787 -ShowData
 ```
 
 By default it waits up to 90 seconds for `/healthz` so you can run it while the backend is still compiling/starting.
@@ -194,7 +236,7 @@ By default it waits up to 90 seconds for `/healthz` so you can run it while the 
 If you want to disable waiting:
 
 ```bash
-python scripts/smoke_endpoints.py --base-url http://127.0.0.1:8080 --wait-seconds 0
+python scripts/smoke_endpoints.py --base-url http://127.0.0.1:8787 --wait-seconds 0
 ```
 
 Optional overrides:
@@ -207,26 +249,26 @@ If you get `HTTP 404` on `/healthz`, you are likely hitting a different process 
 PowerShell quick fix (use a different port):
 
 ```powershell
-$env:PORT = "18080"
+$env:PORT = "8788"
 cargo run
 ```
 
 If you prefer `cmd.exe`, use quoted `set` syntax to avoid trailing-space env values:
 
 ```cmd
-cmd /c "set \"PORT=18080\" && cargo run"
+cmd /c "set \"PORT=8788\" && cargo run"
 ```
 
 Then test:
 
 ```powershell
-python scripts/smoke_endpoints.py --base-url http://127.0.0.1:18080
+python scripts/smoke_endpoints.py --base-url http://127.0.0.1:8788
 ```
 
-To find who already owns port 8080 on Windows:
+To find who already owns port 8787 on Windows:
 
 ```powershell
-netstat -ano | findstr :8080
+netstat -ano | findstr :8787
 tasklist /FI "PID eq <PID_FROM_NETSTAT>"
 ```
 
@@ -239,7 +281,7 @@ cargo test --test live_endpoints -- --ignored
 You can override target server and test market with env vars:
 
 ```bash
-FERRIS_BASE_URL=http://127.0.0.1:8080 FERRIS_TEST_SYMBOL=ETH/USDC:USDC cargo test --test live_endpoints -- --ignored
+FERRIS_BASE_URL=http://127.0.0.1:8787 FERRIS_TEST_SYMBOL=ETH/USDC:USDC cargo test --test live_endpoints -- --ignored
 ```
 
 ## Docker
@@ -253,7 +295,7 @@ docker build -t ferris-market-data-backend .
 Run:
 
 ```bash
-docker run --rm -p 8080:8080 ferris-market-data-backend
+docker run --rm -p 8787:8787 ferris-market-data-backend
 ```
 
 ## Adding new exchanges

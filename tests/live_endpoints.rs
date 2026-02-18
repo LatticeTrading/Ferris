@@ -8,7 +8,7 @@ fn env_or_default(key: &str, default: &str) -> String {
 }
 
 fn base_url() -> String {
-    env_or_default("FERRIS_BASE_URL", "http://127.0.0.1:8080")
+    env_or_default("FERRIS_BASE_URL", "http://127.0.0.1:8787")
 }
 
 fn exchange() -> String {

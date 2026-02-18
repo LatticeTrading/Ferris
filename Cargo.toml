@@ -2,6 +2,7 @@
 name = "ferris-market-data-backend"
 version = "0.1.0"
 edition = "2021"
+default-run = "ferris-market-data-backend"
 
 [dependencies]
 anyhow = "1.0.100"
@@ -18,3 +19,4 @@ tower-http = { version = "0.6.6", features = ["cors", "trace"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
 futures-util = "0.3.32"
+crossterm = "0.28.1"
