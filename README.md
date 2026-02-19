@@ -176,7 +176,7 @@ Defaults:
 
 These helpers are separate from the main server runtime and are meant for quick manual checks against a running backend.
 
-Note: `market_stream` currently has `trades` and `orderbook` modes only. OHLCV is available through `POST /v1/fetchOHLCV`.
+`market_stream` supports `trades`, `orderbook`, and `ohlcv` modes.
 
 Trades stream (prints only newly seen trades each poll):
 
@@ -214,17 +214,25 @@ Websocket order book stream for Bybit:
 cargo run --bin market_stream -- orderbook --exchange bybit --transport ws --coin BTC --render-ms 16
 ```
 
+OHLCV stream (simple live candle chart in terminal):
+
+```bash
+cargo run --bin market_stream -- ohlcv --exchange bybit --coin BTC --timeframe 1m
+```
+
 Useful optional flags:
 
 - `--base-url` (default `http://127.0.0.1:8787`)
 - `--exchange` (default `hyperliquid`)
-- `--transport` (`poll` or `ws`, default `ws`)
+- `--transport` (`poll` or `ws`, default `ws`, except `ohlcv` defaults to `poll`)
 - `--ws-url` (default depends on `--exchange`)
 - `--coin` (optional websocket coin override)
+- `--timeframe` (OHLCV timeframe, default `1m`)
+- `--chart-height` (OHLCV chart rows, default `16`)
 - `--duration-secs` (stop automatically after N seconds)
 - `--iterations` (stop after N iterations)
 
-`--transport ws` supports `trades` for `hyperliquid`, `binance`, and `bybit`, and supports `orderbook` for `hyperliquid`, `binance`, and `bybit`; `--transport poll` continues to test your backend HTTP endpoints.
+`--transport ws` supports `trades` for `hyperliquid`, `binance`, and `bybit`, and supports `orderbook` for `hyperliquid`, `binance`, and `bybit`; `ohlcv` currently uses HTTP polling (and falls back to poll if `--transport ws` is selected).
 
 ## Testing against a running server
 

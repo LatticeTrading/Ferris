@@ -29,6 +29,13 @@ const DEFAULT_TRADE_LIMIT: usize = 25;
 const DEFAULT_ORDERBOOK_LEVELS: usize = 10;
 const MIN_ORDERBOOK_LEVELS: usize = 10;
 const DEFAULT_ORDERBOOK_RENDER_MS: u64 = 33;
+const DEFAULT_OHLCV_TIMEFRAME: &str = "1m";
+const DEFAULT_OHLCV_LIMIT: usize = 120;
+const DEFAULT_OHLCV_RENDER_MS: u64 = 250;
+const DEFAULT_OHLCV_CHART_HEIGHT: usize = 16;
+const MIN_OHLCV_CHART_HEIGHT: usize = 6;
+const MAX_OHLCV_CHART_HEIGHT: usize = 40;
+const MAX_OHLCV_CHART_CANDLES: usize = 120;
 const DEFAULT_HYPERLIQUID_WS_URL: &str = "wss://api.hyperliquid.xyz/ws";
 const DEFAULT_BINANCE_FUTURES_WS_URL: &str = "wss://fstream.binance.com/ws";
 const DEFAULT_BYBIT_LINEAR_WS_URL: &str = "wss://stream.bybit.com/v5/public/linear";
@@ -41,14 +48,15 @@ const USAGE: &str = r#"Usage:
 Modes:
   trades       Print only newly seen trades on each update
   orderbook    Render a lightweight in-terminal order book snapshot
+  ohlcv        Render a lightweight in-terminal live candle chart
 
 Common options:
   --base-url <url>         Backend base URL (default: http://127.0.0.1:8787)
   --exchange <id>          Exchange id (default: hyperliquid)
   --symbol <symbol>        Market symbol (default: BTC/USDC:USDC)
-  --transport <mode>       Data transport: poll|ws (default: ws)
+  --transport <mode>       Data transport: poll|ws (default: ws; ohlcv defaults to poll)
   --ws-url <url>           Websocket URL for ws transport (default depends on exchange)
-  --coin <coin>            Coin override for ws transport (Hyperliquid coin, or Binance/Bybit base asset)
+  --coin <coin>            Coin override for ws transport (also helps ohlcv polling on Binance/Bybit)
   --poll-ms <ms>           Poll interval in milliseconds (default: 800)
   --timeout-secs <secs>    Per-request timeout in seconds (default: 20)
   --duration-secs <secs>   Stop after this duration
@@ -62,6 +70,12 @@ Mode-specific options:
     --levels <count>       Depth levels to display/request (default: 10, min: 10, max: 20)
     --render-ms <ms>       UI render interval in milliseconds (default: 33)
 
+  ohlcv:
+    --timeframe <value>    fetchOHLCV timeframe (default: 1m)
+    --limit <count>        fetchOHLCV limit (default: 120)
+    --render-ms <ms>       UI render interval in milliseconds (default: 250)
+    --chart-height <rows>  Candle chart height (default: 16, min: 6, max: 40)
+
 Examples:
   cargo run --bin market_stream -- trades --symbol BTC/USDC:USDC --poll-ms 500
   cargo run --bin market_stream -- orderbook --levels 12 --poll-ms 900
@@ -69,6 +83,7 @@ Examples:
   cargo run --bin market_stream -- orderbook --exchange binance --transport ws --coin BTC
   cargo run --bin market_stream -- orderbook --exchange bybit --transport ws --coin BTC
   cargo run --bin market_stream -- trades --exchange bybit --transport ws --coin BTC
+  cargo run --bin market_stream -- ohlcv --exchange bybit --coin BTC --timeframe 1m
   cargo run --bin market_stream -- trades --duration-secs 20
 "#;
 
@@ -76,6 +91,7 @@ Examples:
 enum Mode {
     Trades,
     OrderBook,
+    Ohlcv,
 }
 
 impl Mode {
@@ -83,6 +99,7 @@ impl Mode {
         match self {
             Self::Trades => "trades",
             Self::OrderBook => "orderbook",
+            Self::Ohlcv => "ohlcv",
         }
     }
 }
@@ -118,6 +135,10 @@ struct Config {
     trade_limit: usize,
     orderbook_levels: usize,
     orderbook_render_ms: u64,
+    ohlcv_timeframe: String,
+    ohlcv_limit: usize,
+    ohlcv_render_ms: u64,
+    ohlcv_chart_height: usize,
 }
 
 enum ParseResult {
@@ -159,7 +180,11 @@ fn parse_args(args: &[String]) -> Result<ParseResult, String> {
 
     let mut config = Config {
         mode,
-        transport: Transport::Ws,
+        transport: if mode == Mode::Ohlcv {
+            Transport::Poll
+        } else {
+            Transport::Ws
+        },
         base_url: DEFAULT_BASE_URL.to_string(),
         ws_url: DEFAULT_HYPERLIQUID_WS_URL.to_string(),
         coin: None,
@@ -172,6 +197,10 @@ fn parse_args(args: &[String]) -> Result<ParseResult, String> {
         trade_limit: DEFAULT_TRADE_LIMIT,
         orderbook_levels: DEFAULT_ORDERBOOK_LEVELS,
         orderbook_render_ms: DEFAULT_ORDERBOOK_RENDER_MS,
+        ohlcv_timeframe: DEFAULT_OHLCV_TIMEFRAME.to_string(),
+        ohlcv_limit: DEFAULT_OHLCV_LIMIT,
+        ohlcv_render_ms: DEFAULT_OHLCV_RENDER_MS,
+        ohlcv_chart_height: DEFAULT_OHLCV_CHART_HEIGHT,
     };
 
     let mut index = 1usize;
@@ -219,14 +248,26 @@ fn parse_args(args: &[String]) -> Result<ParseResult, String> {
                 config.iterations = Some(parse_u64_gt_zero("--iterations", &value(&mut index)?)?);
             }
             "--limit" => {
-                config.trade_limit = parse_usize_gt_zero("--limit", &value(&mut index)?)?;
+                let limit = parse_usize_gt_zero("--limit", &value(&mut index)?)?;
+                config.trade_limit = limit;
+                config.ohlcv_limit = limit;
             }
             "--levels" => {
                 let levels = parse_usize_gt_zero("--levels", &value(&mut index)?)?;
                 config.orderbook_levels = levels.clamp(MIN_ORDERBOOK_LEVELS, MAX_ORDERBOOK_LEVELS);
             }
             "--render-ms" => {
-                config.orderbook_render_ms = parse_u64_gt_zero("--render-ms", &value(&mut index)?)?;
+                let render_ms = parse_u64_gt_zero("--render-ms", &value(&mut index)?)?;
+                config.orderbook_render_ms = render_ms;
+                config.ohlcv_render_ms = render_ms;
+            }
+            "--timeframe" => {
+                config.ohlcv_timeframe = value(&mut index)?;
+            }
+            "--chart-height" => {
+                let chart_height = parse_usize_gt_zero("--chart-height", &value(&mut index)?)?;
+                config.ohlcv_chart_height =
+                    chart_height.clamp(MIN_OHLCV_CHART_HEIGHT, MAX_OHLCV_CHART_HEIGHT);
             }
             _ => {
                 return Err(format!("unknown argument `{flag}`"));
@@ -248,6 +289,9 @@ fn parse_args(args: &[String]) -> Result<ParseResult, String> {
     if config.symbol.trim().is_empty() {
         return Err("`--symbol` cannot be empty".to_string());
     }
+    if config.ohlcv_timeframe.trim().is_empty() {
+        return Err("`--timeframe` cannot be empty".to_string());
+    }
     if let Some(coin) = config.coin.as_deref() {
         if coin.trim().is_empty() {
             return Err("`--coin` cannot be empty".to_string());
@@ -261,8 +305,9 @@ fn parse_mode(value: &str) -> Result<Mode, String> {
     match value {
         "trades" => Ok(Mode::Trades),
         "orderbook" => Ok(Mode::OrderBook),
+        "ohlcv" | "ohlc" => Ok(Mode::Ohlcv),
         _ => Err(format!(
-            "invalid mode `{value}` (expected `trades` or `orderbook`)"
+            "invalid mode `{value}` (expected `trades`, `orderbook`, or `ohlcv`)"
         )),
     }
 }
@@ -301,7 +346,7 @@ async fn run_stream(config: Config) -> anyhow::Result<()> {
     let client = BackendClient::new(config.base_url.clone(), config.timeout_secs)?;
 
     println!(
-        "mode={} transport={} base_url={} exchange={} symbol={} poll_ms={} timeout_secs={} render_ms={}",
+        "mode={} transport={} base_url={} exchange={} symbol={} poll_ms={} timeout_secs={} orderbook_render_ms={} ohlcv_render_ms={} ohlcv_timeframe={} ohlcv_limit={} chart_height={}",
         config.mode.as_str(),
         config.transport.as_str(),
         config.base_url,
@@ -310,6 +355,10 @@ async fn run_stream(config: Config) -> anyhow::Result<()> {
         config.poll_ms,
         config.timeout_secs,
         config.orderbook_render_ms,
+        config.ohlcv_render_ms,
+        config.ohlcv_timeframe,
+        config.ohlcv_limit,
+        config.ohlcv_chart_height,
     );
     if config.transport == Transport::Ws {
         let ws_url = resolved_ws_base_url(&config);
@@ -331,6 +380,7 @@ async fn run_stream(config: Config) -> anyhow::Result<()> {
     match config.mode {
         Mode::Trades => run_trades_stream(&client, &config).await,
         Mode::OrderBook => run_orderbook_stream(&client, &config).await,
+        Mode::Ohlcv => run_ohlcv_stream(&client, &config).await,
     }
 }
 
@@ -490,6 +540,124 @@ async fn run_orderbook_stream_poll(client: &BackendClient, config: &Config) -> a
                     poll_iteration,
                     started_at.elapsed(),
                     &config.symbol,
+                );
+                renderer.render(&frame)?;
+            }
+        }
+    };
+
+    drop(renderer);
+    println!("stopped: {stop_reason}");
+    Ok(())
+}
+
+async fn run_ohlcv_stream(client: &BackendClient, config: &Config) -> anyhow::Result<()> {
+    if config.transport == Transport::Ws {
+        eprintln!("ws transport for ohlcv is not wired yet; falling back to poll transport");
+    }
+
+    run_ohlcv_stream_poll(client, config).await
+}
+
+fn resolve_ohlcv_poll_symbol(config: &Config) -> anyhow::Result<String> {
+    if config.coin.is_none() {
+        return Ok(config.symbol.clone());
+    }
+
+    match config.exchange.as_str() {
+        "binance" => resolve_binance_ws_symbol(config),
+        "bybit" => resolve_bybit_ws_symbol(config),
+        _ => Ok(config.symbol.clone()),
+    }
+}
+
+fn build_ohlcv_poll_params(config: &Config) -> Value {
+    if config.exchange == "hyperliquid" {
+        if let Some(coin) = config.coin.as_deref() {
+            return json!({ "coin": coin.trim() });
+        }
+    }
+
+    json!({})
+}
+
+async fn run_ohlcv_stream_poll(client: &BackendClient, config: &Config) -> anyhow::Result<()> {
+    let request_symbol = resolve_ohlcv_poll_symbol(config)?;
+    let request_params = build_ohlcv_poll_params(config);
+
+    let payload = json!({
+        "exchange": config.exchange,
+        "symbol": request_symbol.clone(),
+        "timeframe": config.ohlcv_timeframe,
+        "limit": config.ohlcv_limit,
+        "params": request_params,
+    });
+
+    let mut poll_iteration = 0u64;
+    let started_at = Instant::now();
+    let mut renderer = OrderBookRenderer::new()?;
+
+    let mut state = match client
+        .post_json::<Vec<OhlcvRow>>("/v1/fetchOHLCV", &payload)
+        .await
+    {
+        Ok(candles) => OhlcvState::Candles(candles),
+        Err(err) => OhlcvState::Error(format!("{err:#}")),
+    };
+    poll_iteration += 1;
+
+    let first_frame = build_ohlcv_state_frame(
+        &state,
+        poll_iteration,
+        started_at.elapsed(),
+        &request_symbol,
+        &config.ohlcv_timeframe,
+        config.ohlcv_chart_height,
+    );
+    renderer.render(&first_frame)?;
+
+    let mut poll_interval = tokio::time::interval(Duration::from_millis(config.poll_ms));
+    poll_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    poll_interval.tick().await;
+
+    let mut render_interval = tokio::time::interval(Duration::from_millis(config.ohlcv_render_ms));
+    render_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    render_interval.tick().await;
+
+    let stop_reason = loop {
+        if should_stop(started_at, poll_iteration, config) {
+            break "reached configured stop condition";
+        }
+
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                break "received Ctrl+C";
+            }
+            _ = poll_interval.tick() => {
+                state = match client.post_json::<Vec<OhlcvRow>>("/v1/fetchOHLCV", &payload).await {
+                    Ok(candles) => OhlcvState::Candles(candles),
+                    Err(err) => OhlcvState::Error(format!("{err:#}")),
+                };
+                poll_iteration += 1;
+
+                let frame = build_ohlcv_state_frame(
+                    &state,
+                    poll_iteration,
+                    started_at.elapsed(),
+                    &request_symbol,
+                    &config.ohlcv_timeframe,
+                    config.ohlcv_chart_height,
+                );
+                renderer.render(&frame)?;
+            }
+            _ = render_interval.tick() => {
+                let frame = build_ohlcv_state_frame(
+                    &state,
+                    poll_iteration,
+                    started_at.elapsed(),
+                    &request_symbol,
+                    &config.ohlcv_timeframe,
+                    config.ohlcv_chart_height,
                 );
                 renderer.render(&frame)?;
             }
@@ -1977,6 +2145,40 @@ enum OrderBookState {
     Error(String),
 }
 
+#[derive(Debug, Clone, Copy, Deserialize)]
+struct OhlcvRow(u64, f64, f64, f64, f64, f64);
+
+impl OhlcvRow {
+    fn timestamp(self) -> u64 {
+        self.0
+    }
+
+    fn open(self) -> f64 {
+        self.1
+    }
+
+    fn high(self) -> f64 {
+        self.2
+    }
+
+    fn low(self) -> f64 {
+        self.3
+    }
+
+    fn close(self) -> f64 {
+        self.4
+    }
+
+    fn volume(self) -> f64 {
+        self.5
+    }
+}
+
+enum OhlcvState {
+    Candles(Vec<OhlcvRow>),
+    Error(String),
+}
+
 #[derive(Debug)]
 struct BookStats {
     best_bid: Option<f64>,
@@ -2148,6 +2350,244 @@ fn build_orderbook_error_frame(
     output
 }
 
+fn build_ohlcv_state_frame(
+    state: &OhlcvState,
+    iteration: u64,
+    elapsed: Duration,
+    default_symbol: &str,
+    timeframe: &str,
+    chart_height: usize,
+) -> String {
+    match state {
+        OhlcvState::Candles(candles) => build_ohlcv_frame(
+            candles,
+            iteration,
+            elapsed,
+            default_symbol,
+            timeframe,
+            chart_height,
+        ),
+        OhlcvState::Error(error) => {
+            build_ohlcv_error_frame(iteration, elapsed, default_symbol, timeframe, error)
+        }
+    }
+}
+
+fn build_ohlcv_frame(
+    candles: &[OhlcvRow],
+    iteration: u64,
+    elapsed: Duration,
+    symbol: &str,
+    timeframe: &str,
+    chart_height: usize,
+) -> String {
+    if candles.is_empty() {
+        return build_ohlcv_error_frame(
+            iteration,
+            elapsed,
+            symbol,
+            timeframe,
+            "fetchOHLCV returned no candles",
+        );
+    }
+
+    let mut ordered = candles.to_vec();
+    ordered.sort_by_key(|candle| candle.timestamp());
+
+    let window_start = ordered.len().saturating_sub(MAX_OHLCV_CHART_CANDLES);
+    let visible = ordered[window_start..].to_vec();
+    let latest = visible
+        .last()
+        .copied()
+        .expect("non-empty candle window expected");
+
+    let window_from = visible
+        .first()
+        .and_then(|candle| iso8601_millis(candle.timestamp()))
+        .unwrap_or_else(|| "unknown".to_string());
+    let window_to = iso8601_millis(latest.timestamp()).unwrap_or_else(|| "unknown".to_string());
+
+    let low = visible
+        .iter()
+        .map(|candle| candle.low())
+        .fold(f64::INFINITY, f64::min);
+    let high = visible
+        .iter()
+        .map(|candle| candle.high())
+        .fold(f64::NEG_INFINITY, f64::max);
+
+    let close_delta = visible
+        .iter()
+        .rev()
+        .nth(1)
+        .map(|previous| latest.close() - previous.close());
+    let close_delta_pct = close_delta.and_then(|delta| {
+        let previous = latest.close() - delta;
+        if previous.abs() <= f64::EPSILON {
+            None
+        } else {
+            Some(delta / previous)
+        }
+    });
+
+    let mut output = String::new();
+    let _ = writeln!(
+        output,
+        "ohlcv stream | update={} | elapsed={}s | symbol={} | timeframe={} | candles={}",
+        iteration,
+        elapsed.as_secs(),
+        symbol,
+        timeframe,
+        visible.len(),
+    );
+    let _ = writeln!(output, "window: {window_from} -> {window_to}");
+    let _ = writeln!(
+        output,
+        "latest: ts={} open={} high={} low={} close={} volume={}",
+        iso8601_millis(latest.timestamp()).unwrap_or_else(|| "unknown".to_string()),
+        format_price(latest.open()),
+        format_price(latest.high()),
+        format_price(latest.low()),
+        format_price(latest.close()),
+        format_f64(Some(latest.volume())),
+    );
+    let _ = writeln!(
+        output,
+        "close_delta={} close_delta_pct={} range_low={} range_high={}",
+        format_f64(close_delta),
+        format_pct(close_delta_pct),
+        format_price(low),
+        format_price(high),
+    );
+    let _ = writeln!(
+        output,
+        "legend: # up candle body, * down candle body, = doji, | wick"
+    );
+    let _ = writeln!(output);
+
+    for line in build_ohlcv_chart_lines(&visible, chart_height) {
+        let _ = writeln!(output, "{line}");
+    }
+
+    output
+}
+
+fn build_ohlcv_error_frame(
+    iteration: u64,
+    elapsed: Duration,
+    symbol: &str,
+    timeframe: &str,
+    error: &str,
+) -> String {
+    let mut output = String::new();
+    let compact_error = error.replace('\n', " | ");
+    let _ = writeln!(
+        output,
+        "ohlcv stream | update={} | elapsed={}s | symbol={} | timeframe={}",
+        iteration,
+        elapsed.as_secs(),
+        symbol,
+        timeframe,
+    );
+    let _ = writeln!(output, "error fetching candles");
+    let _ = writeln!(output, "{compact_error}");
+    output
+}
+
+fn build_ohlcv_chart_lines(candles: &[OhlcvRow], chart_height: usize) -> Vec<String> {
+    if candles.is_empty() {
+        return vec!["(no candles)".to_string()];
+    }
+
+    let height = chart_height.clamp(MIN_OHLCV_CHART_HEIGHT, MAX_OHLCV_CHART_HEIGHT);
+
+    let mut low = candles
+        .iter()
+        .map(|candle| candle.low())
+        .fold(f64::INFINITY, f64::min);
+    let mut high = candles
+        .iter()
+        .map(|candle| candle.high())
+        .fold(f64::NEG_INFINITY, f64::max);
+
+    if !low.is_finite() || !high.is_finite() {
+        return vec!["(invalid candle values)".to_string()];
+    }
+
+    if (high - low).abs() <= f64::EPSILON {
+        high += 1.0;
+        low -= 1.0;
+    }
+
+    let mut grid = vec![vec![' '; candles.len()]; height];
+    for (index, candle) in candles.iter().enumerate() {
+        let wick_top = price_to_chart_row(candle.high(), high, low, height);
+        let wick_bottom = price_to_chart_row(candle.low(), high, low, height);
+        for row in wick_top.min(wick_bottom)..=wick_top.max(wick_bottom) {
+            grid[row][index] = '|';
+        }
+
+        let body_top = price_to_chart_row(candle.open().max(candle.close()), high, low, height);
+        let body_bottom = price_to_chart_row(candle.open().min(candle.close()), high, low, height);
+        let body_char = if (candle.close() - candle.open()).abs() <= f64::EPSILON {
+            '='
+        } else if candle.close() > candle.open() {
+            '#'
+        } else {
+            '*'
+        };
+
+        for row in body_top.min(body_bottom)..=body_top.max(body_bottom) {
+            grid[row][index] = body_char;
+        }
+    }
+
+    let mut lines = Vec::with_capacity(height + 2);
+    for row in 0..height {
+        let ratio = if height <= 1 {
+            0.0
+        } else {
+            row as f64 / (height - 1) as f64
+        };
+        let price = high - ((high - low) * ratio);
+        let bar = grid[row].iter().collect::<String>();
+        lines.push(format!("{:>11} {}", format_price(price), bar));
+    }
+
+    lines.push(format!("{:>11} {}", "", "-".repeat(candles.len())));
+
+    let from = candles
+        .first()
+        .and_then(|candle| short_time(candle.timestamp()))
+        .unwrap_or_else(|| "unknown".to_string());
+    let to = candles
+        .last()
+        .and_then(|candle| short_time(candle.timestamp()))
+        .unwrap_or_else(|| "unknown".to_string());
+    lines.push(format!("time: {from} -> {to}"));
+
+    lines
+}
+
+fn price_to_chart_row(price: f64, top: f64, bottom: f64, height: usize) -> usize {
+    if height <= 1 {
+        return 0;
+    }
+
+    let span = top - bottom;
+    if span.abs() <= f64::EPSILON {
+        return 0;
+    }
+
+    let normalized = ((top - price) / span).clamp(0.0, 1.0);
+    (normalized * (height - 1) as f64).round() as usize
+}
+
+fn short_time(timestamp: u64) -> Option<String> {
+    chrono::DateTime::<Utc>::from_timestamp_millis(timestamp as i64)
+        .map(|value| value.format("%m-%d %H:%M:%S").to_string())
+}
+
 fn normalize_book_levels(book: &OrderBookSnapshot) -> (Vec<(f64, f64)>, Vec<(f64, f64)>) {
     let mut asks = book.asks.clone();
     let mut bids = book.bids.clone();
@@ -2295,14 +2735,14 @@ impl TradeDeduper {
 mod tests {
     use super::{
         apply_bybit_orderbook_event, build_binance_orderbook_ws_endpoint,
-        build_bybit_orderbook_ws_endpoint, build_level_rows, compute_book_stats, format_depth_bar,
-        infer_hyperliquid_coin_from_symbol, normalize_book_levels, parse_args,
-        parse_binance_orderbook_message, parse_binance_trades_message,
-        parse_bybit_orderbook_message, parse_bybit_trades_message,
+        build_bybit_orderbook_ws_endpoint, build_level_rows, build_ohlcv_chart_lines,
+        compute_book_stats, format_depth_bar, infer_hyperliquid_coin_from_symbol,
+        normalize_book_levels, parse_args, parse_binance_orderbook_message,
+        parse_binance_trades_message, parse_bybit_orderbook_message, parse_bybit_trades_message,
         parse_hyperliquid_orderbook_message, parse_hyperliquid_trades_message,
-        resolve_binance_ws_symbol, resolve_bybit_ws_symbol, to_binance_ws_depth_levels,
-        to_bybit_ws_depth_levels, trade_key, BybitOrderBookEventType, Config, Mode,
-        OrderBookSnapshot, ParseResult, TradeDeduper, TradeRow, Transport,
+        resolve_binance_ws_symbol, resolve_bybit_ws_symbol, resolve_ohlcv_poll_symbol,
+        to_binance_ws_depth_levels, to_bybit_ws_depth_levels, trade_key, BybitOrderBookEventType,
+        Config, Mode, OhlcvRow, OrderBookSnapshot, ParseResult, TradeDeduper, TradeRow, Transport,
     };
 
     fn parse_run(args: &[&str]) -> Config {
@@ -2347,6 +2787,12 @@ mod tests {
     }
 
     #[test]
+    fn parse_args_defaults_ohlcv_to_poll_transport() {
+        let config = parse_run(&["ohlcv"]);
+        assert_eq!(config.transport, Transport::Poll);
+    }
+
+    #[test]
     fn parse_args_caps_orderbook_levels() {
         let config = parse_run(&["orderbook", "--levels", "999", "--render-ms", "16"]);
         assert_eq!(config.mode, Mode::OrderBook);
@@ -2358,6 +2804,50 @@ mod tests {
     fn parse_args_enforces_minimum_orderbook_levels() {
         let config = parse_run(&["orderbook", "--levels", "1"]);
         assert_eq!(config.orderbook_levels, 10);
+    }
+
+    #[test]
+    fn parse_args_reads_ohlcv_flags() {
+        let config = parse_run(&[
+            "ohlcv",
+            "--timeframe",
+            "5m",
+            "--limit",
+            "80",
+            "--render-ms",
+            "120",
+            "--chart-height",
+            "18",
+        ]);
+
+        assert_eq!(config.mode, Mode::Ohlcv);
+        assert_eq!(config.ohlcv_timeframe, "5m");
+        assert_eq!(config.ohlcv_limit, 80);
+        assert_eq!(config.ohlcv_render_ms, 120);
+        assert_eq!(config.ohlcv_chart_height, 18);
+    }
+
+    #[test]
+    fn resolve_ohlcv_poll_symbol_uses_coin_override_for_bybit() {
+        let config = parse_run(&["ohlcv", "--exchange", "bybit", "--coin", "btc"]);
+        assert_eq!(resolve_ohlcv_poll_symbol(&config).unwrap(), "BTCUSDT");
+    }
+
+    #[test]
+    fn build_ohlcv_chart_lines_draws_candle_markers() {
+        let candles = vec![
+            OhlcvRow(1700000000000, 100.0, 102.0, 99.0, 101.5, 3.0),
+            OhlcvRow(1700000060000, 101.5, 103.0, 100.0, 100.5, 2.5),
+            OhlcvRow(1700000120000, 100.5, 101.0, 100.0, 100.5, 1.8),
+        ];
+
+        let lines = build_ohlcv_chart_lines(&candles, 10);
+        let joined = lines.join("\n");
+
+        assert!(joined.contains('#'));
+        assert!(joined.contains('*'));
+        assert!(joined.contains('='));
+        assert!(joined.contains('|'));
     }
 
     #[test]
