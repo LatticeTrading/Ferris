@@ -8,7 +8,7 @@ This first version focuses on:
 
 - unified endpoint shapes (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`)
 - pluggable exchange adapter architecture
-- Hyperliquid market-data support for public recent trades
+- market-data support for `hyperliquid`, `binance`, and `bybit`
 - background websocket trade collector with in-memory ring buffer for deeper trade history
 
 ## Why this exists
@@ -175,6 +175,8 @@ Defaults:
 ## Terminal stream viewers
 
 These helpers are separate from the main server runtime and are meant for quick manual checks against a running backend.
+
+Note: `market_stream` currently has `trades` and `orderbook` modes only. OHLCV is available through `POST /v1/fetchOHLCV`.
 
 Trades stream (prints only newly seen trades each poll):
 
