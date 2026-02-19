@@ -1,9 +1,9 @@
+use std::time::Duration;
+
 use async_trait::async_trait;
-use bybit::prelude::{
-    Bybit, BybitError, Category, GeneralCode, MarketData, RecentTrade, RecentTradesRequest,
-    ReturnCode, Side,
-};
 use chrono::{SecondsFormat, Utc};
+use reqwest::StatusCode;
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::{
@@ -14,18 +14,29 @@ use crate::{
     },
 };
 
+const DEFAULT_BYBIT_BASE_URL: &str = "https://api.bybit.com";
 const DEFAULT_FETCH_TRADES_LIMIT: usize = 100;
 const MAX_FETCH_TRADES_LIMIT: usize = 1_000;
 const MAX_FETCH_TRADES_LIMIT_SPOT: usize = 60;
 
 pub struct BybitExchange {
-    client: MarketData,
+    http_client: reqwest::Client,
+    base_url: String,
 }
 
 impl BybitExchange {
-    pub fn new(_timeout_ms: u64) -> Result<Self, ExchangeError> {
-        let client: MarketData = Bybit::new(None, None);
-        Ok(Self { client })
+    pub fn new(timeout_ms: u64) -> Result<Self, ExchangeError> {
+        let http_client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(timeout_ms))
+            .build()
+            .map_err(|err| {
+                ExchangeError::Internal(format!("failed to build Bybit REST client: {err}"))
+            })?;
+
+        Ok(Self {
+            http_client,
+            base_url: DEFAULT_BYBIT_BASE_URL.to_string(),
+        })
     }
 }
 
@@ -48,22 +59,54 @@ impl MarketDataExchange for BybitExchange {
             .unwrap_or(DEFAULT_FETCH_TRADES_LIMIT)
             .clamp(1, max_trade_limit_for_category(category));
 
-        let request = RecentTradesRequest::new(
-            category,
-            Some(market_symbol.as_str()),
-            None,
-            Some(requested_limit as u64),
-        );
+        let endpoint = format!("{}/v5/market/recent-trade", self.base_url);
+        let limit = requested_limit.to_string();
+        let query = [
+            ("category", category.as_str()),
+            ("symbol", market_symbol.as_str()),
+            ("limit", limit.as_str()),
+        ];
 
         let response = self
-            .client
-            .get_recent_trades(request)
+            .http_client
+            .get(endpoint)
+            .query(&query)
+            .send()
             .await
-            .map_err(map_bybit_error)?;
+            .map_err(|err| ExchangeError::UpstreamRequest(err.to_string()))?;
 
-        let mut mapped = Vec::with_capacity(response.result.list.len());
-        for row in response.result.list {
-            match map_trade(row, &resolved_symbol) {
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|err| ExchangeError::UpstreamRequest(err.to_string()))?;
+
+        if status != StatusCode::OK {
+            return Err(ExchangeError::UpstreamRequest(format!(
+                "bybit status={status} body={} query={:?}",
+                truncate(&body, 240),
+                query,
+            )));
+        }
+
+        let envelope: BybitRecentTradesEnvelope = serde_json::from_str(&body).map_err(|err| {
+            ExchangeError::UpstreamData(format!(
+                "failed to parse Bybit recent trades response: {err}; body={}",
+                truncate(&body, 240)
+            ))
+        })?;
+
+        if envelope.ret_code != 0 {
+            return Err(map_bybit_api_error(envelope.ret_code, &envelope.ret_msg));
+        }
+
+        let result = envelope.result.ok_or_else(|| {
+            ExchangeError::UpstreamData("Bybit recent trades response missing `result`".to_string())
+        })?;
+
+        let mut mapped = Vec::with_capacity(result.list.len());
+        for row in result.list {
+            match map_trade_row(row, &resolved_symbol) {
                 Ok(trade) => mapped.push(trade),
                 Err(err) => {
                     tracing::warn!(error = %err, "unable to map Bybit trade, skipping");
@@ -103,69 +146,140 @@ impl MarketDataExchange for BybitExchange {
     }
 }
 
-fn max_trade_limit_for_category(category: Category) -> usize {
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BybitRecentTradesEnvelope {
+    #[serde(rename = "retCode")]
+    ret_code: i32,
+    #[serde(rename = "retMsg")]
+    ret_msg: String,
+    result: Option<BybitRecentTradesResult>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BybitRecentTradesResult {
+    list: Vec<Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BybitCategory {
+    Spot,
+    Linear,
+    Inverse,
+    Option,
+}
+
+impl BybitCategory {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Spot => "spot",
+            Self::Linear => "linear",
+            Self::Inverse => "inverse",
+            Self::Option => "option",
+        }
+    }
+}
+
+fn max_trade_limit_for_category(category: BybitCategory) -> usize {
     match category {
-        Category::Spot => MAX_FETCH_TRADES_LIMIT_SPOT,
+        BybitCategory::Spot => MAX_FETCH_TRADES_LIMIT_SPOT,
         _ => MAX_FETCH_TRADES_LIMIT,
     }
 }
 
-fn parse_category_from_params(params: &Value) -> Result<Category, ExchangeError> {
+fn parse_category_from_params(params: &Value) -> Result<BybitCategory, ExchangeError> {
     let Some(raw) = params.get("category").and_then(Value::as_str) else {
-        return Ok(Category::Linear);
+        return Ok(BybitCategory::Linear);
     };
 
     let normalized = raw.trim().to_ascii_lowercase();
     if normalized.is_empty() {
-        return Ok(Category::Linear);
+        return Ok(BybitCategory::Linear);
     }
 
     match normalized.as_str() {
-        "spot" => Ok(Category::Spot),
-        "linear" => Ok(Category::Linear),
-        "inverse" => Ok(Category::Inverse),
-        "option" => Ok(Category::Option),
+        "spot" => Ok(BybitCategory::Spot),
+        "linear" => Ok(BybitCategory::Linear),
+        "inverse" => Ok(BybitCategory::Inverse),
+        "option" => Ok(BybitCategory::Option),
         other => Err(ExchangeError::BadSymbol(format!(
             "unsupported Bybit category `{other}`"
         ))),
     }
 }
 
-fn map_trade(raw: RecentTrade, symbol: &str) -> Result<CcxtTrade, ExchangeError> {
-    let timestamp = raw.time;
+fn map_trade_row(raw: Value, symbol: &str) -> Result<CcxtTrade, ExchangeError> {
+    let timestamp = raw
+        .get("time")
+        .and_then(parse_u64_lossy)
+        .ok_or_else(|| ExchangeError::UpstreamData("Bybit trade missing `time`".to_string()))?;
+
+    let price = raw
+        .get("price")
+        .and_then(parse_f64_lossy)
+        .ok_or_else(|| ExchangeError::UpstreamData("Bybit trade missing `price`".to_string()))?;
+
+    let amount = raw
+        .get("size")
+        .and_then(parse_f64_lossy)
+        .ok_or_else(|| ExchangeError::UpstreamData("Bybit trade missing `size`".to_string()))?;
+
     let datetime = chrono::DateTime::<Utc>::from_timestamp_millis(timestamp as i64)
         .ok_or_else(|| ExchangeError::UpstreamData(format!("invalid timestamp `{timestamp}`")))?
         .to_rfc3339_opts(SecondsFormat::Millis, true);
 
-    let side = match raw.side {
-        Side::Buy => "buy".to_string(),
-        Side::Sell => "sell".to_string(),
-    };
+    let side = raw
+        .get("side")
+        .and_then(Value::as_str)
+        .map(|value| match value {
+            "Buy" | "BUY" | "buy" => "buy".to_string(),
+            "Sell" | "SELL" | "sell" => "sell".to_string(),
+            other => other.to_ascii_lowercase(),
+        });
 
-    let price = raw.price;
-    let amount = raw.size;
+    let id = raw.get("execId").and_then(stringify_json_value);
     let cost = price * amount;
-    let id = raw.exec_id.clone();
-
-    let info = serde_json::to_value(&raw).map_err(|err| {
-        ExchangeError::UpstreamData(format!("failed to serialize Bybit trade info: {err}"))
-    })?;
 
     Ok(CcxtTrade {
-        info,
+        info: raw,
         amount: Some(amount),
         datetime: Some(datetime),
-        id: Some(id),
+        id,
         order: None,
         price: Some(price),
         timestamp: Some(timestamp),
         trade_type: None,
-        side: Some(side),
+        side,
         symbol: Some(symbol.to_string()),
         taker_or_maker: None,
         cost: Some(cost),
         fee: None,
     })
+}
+
+fn parse_u64_lossy(value: &Value) -> Option<u64> {
+    match value {
+        Value::Number(number) => number.as_u64(),
+        Value::String(text) => text.parse::<u64>().ok(),
+        _ => None,
+    }
+}
+
+fn parse_f64_lossy(value: &Value) -> Option<f64> {
+    match value {
+        Value::Number(number) => number.as_f64(),
+        Value::String(text) => text.parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+fn stringify_json_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Number(number) => Some(number.to_string()),
+        _ => None,
+    }
 }
 
 fn normalize_market_symbol(symbol: &str) -> Result<String, ExchangeError> {
@@ -257,36 +371,20 @@ fn split_market_symbol(market_symbol: &str) -> Option<(String, String)> {
     None
 }
 
-fn map_bybit_error(error: BybitError) -> ExchangeError {
-    match error {
-        BybitError::BybitError(content) => {
-            let code = content.code;
-            let message = content.msg;
-
-            if is_bad_symbol_error(code, &message) {
-                return ExchangeError::BadSymbol(format!(
-                    "bybit rejected request with code={code}: {message}"
-                ));
-            }
-
-            ExchangeError::UpstreamRequest(format!(
-                "bybit rejected request with code={code}: {message}"
-            ))
-        }
-        other => ExchangeError::UpstreamRequest(other.to_string()),
+fn map_bybit_api_error(code: i32, message: &str) -> ExchangeError {
+    if is_bad_symbol_error(code, message) {
+        return ExchangeError::BadSymbol(format!(
+            "bybit rejected request with code={code}: {message}"
+        ));
     }
+
+    ExchangeError::UpstreamRequest(format!(
+        "bybit rejected request with code={code}: {message}"
+    ))
 }
 
 fn is_bad_symbol_error(code: i32, message: &str) -> bool {
-    if matches!(
-        ReturnCode::from_code(code),
-        Some(ReturnCode::General(
-            GeneralCode::InvalidParameters
-                | GeneralCode::SymbolNotExist
-                | GeneralCode::SymbolNotTrading
-                | GeneralCode::InvalidCategory
-        ))
-    ) {
+    if matches!(code, 10001 | 10021 | 10022 | 100401) {
         return true;
     }
 
@@ -294,17 +392,23 @@ fn is_bad_symbol_error(code: i32, message: &str) -> bool {
     normalized_message.contains("symbol") || normalized_message.contains("category")
 }
 
+fn truncate(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+
+    value.chars().take(max_chars).collect::<String>() + "..."
+}
+
 #[cfg(test)]
 mod tests {
-    use bybit::prelude::BybitContentError;
     use serde_json::json;
 
     use super::{
-        map_bybit_error, map_trade, normalize_market_symbol, parse_category_from_params,
-        resolve_public_symbol,
+        map_bybit_api_error, map_trade_row, normalize_market_symbol, parse_category_from_params,
+        resolve_public_symbol, BybitCategory,
     };
     use crate::exchanges::traits::ExchangeError;
-    use bybit::prelude::{BybitError, Category, RecentTrade, Side};
 
     #[test]
     fn normalizes_ccxt_and_exchange_symbols() {
@@ -332,29 +436,29 @@ mod tests {
     fn parses_category_from_params_with_default_linear() {
         assert_eq!(
             parse_category_from_params(&json!({})).unwrap(),
-            Category::Linear
+            BybitCategory::Linear
         );
         assert_eq!(
             parse_category_from_params(&json!({"category": "spot"})).unwrap(),
-            Category::Spot
+            BybitCategory::Spot
         );
         assert!(parse_category_from_params(&json!({"category": "invalid"})).is_err());
     }
 
     #[test]
     fn maps_bybit_trade_to_ccxt_shape() {
-        let trade = RecentTrade {
-            time: 1_700_000_000_000,
-            symbol: "BTCUSDT".to_string(),
-            price: 100.25,
-            size: 0.5,
-            side: Side::Buy,
-            exec_id: "abc123".to_string(),
-            is_block_trade: false,
-            is_rpi_trade: false,
-        };
+        let raw = json!({
+            "time": "1700000000000",
+            "symbol": "BTCUSDT",
+            "price": "100.25",
+            "size": "0.5",
+            "side": "Buy",
+            "execId": "abc123",
+            "isBlockTrade": false,
+            "isRPITrade": false,
+        });
 
-        let mapped = map_trade(trade, "BTC/USDT:USDT").expect("trade should map");
+        let mapped = map_trade_row(raw, "BTC/USDT:USDT").expect("trade should map");
         assert_eq!(mapped.id.as_deref(), Some("abc123"));
         assert_eq!(mapped.side.as_deref(), Some("buy"));
         assert_eq!(mapped.symbol.as_deref(), Some("BTC/USDT:USDT"));
@@ -366,12 +470,7 @@ mod tests {
 
     #[test]
     fn maps_bybit_symbol_errors_to_bad_symbol() {
-        let error = BybitError::BybitError(BybitContentError {
-            code: 10021,
-            msg: "Futures/Options symbol does not exist.".to_string(),
-        });
-
-        let mapped = map_bybit_error(error);
+        let mapped = map_bybit_api_error(10021, "Futures/Options symbol does not exist.");
         assert!(matches!(mapped, ExchangeError::BadSymbol(_)));
     }
 }
