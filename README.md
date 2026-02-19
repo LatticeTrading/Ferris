@@ -24,7 +24,10 @@ Frontend apps (including Electron and web frontends) often cannot directly use s
 - `POST /v1/fetchTrades`
 - `POST /v1/fetchOHLCV`
 - `POST /v1/fetchOrderBook`
-- exchange supported: `hyperliquid`
+- exchange supported:
+  - `hyperliquid` (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`)
+  - `binance` (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`)
+  - `bybit` (`fetchTrades` only for now)
 - market-data only (no private trading endpoints yet)
 
 ## API
@@ -197,17 +200,23 @@ Websocket trades stream (instant event-driven updates, no polling):
 cargo run --bin market_stream -- trades --transport ws --coin BTC
 ```
 
+Websocket trades stream for Bybit:
+
+```bash
+cargo run --bin market_stream -- trades --exchange bybit --transport ws --coin BTC
+```
+
 Useful optional flags:
 
 - `--base-url` (default `http://127.0.0.1:8787`)
 - `--exchange` (default `hyperliquid`)
-- `--transport` (`poll` or `ws`, default `poll`)
-- `--ws-url` (default `wss://api.hyperliquid.xyz/ws`)
+- `--transport` (`poll` or `ws`, default `ws`)
+- `--ws-url` (default depends on `--exchange`)
 - `--coin` (optional websocket coin override)
 - `--duration-secs` (stop automatically after N seconds)
 - `--iterations` (stop after N iterations)
 
-`--transport ws` currently targets Hyperliquid directly and is useful for socket-focused terminal testing; `--transport poll` continues to test your backend HTTP endpoints.
+`--transport ws` supports `trades` for `hyperliquid`, `binance`, and `bybit`, and supports `orderbook` for `hyperliquid` and `binance`; `--transport poll` continues to test your backend HTTP endpoints.
 
 ## Testing against a running server
 

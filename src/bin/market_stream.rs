@@ -31,6 +31,7 @@ const MIN_ORDERBOOK_LEVELS: usize = 10;
 const DEFAULT_ORDERBOOK_RENDER_MS: u64 = 33;
 const DEFAULT_HYPERLIQUID_WS_URL: &str = "wss://api.hyperliquid.xyz/ws";
 const DEFAULT_BINANCE_FUTURES_WS_URL: &str = "wss://fstream.binance.com/ws";
+const DEFAULT_BYBIT_LINEAR_WS_URL: &str = "wss://stream.bybit.com/v5/public/linear";
 const MAX_ORDERBOOK_LEVELS: usize = 20;
 const TRADE_DEDUP_CAPACITY: usize = 20_000;
 
@@ -47,7 +48,7 @@ Common options:
   --symbol <symbol>        Market symbol (default: BTC/USDC:USDC)
   --transport <mode>       Data transport: poll|ws (default: ws)
   --ws-url <url>           Websocket URL for ws transport (default depends on exchange)
-  --coin <coin>            Coin override for ws transport (Hyperliquid coin, or Binance base asset)
+  --coin <coin>            Coin override for ws transport (Hyperliquid coin, or Binance/Bybit base asset)
   --poll-ms <ms>           Poll interval in milliseconds (default: 800)
   --timeout-secs <secs>    Per-request timeout in seconds (default: 20)
   --duration-secs <secs>   Stop after this duration
@@ -66,6 +67,7 @@ Examples:
   cargo run --bin market_stream -- orderbook --levels 12 --poll-ms 900
   cargo run --bin market_stream -- orderbook --transport ws --coin BTC --render-ms 16
   cargo run --bin market_stream -- orderbook --exchange binance --transport ws --coin BTC
+  cargo run --bin market_stream -- trades --exchange bybit --transport ws --coin BTC
   cargo run --bin market_stream -- trades --duration-secs 20
 "#;
 
@@ -334,7 +336,7 @@ async fn run_stream(config: Config) -> anyhow::Result<()> {
 async fn run_trades_stream(client: &BackendClient, config: &Config) -> anyhow::Result<()> {
     if config.transport == Transport::Ws {
         match config.exchange.as_str() {
-            "hyperliquid" | "binance" => return run_trades_stream_ws(config).await,
+            "hyperliquid" | "binance" | "bybit" => return run_trades_stream_ws(config).await,
             other => {
                 eprintln!(
                     "ws transport for exchange={other} is not wired yet; falling back to poll transport"
@@ -402,6 +404,11 @@ async fn run_orderbook_stream(client: &BackendClient, config: &Config) -> anyhow
     if config.transport == Transport::Ws {
         match config.exchange.as_str() {
             "hyperliquid" | "binance" => return run_orderbook_stream_ws(config).await,
+            "bybit" => {
+                bail!(
+                    "orderbook stream for exchange=bybit is not implemented yet; run `cargo run --bin market_stream -- trades --exchange bybit --coin BTC` for this phase"
+                );
+            }
             other => {
                 eprintln!(
                     "ws transport for exchange={other} is not wired yet; falling back to poll transport"
@@ -502,8 +509,9 @@ async fn run_trades_stream_ws(config: &Config) -> anyhow::Result<()> {
     match config.exchange.as_str() {
         "hyperliquid" => run_hyperliquid_trades_stream_ws(config).await,
         "binance" => run_binance_trades_stream_ws(config).await,
+        "bybit" => run_bybit_trades_stream_ws(config).await,
         other => bail!(
-            "ws transport for trades supports exchange=hyperliquid or exchange=binance (got `{other}`)"
+            "ws transport for trades supports exchange=hyperliquid, exchange=binance, or exchange=bybit (got `{other}`)"
         ),
     }
 }
@@ -634,6 +642,80 @@ async fn run_binance_trades_stream_ws(config: &Config) -> anyhow::Result<()> {
                         };
 
                         let trades = parse_binance_trades_message(&text);
+                        if trades.is_empty() {
+                            continue;
+                        }
+
+                        for trade in trades.iter().rev() {
+                            let key = trade_key(trade);
+                            if deduper.insert(key) {
+                                println!("{}", format_trade_line(trade));
+                            }
+                        }
+
+                        iteration += 1;
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn run_bybit_trades_stream_ws(config: &Config) -> anyhow::Result<()> {
+    let ws_endpoint = build_bybit_trade_ws_endpoint(config)?;
+    let symbol = resolve_bybit_ws_symbol(config)?;
+
+    let (mut stream, _) = connect_async(&ws_endpoint)
+        .await
+        .with_context(|| format!("failed to connect websocket {ws_endpoint}"))?;
+
+    send_bybit_trade_subscription(&mut stream, &symbol).await?;
+
+    let mut deduper = TradeDeduper::new(TRADE_DEDUP_CAPACITY.max(config.trade_limit * 10));
+    let mut iteration = 0u64;
+    let started_at = Instant::now();
+
+    let mut stop_check = tokio::time::interval(Duration::from_millis(50));
+    stop_check.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    stop_check.tick().await;
+
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                println!("stopped: received Ctrl+C");
+                return Ok(());
+            }
+            _ = stop_check.tick() => {
+                if should_stop(started_at, iteration, config) {
+                    println!("stopped: reached configured stop condition");
+                    return Ok(());
+                }
+            }
+            message = stream.next() => {
+                let Some(message) = message else {
+                    println!("stopped: websocket closed by peer");
+                    return Ok(());
+                };
+
+                let message = message.context("websocket read error")?;
+
+                match message {
+                    Message::Ping(payload) => {
+                        stream
+                            .send(Message::Pong(payload))
+                            .await
+                            .context("failed to reply to websocket ping")?;
+                    }
+                    Message::Close(_) => {
+                        println!("stopped: websocket closed by peer");
+                        return Ok(());
+                    }
+                    _ => {
+                        let Some(text) = ws_message_text(message)? else {
+                            continue;
+                        };
+
+                        let trades = parse_bybit_trades_message(&text);
                         if trades.is_empty() {
                             continue;
                         }
@@ -877,6 +959,7 @@ fn resolved_ws_base_url(config: &Config) -> String {
 
     match config.exchange.as_str() {
         "binance" => DEFAULT_BINANCE_FUTURES_WS_URL.to_string(),
+        "bybit" => DEFAULT_BYBIT_LINEAR_WS_URL.to_string(),
         _ => DEFAULT_HYPERLIQUID_WS_URL.to_string(),
     }
 }
@@ -890,6 +973,15 @@ fn build_binance_trade_ws_endpoint(config: &Config) -> anyhow::Result<String> {
         base_url.trim_end_matches('/'),
         stream_name
     ))
+}
+
+fn build_bybit_trade_ws_endpoint(config: &Config) -> anyhow::Result<String> {
+    let base_url = resolved_ws_base_url(config);
+    if base_url.trim().is_empty() {
+        bail!("invalid Bybit websocket endpoint");
+    }
+
+    Ok(base_url.trim_end_matches('/').to_string())
 }
 
 fn build_binance_orderbook_ws_endpoint(config: &Config) -> anyhow::Result<String> {
@@ -962,6 +1054,60 @@ fn resolve_binance_ws_symbol(config: &Config) -> anyhow::Result<String> {
     Ok(market_symbol)
 }
 
+fn resolve_bybit_ws_symbol(config: &Config) -> anyhow::Result<String> {
+    if let Some(coin) = config.coin.as_deref() {
+        let asset = coin
+            .chars()
+            .filter(|ch| ch.is_ascii_alphanumeric())
+            .collect::<String>()
+            .to_ascii_uppercase();
+
+        if asset.is_empty() {
+            bail!("`--coin` cannot be empty for exchange=bybit");
+        }
+
+        if has_bybit_quote_suffix(&asset) {
+            return Ok(asset);
+        }
+
+        return Ok(format!("{asset}USDT"));
+    }
+
+    let core = config
+        .symbol
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_uppercase();
+
+    let market_symbol = if core.contains('/') {
+        let mut parts = core.split('/');
+        let base = parts.next().unwrap_or_default().trim();
+        let quote = parts.next().unwrap_or_default().trim();
+        if base.is_empty() || quote.is_empty() || parts.next().is_some() {
+            bail!("invalid Bybit symbol `{}`", config.symbol);
+        }
+        format!("{base}{quote}")
+    } else {
+        core.chars()
+            .filter(|ch| ch.is_ascii_alphanumeric())
+            .collect::<String>()
+    };
+
+    if market_symbol.len() < 6 {
+        bail!("invalid Bybit symbol `{}`", config.symbol);
+    }
+
+    Ok(market_symbol)
+}
+
+fn has_bybit_quote_suffix(symbol: &str) -> bool {
+    ["USDT", "USDC", "USD", "BTC", "ETH", "EUR"]
+        .iter()
+        .any(|quote| symbol.len() > quote.len() && symbol.ends_with(quote))
+}
+
 fn resolve_hyperliquid_coin(config: &Config) -> String {
     if let Some(coin) = config.coin.as_deref() {
         return coin.trim().to_string();
@@ -1005,6 +1151,21 @@ async fn send_hyperliquid_subscription(
         .send(Message::Text(payload.to_string().into()))
         .await
         .context("failed to send websocket subscription")
+}
+
+async fn send_bybit_trade_subscription(
+    stream: &mut HyperliquidWsStream,
+    symbol: &str,
+) -> anyhow::Result<()> {
+    let payload = json!({
+        "op": "subscribe",
+        "args": [format!("publicTrade.{symbol}")],
+    });
+
+    stream
+        .send(Message::Text(payload.to_string().into()))
+        .await
+        .context("failed to send Bybit trade websocket subscription")
 }
 
 fn ws_message_text(message: Message) -> anyhow::Result<Option<String>> {
@@ -1180,6 +1341,58 @@ fn parse_binance_trades_message(payload: &str) -> Vec<TradeRow> {
         amount,
         cost,
     }]
+}
+
+fn parse_bybit_trades_message(payload: &str) -> Vec<TradeRow> {
+    let Ok(value) = serde_json::from_str::<Value>(payload) else {
+        return Vec::new();
+    };
+
+    let topic = value
+        .get("topic")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !topic.starts_with("publicTrade.") {
+        return Vec::new();
+    }
+
+    let Some(rows) = value.get("data").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    let mut parsed = Vec::with_capacity(rows.len());
+    for row in rows {
+        let timestamp = row.get("T").and_then(parse_u64_lossy);
+        let price = row.get("p").and_then(parse_f64_lossy);
+        let amount = row.get("v").and_then(parse_f64_lossy);
+        let id = row.get("i").and_then(stringify_json_value);
+        let side = row
+            .get("S")
+            .and_then(Value::as_str)
+            .map(|value| match value {
+                "Buy" | "BUY" | "buy" => "buy".to_string(),
+                "Sell" | "SELL" | "sell" => "sell".to_string(),
+                other => other.to_ascii_lowercase(),
+            });
+
+        let cost = match (price, amount) {
+            (Some(price), Some(amount)) => Some(price * amount),
+            _ => None,
+        };
+
+        parsed.push(TradeRow {
+            id,
+            timestamp,
+            datetime: timestamp.and_then(iso8601_millis),
+            side,
+            price,
+            amount,
+            cost,
+        });
+    }
+
+    parsed.sort_by_key(|trade| trade.timestamp.unwrap_or_default());
+    parsed
 }
 
 fn parse_binance_orderbook_message(
@@ -1782,10 +1995,10 @@ mod tests {
     use super::{
         build_binance_orderbook_ws_endpoint, build_level_rows, compute_book_stats,
         format_depth_bar, infer_hyperliquid_coin_from_symbol, normalize_book_levels, parse_args,
-        parse_binance_orderbook_message, parse_binance_trades_message,
+        parse_binance_orderbook_message, parse_binance_trades_message, parse_bybit_trades_message,
         parse_hyperliquid_orderbook_message, parse_hyperliquid_trades_message,
-        resolve_binance_ws_symbol, to_binance_ws_depth_levels, trade_key, Config, Mode,
-        OrderBookSnapshot, ParseResult, TradeDeduper, TradeRow, Transport,
+        resolve_binance_ws_symbol, resolve_bybit_ws_symbol, to_binance_ws_depth_levels, trade_key,
+        Config, Mode, OrderBookSnapshot, ParseResult, TradeDeduper, TradeRow, Transport,
     };
 
     fn parse_run(args: &[&str]) -> Config {
@@ -1998,6 +2211,15 @@ mod tests {
     }
 
     #[test]
+    fn resolve_bybit_ws_symbol_uses_coin_override() {
+        let config = parse_run(&["trades", "--exchange", "bybit", "--coin", "btc"]);
+        assert_eq!(resolve_bybit_ws_symbol(&config).unwrap(), "BTCUSDT");
+
+        let explicit_pair = parse_run(&["trades", "--exchange", "bybit", "--coin", "BTCUSDC"]);
+        assert_eq!(resolve_bybit_ws_symbol(&explicit_pair).unwrap(), "BTCUSDC");
+    }
+
+    #[test]
     fn parse_binance_trades_message_maps_trade_row() {
         let payload = r#"{
             "e": "trade",
@@ -2015,6 +2237,36 @@ mod tests {
         assert_eq!(parsed[0].id.as_deref(), Some("123456"));
         assert_eq!(parsed[0].timestamp, Some(1700000000000));
         assert_eq!(parsed[0].side.as_deref(), Some("sell"));
+        assert_eq!(parsed[0].price, Some(100.5));
+        assert_eq!(parsed[0].amount, Some(0.25));
+        assert_eq!(parsed[0].cost, Some(25.125));
+    }
+
+    #[test]
+    fn parse_bybit_trades_message_maps_trade_row() {
+        let payload = r#"{
+            "topic": "publicTrade.BTCUSDT",
+            "type": "snapshot",
+            "ts": 1700000000100,
+            "data": [
+                {
+                    "T": 1700000000000,
+                    "s": "BTCUSDT",
+                    "S": "Buy",
+                    "v": "0.25",
+                    "p": "100.5",
+                    "i": "abc-123",
+                    "BT": false,
+                    "RPI": false
+                }
+            ]
+        }"#;
+
+        let parsed = parse_bybit_trades_message(payload);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].id.as_deref(), Some("abc-123"));
+        assert_eq!(parsed[0].timestamp, Some(1700000000000));
+        assert_eq!(parsed[0].side.as_deref(), Some("buy"));
         assert_eq!(parsed[0].price, Some(100.5));
         assert_eq!(parsed[0].amount, Some(0.25));
         assert_eq!(parsed[0].cost, Some(25.125));
