@@ -8,7 +8,7 @@ This first version focuses on:
 
 - unified endpoint shapes (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`)
 - pluggable exchange adapter architecture
-- Hyperliquid market-data support for public recent trades
+- market-data support for `hyperliquid`, `binance`, and `bybit`
 - background websocket trade collector with in-memory ring buffer for deeper trade history
 
 ## Why this exists
@@ -24,7 +24,10 @@ Frontend apps (including Electron and web frontends) often cannot directly use s
 - `POST /v1/fetchTrades`
 - `POST /v1/fetchOHLCV`
 - `POST /v1/fetchOrderBook`
-- exchange supported: `hyperliquid`
+- exchange supported:
+  - `hyperliquid` (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`)
+  - `binance` (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`)
+  - `bybit` (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`)
 - market-data only (no private trading endpoints yet)
 
 ## API
@@ -173,6 +176,8 @@ Defaults:
 
 These helpers are separate from the main server runtime and are meant for quick manual checks against a running backend.
 
+Note: `market_stream` currently has `trades` and `orderbook` modes only. OHLCV is available through `POST /v1/fetchOHLCV`.
+
 Trades stream (prints only newly seen trades each poll):
 
 ```bash
@@ -197,17 +202,29 @@ Websocket trades stream (instant event-driven updates, no polling):
 cargo run --bin market_stream -- trades --transport ws --coin BTC
 ```
 
+Websocket trades stream for Bybit:
+
+```bash
+cargo run --bin market_stream -- trades --exchange bybit --transport ws --coin BTC
+```
+
+Websocket order book stream for Bybit:
+
+```bash
+cargo run --bin market_stream -- orderbook --exchange bybit --transport ws --coin BTC --render-ms 16
+```
+
 Useful optional flags:
 
 - `--base-url` (default `http://127.0.0.1:8787`)
 - `--exchange` (default `hyperliquid`)
-- `--transport` (`poll` or `ws`, default `poll`)
-- `--ws-url` (default `wss://api.hyperliquid.xyz/ws`)
+- `--transport` (`poll` or `ws`, default `ws`)
+- `--ws-url` (default depends on `--exchange`)
 - `--coin` (optional websocket coin override)
 - `--duration-secs` (stop automatically after N seconds)
 - `--iterations` (stop after N iterations)
 
-`--transport ws` currently targets Hyperliquid directly and is useful for socket-focused terminal testing; `--transport poll` continues to test your backend HTTP endpoints.
+`--transport ws` supports `trades` for `hyperliquid`, `binance`, and `bybit`, and supports `orderbook` for `hyperliquid`, `binance`, and `bybit`; `--transport poll` continues to test your backend HTTP endpoints.
 
 ## Testing against a running server
 

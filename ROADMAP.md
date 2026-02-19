@@ -2,7 +2,7 @@
 
 This document tracks what is done, what is next, and what to watch as this backend grows.
 
-Last updated: 2026-02-18
+Last updated: 2026-02-19
 
 ## How To Use This Doc
 
@@ -28,17 +28,20 @@ Completed:
   - `POST /v1/fetchOrderBook`
   - `GET /healthz`
 - Hyperliquid adapter integrated
+- Binance USDS adapter integrated (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`)
+- Bybit adapter integrated (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`)
 - Websocket trade collector + in-memory trade cache
+- `market_stream` websocket parity for trades/orderbook on Hyperliquid, Binance, and Bybit
 - Smoke test scripts (Python + PowerShell)
 - Live ignored integration tests
 
 In progress:
 
 - Production hardening and public-host readiness
+- Exchange expansion follow-up (next adapter candidate after Bybit)
 
 Not started:
 
-- Additional exchange adapters
 - Persistent/shared cache (Redis or similar)
 - Public deployment automation
 
@@ -99,18 +102,54 @@ Acceptance criteria:
 ## M3 - Exchange Expansion
 
 Target window: 2026-03 to 2026-04
-Status: `planned`
+Status: `done`
 
 Scope:
 
-- Add exchange #2 using current adapter interface
-- Add exchange #3
-- Build adapter checklist/template to speed future integrations
+- Add exchange #2 using current adapter interface (done: Binance USDS)
+- Add exchange #3 (done: Bybit)
+- Build adapter checklist/template to speed future integrations (done)
 
 Acceptance criteria:
 
 - New exchange can be added without changing frontend contract
 - Endpoint behavior remains consistent across exchanges
+
+## Exchange Adapter Checklist (Template)
+
+Use this checklist every time a new exchange is added.
+
+- Adapter wiring
+  - Create `src/exchanges/<exchange>/mod.rs` implementing `MarketDataExchange`
+  - Register module in `src/exchanges/mod.rs`
+  - Register adapter in `src/main.rs` through `ExchangeRegistry`
+  - Add only required SDK features/dependencies in `Cargo.toml`
+- Contract and normalization
+  - Define symbol input normalization and canonical output symbol mapping
+  - Define timeframe mapping (`1m`, `5m`, `1h`, etc.) to exchange-native values
+  - Clamp/translate endpoint limits to supported upstream values
+  - Preserve raw upstream payload in `info` where relevant
+- Endpoint parity
+  - `fetchTrades`: map id/timestamp/side/price/amount/cost consistently
+  - `fetchOHLCV`: map to `(timestamp, open, high, low, close, volume)` and enforce sorting
+  - `fetchOrderBook`: normalize bids descending and asks ascending
+  - Honor `since`, `limit`, and relevant `params` consistently
+- Websocket parity (tester)
+  - Add websocket trades parser + endpoint builder in `market_stream`
+  - Add websocket orderbook parser + endpoint builder in `market_stream`
+  - Ensure default websocket path works with `--exchange <id>`
+  - Fallback to poll mode with clear message if websocket path is not implemented
+- Errors and observability
+  - Map bad symbol/timeframe/limit cases to `ExchangeError::BadSymbol`
+  - Map network/upstream failures to `ExchangeError::UpstreamRequest`
+  - Map invalid upstream payloads to `ExchangeError::UpstreamData`
+  - Emit adapter-level warnings for skipped malformed rows
+- Validation
+  - Add unit tests for symbol normalization and payload mapping
+  - Add parser tests for websocket trade/orderbook messages
+  - Run `cargo test`
+  - Run smoke checks (`scripts/smoke_endpoints.py` or `.ps1`) for the exchange
+  - Verify `market_stream` trades and orderbook workflows
 
 ## M4 - Public Rollout and Operations
 
@@ -149,7 +188,7 @@ Week 3:
 
 Week 4:
 
-- Add second exchange adapter
+- Finalize third exchange adapter (Bybit)
 - Expand smoke/live test coverage for multi-exchange routing
 
 ## Risk Watchlist
@@ -180,6 +219,22 @@ Week 4:
 2026-02-17:
 
 - Decided to include websocket collector + in-memory trade cache now to improve `fetchTrades` depth beyond REST-only windows.
+
+2026-02-18:
+
+- Completed Binance USDS integration for `fetchTrades`, `fetchOHLCV`, and `fetchOrderBook` under the unified contract.
+
+2026-02-18:
+
+- Added a repeatable exchange adapter checklist template to standardize future integrations.
+
+2026-02-19:
+
+- Completed Bybit integration for `fetchTrades`, `fetchOHLCV`, and `fetchOrderBook` under the unified contract.
+
+2026-02-19:
+
+- Added Bybit websocket parity in `market_stream` for both `trades` and `orderbook` modes.
 
 ## Weekly Update Template
 
