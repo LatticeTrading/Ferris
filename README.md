@@ -27,7 +27,7 @@ Frontend apps (including Electron and web frontends) often cannot directly use s
 - exchange supported:
   - `hyperliquid` (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`)
   - `binance` (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`)
-  - `bybit` (`fetchTrades` only for now)
+  - `bybit` (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`)
 - market-data only (no private trading endpoints yet)
 
 ## API
@@ -206,6 +206,12 @@ Websocket trades stream for Bybit:
 cargo run --bin market_stream -- trades --exchange bybit --transport ws --coin BTC
 ```
 
+Websocket order book stream for Bybit:
+
+```bash
+cargo run --bin market_stream -- orderbook --exchange bybit --transport ws --coin BTC --render-ms 16
+```
+
 Useful optional flags:
 
 - `--base-url` (default `http://127.0.0.1:8787`)
@@ -216,7 +222,7 @@ Useful optional flags:
 - `--duration-secs` (stop automatically after N seconds)
 - `--iterations` (stop after N iterations)
 
-`--transport ws` supports `trades` for `hyperliquid`, `binance`, and `bybit`, and supports `orderbook` for `hyperliquid` and `binance`; `--transport poll` continues to test your backend HTTP endpoints.
+`--transport ws` supports `trades` for `hyperliquid`, `binance`, and `bybit`, and supports `orderbook` for `hyperliquid`, `binance`, and `bybit`; `--transport poll` continues to test your backend HTTP endpoints.
 
 ## Testing against a running server
 

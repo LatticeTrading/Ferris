@@ -67,6 +67,7 @@ Examples:
   cargo run --bin market_stream -- orderbook --levels 12 --poll-ms 900
   cargo run --bin market_stream -- orderbook --transport ws --coin BTC --render-ms 16
   cargo run --bin market_stream -- orderbook --exchange binance --transport ws --coin BTC
+  cargo run --bin market_stream -- orderbook --exchange bybit --transport ws --coin BTC
   cargo run --bin market_stream -- trades --exchange bybit --transport ws --coin BTC
   cargo run --bin market_stream -- trades --duration-secs 20
 "#;
@@ -403,12 +404,7 @@ async fn run_trades_stream_poll(client: &BackendClient, config: &Config) -> anyh
 async fn run_orderbook_stream(client: &BackendClient, config: &Config) -> anyhow::Result<()> {
     if config.transport == Transport::Ws {
         match config.exchange.as_str() {
-            "hyperliquid" | "binance" => return run_orderbook_stream_ws(config).await,
-            "bybit" => {
-                bail!(
-                    "orderbook stream for exchange=bybit is not implemented yet; run `cargo run --bin market_stream -- trades --exchange bybit --coin BTC` for this phase"
-                );
-            }
+            "hyperliquid" | "binance" | "bybit" => return run_orderbook_stream_ws(config).await,
             other => {
                 eprintln!(
                     "ws transport for exchange={other} is not wired yet; falling back to poll transport"
@@ -739,8 +735,9 @@ async fn run_orderbook_stream_ws(config: &Config) -> anyhow::Result<()> {
     match config.exchange.as_str() {
         "hyperliquid" => run_hyperliquid_orderbook_stream_ws(config).await,
         "binance" => run_binance_orderbook_stream_ws(config).await,
+        "bybit" => run_bybit_orderbook_stream_ws(config).await,
         other => bail!(
-            "ws transport for orderbook supports exchange=hyperliquid or exchange=binance (got `{other}`)"
+            "ws transport for orderbook supports exchange=hyperliquid, exchange=binance, or exchange=bybit (got `{other}`)"
         ),
     }
 }
@@ -936,6 +933,112 @@ async fn run_binance_orderbook_stream_ws(config: &Config) -> anyhow::Result<()> 
     Ok(())
 }
 
+async fn run_bybit_orderbook_stream_ws(config: &Config) -> anyhow::Result<()> {
+    let ws_endpoint = build_bybit_orderbook_ws_endpoint(config)?;
+    let symbol = resolve_bybit_ws_symbol(config)?;
+    let depth = to_bybit_ws_depth_levels(config.orderbook_levels);
+
+    let (mut stream, _) = connect_async(&ws_endpoint)
+        .await
+        .with_context(|| format!("failed to connect websocket {ws_endpoint}"))?;
+
+    send_bybit_orderbook_subscription(&mut stream, &symbol, depth).await?;
+
+    let mut renderer = OrderBookRenderer::new()?;
+    let started_at = Instant::now();
+    let mut iteration = 0u64;
+    let mut state: Option<OrderBookSnapshot> = None;
+
+    let waiting_frame = build_orderbook_error_frame(
+        iteration,
+        started_at.elapsed(),
+        &config.symbol,
+        "waiting for websocket orderbook updates",
+    );
+    renderer.render(&waiting_frame)?;
+
+    let mut stop_check = tokio::time::interval(Duration::from_millis(50));
+    stop_check.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    stop_check.tick().await;
+
+    let stop_reason = loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                break "received Ctrl+C";
+            }
+            _ = stop_check.tick() => {
+                if should_stop(started_at, iteration, config) {
+                    break "reached configured stop condition";
+                }
+            }
+            message = stream.next() => {
+                let Some(message) = message else {
+                    break "websocket closed by peer";
+                };
+
+                let message = match message {
+                    Ok(message) => message,
+                    Err(err) => {
+                        let frame = build_orderbook_error_frame(
+                            iteration,
+                            started_at.elapsed(),
+                            &config.symbol,
+                            &format!("websocket read error: {err}"),
+                        );
+                        renderer.render(&frame)?;
+                        continue;
+                    }
+                };
+
+                match message {
+                    Message::Ping(payload) => {
+                        stream
+                            .send(Message::Pong(payload))
+                            .await
+                            .context("failed to reply to websocket ping")?;
+                    }
+                    Message::Close(_) => {
+                        break "websocket closed by peer";
+                    }
+                    _ => {
+                        let Some(text) = ws_message_text(message)? else {
+                            continue;
+                        };
+
+                        let Some(event) = parse_bybit_orderbook_message(&text) else {
+                            continue;
+                        };
+
+                        if !apply_bybit_orderbook_event(
+                            &mut state,
+                            event,
+                            config.orderbook_levels,
+                            &config.symbol,
+                        ) {
+                            continue;
+                        }
+
+                        if let Some(book) = state.as_ref() {
+                            iteration += 1;
+                            let frame = build_orderbook_frame(
+                                book,
+                                config.orderbook_levels,
+                                iteration,
+                                started_at.elapsed(),
+                            );
+                            renderer.render(&frame)?;
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    drop(renderer);
+    println!("stopped: {stop_reason}");
+    Ok(())
+}
+
 fn ensure_hyperliquid_ws(config: &Config) -> anyhow::Result<()> {
     if config.exchange != "hyperliquid" {
         bail!(
@@ -984,6 +1087,10 @@ fn build_bybit_trade_ws_endpoint(config: &Config) -> anyhow::Result<String> {
     Ok(base_url.trim_end_matches('/').to_string())
 }
 
+fn build_bybit_orderbook_ws_endpoint(config: &Config) -> anyhow::Result<String> {
+    build_bybit_trade_ws_endpoint(config)
+}
+
 fn build_binance_orderbook_ws_endpoint(config: &Config) -> anyhow::Result<String> {
     let base_url = resolved_ws_base_url(config);
     let symbol = resolve_binance_ws_symbol(config)?;
@@ -1007,6 +1114,18 @@ fn to_binance_ws_depth_levels(levels: usize) -> usize {
         10
     } else {
         20
+    }
+}
+
+fn to_bybit_ws_depth_levels(levels: usize) -> usize {
+    if levels <= 1 {
+        1
+    } else if levels <= 50 {
+        50
+    } else if levels <= 200 {
+        200
+    } else {
+        1_000
     }
 }
 
@@ -1157,15 +1276,33 @@ async fn send_bybit_trade_subscription(
     stream: &mut HyperliquidWsStream,
     symbol: &str,
 ) -> anyhow::Result<()> {
+    let topic = format!("publicTrade.{symbol}");
+    send_bybit_subscription(stream, &topic, "trade").await
+}
+
+async fn send_bybit_orderbook_subscription(
+    stream: &mut HyperliquidWsStream,
+    symbol: &str,
+    depth: usize,
+) -> anyhow::Result<()> {
+    let topic = format!("orderbook.{depth}.{symbol}");
+    send_bybit_subscription(stream, &topic, "orderbook").await
+}
+
+async fn send_bybit_subscription(
+    stream: &mut HyperliquidWsStream,
+    topic: &str,
+    channel: &str,
+) -> anyhow::Result<()> {
     let payload = json!({
         "op": "subscribe",
-        "args": [format!("publicTrade.{symbol}")],
+        "args": [topic],
     });
 
     stream
         .send(Message::Text(payload.to_string().into()))
         .await
-        .context("failed to send Bybit trade websocket subscription")
+        .with_context(|| format!("failed to send Bybit {channel} websocket subscription"))
 }
 
 fn ws_message_text(message: Message) -> anyhow::Result<Option<String>> {
@@ -1393,6 +1530,170 @@ fn parse_bybit_trades_message(payload: &str) -> Vec<TradeRow> {
 
     parsed.sort_by_key(|trade| trade.timestamp.unwrap_or_default());
     parsed
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BybitOrderBookEventType {
+    Snapshot,
+    Delta,
+}
+
+#[derive(Debug)]
+struct BybitOrderBookEvent {
+    event_type: BybitOrderBookEventType,
+    bids: Vec<(f64, f64)>,
+    asks: Vec<(f64, f64)>,
+    timestamp: Option<u64>,
+}
+
+fn parse_bybit_orderbook_message(payload: &str) -> Option<BybitOrderBookEvent> {
+    let value = serde_json::from_str::<Value>(payload).ok()?;
+
+    let topic = value.get("topic")?.as_str()?;
+    if !topic.starts_with("orderbook.") {
+        return None;
+    }
+
+    let event_type = match value.get("type").and_then(Value::as_str)? {
+        "snapshot" => BybitOrderBookEventType::Snapshot,
+        "delta" => BybitOrderBookEventType::Delta,
+        _ => return None,
+    };
+
+    let data = value.get("data")?;
+    let bids = parse_bybit_orderbook_side(data.get("b"));
+    let asks = parse_bybit_orderbook_side(data.get("a"));
+
+    let timestamp = value
+        .get("ts")
+        .and_then(parse_u64_lossy)
+        .or_else(|| data.get("cts").and_then(parse_u64_lossy));
+
+    Some(BybitOrderBookEvent {
+        event_type,
+        bids,
+        asks,
+        timestamp,
+    })
+}
+
+fn parse_bybit_orderbook_side(value: Option<&Value>) -> Vec<(f64, f64)> {
+    let Some(levels) = value.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    let mut output = Vec::with_capacity(levels.len());
+    for row in levels {
+        let Some(row) = row.as_array() else {
+            continue;
+        };
+        if row.len() < 2 {
+            continue;
+        }
+
+        let Some(price) = row.first().and_then(parse_f64_lossy) else {
+            continue;
+        };
+        let Some(size) = row.get(1).and_then(parse_f64_lossy) else {
+            continue;
+        };
+
+        output.push((price, size));
+    }
+
+    output
+}
+
+fn apply_bybit_orderbook_event(
+    state: &mut Option<OrderBookSnapshot>,
+    event: BybitOrderBookEvent,
+    levels_limit: usize,
+    default_symbol: &str,
+) -> bool {
+    let symbol = default_symbol.to_string();
+    let datetime = event.timestamp.and_then(iso8601_millis);
+
+    match event.event_type {
+        BybitOrderBookEventType::Snapshot => {
+            let mut bids = event.bids;
+            let mut asks = event.asks;
+
+            normalize_bybit_book_side(&mut bids, true, levels_limit);
+            normalize_bybit_book_side(&mut asks, false, levels_limit);
+
+            *state = Some(OrderBookSnapshot {
+                asks,
+                bids,
+                datetime,
+                timestamp: event.timestamp,
+                symbol: Some(symbol),
+            });
+            true
+        }
+        BybitOrderBookEventType::Delta => {
+            let Some(book) = state.as_mut() else {
+                return false;
+            };
+
+            apply_bybit_level_updates(&mut book.bids, &event.bids, true);
+            apply_bybit_level_updates(&mut book.asks, &event.asks, false);
+
+            normalize_bybit_book_side(&mut book.bids, true, levels_limit);
+            normalize_bybit_book_side(&mut book.asks, false, levels_limit);
+
+            book.timestamp = event.timestamp;
+            book.datetime = datetime;
+            book.symbol = Some(symbol);
+            true
+        }
+    }
+}
+
+fn apply_bybit_level_updates(
+    levels: &mut Vec<(f64, f64)>,
+    updates: &[(f64, f64)],
+    descending: bool,
+) {
+    for (price, size) in updates {
+        let existing_index = levels
+            .iter()
+            .position(|(existing_price, _)| bybit_price_eq(*existing_price, *price));
+
+        if *size <= 0.0 {
+            if let Some(index) = existing_index {
+                levels.remove(index);
+            }
+            continue;
+        }
+
+        if let Some(index) = existing_index {
+            levels[index].1 = *size;
+        } else {
+            levels.push((*price, *size));
+        }
+    }
+
+    sort_bybit_book_side(levels, descending);
+}
+
+fn normalize_bybit_book_side(levels: &mut Vec<(f64, f64)>, descending: bool, levels_limit: usize) {
+    levels.retain(|(_, size)| *size > 0.0);
+    sort_bybit_book_side(levels, descending);
+    if levels.len() > levels_limit {
+        levels.truncate(levels_limit);
+    }
+}
+
+fn sort_bybit_book_side(levels: &mut [(f64, f64)], descending: bool) {
+    if descending {
+        levels.sort_by(|left, right| right.0.total_cmp(&left.0));
+    } else {
+        levels.sort_by(|left, right| left.0.total_cmp(&right.0));
+    }
+}
+
+fn bybit_price_eq(left: f64, right: f64) -> bool {
+    (left - right).abs() <= 1e-12
 }
 
 fn parse_binance_orderbook_message(
@@ -1993,12 +2294,15 @@ impl TradeDeduper {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_binance_orderbook_ws_endpoint, build_level_rows, compute_book_stats,
-        format_depth_bar, infer_hyperliquid_coin_from_symbol, normalize_book_levels, parse_args,
-        parse_binance_orderbook_message, parse_binance_trades_message, parse_bybit_trades_message,
+        apply_bybit_orderbook_event, build_binance_orderbook_ws_endpoint,
+        build_bybit_orderbook_ws_endpoint, build_level_rows, compute_book_stats, format_depth_bar,
+        infer_hyperliquid_coin_from_symbol, normalize_book_levels, parse_args,
+        parse_binance_orderbook_message, parse_binance_trades_message,
+        parse_bybit_orderbook_message, parse_bybit_trades_message,
         parse_hyperliquid_orderbook_message, parse_hyperliquid_trades_message,
-        resolve_binance_ws_symbol, resolve_bybit_ws_symbol, to_binance_ws_depth_levels, trade_key,
-        Config, Mode, OrderBookSnapshot, ParseResult, TradeDeduper, TradeRow, Transport,
+        resolve_binance_ws_symbol, resolve_bybit_ws_symbol, to_binance_ws_depth_levels,
+        to_bybit_ws_depth_levels, trade_key, BybitOrderBookEventType, Config, Mode,
+        OrderBookSnapshot, ParseResult, TradeDeduper, TradeRow, Transport,
     };
 
     fn parse_run(args: &[&str]) -> Config {
@@ -2273,6 +2577,79 @@ mod tests {
     }
 
     #[test]
+    fn parse_bybit_orderbook_message_maps_snapshot() {
+        let payload = r#"{
+            "topic": "orderbook.50.BTCUSDT",
+            "type": "snapshot",
+            "ts": 1700000000100,
+            "data": {
+                "s": "BTCUSDT",
+                "b": [["100.0", "1.5"], ["99.5", "2.0"]],
+                "a": [["100.5", "1.0"], ["101.0", "3.0"]],
+                "u": 12345,
+                "seq": 42
+            }
+        }"#;
+
+        let event = parse_bybit_orderbook_message(payload).expect("message should parse");
+        assert_eq!(event.event_type, BybitOrderBookEventType::Snapshot);
+        assert_eq!(event.timestamp, Some(1700000000100));
+        assert_eq!(event.bids, vec![(100.0, 1.5), (99.5, 2.0)]);
+        assert_eq!(event.asks, vec![(100.5, 1.0), (101.0, 3.0)]);
+    }
+
+    #[test]
+    fn apply_bybit_orderbook_event_applies_delta_updates() {
+        let snapshot_payload = r#"{
+            "topic": "orderbook.50.BTCUSDT",
+            "type": "snapshot",
+            "ts": 1700000000100,
+            "data": {
+                "s": "BTCUSDT",
+                "b": [["100.0", "1.5"], ["99.5", "2.0"]],
+                "a": [["100.5", "1.0"], ["101.0", "3.0"]],
+                "u": 12345
+            }
+        }"#;
+
+        let delta_payload = r#"{
+            "topic": "orderbook.50.BTCUSDT",
+            "type": "delta",
+            "ts": 1700000000200,
+            "data": {
+                "s": "BTCUSDT",
+                "b": [["100.0", "0.75"], ["98.0", "3.0"], ["99.5", "0"]],
+                "a": [["100.5", "0"], ["100.6", "1.2"]],
+                "u": 12346
+            }
+        }"#;
+
+        let snapshot =
+            parse_bybit_orderbook_message(snapshot_payload).expect("snapshot should parse");
+        let delta = parse_bybit_orderbook_message(delta_payload).expect("delta should parse");
+
+        let mut state = None;
+        assert!(apply_bybit_orderbook_event(
+            &mut state,
+            snapshot,
+            10,
+            "BTC/USDT:USDT"
+        ));
+        assert!(apply_bybit_orderbook_event(
+            &mut state,
+            delta,
+            10,
+            "BTC/USDT:USDT"
+        ));
+
+        let book = state.expect("state should contain orderbook");
+        assert_eq!(book.symbol.as_deref(), Some("BTC/USDT:USDT"));
+        assert_eq!(book.timestamp, Some(1700000000200));
+        assert_eq!(book.bids, vec![(100.0, 0.75), (98.0, 3.0)]);
+        assert_eq!(book.asks, vec![(100.6, 1.2), (101.0, 3.0)]);
+    }
+
+    #[test]
     fn parse_binance_orderbook_message_maps_levels() {
         let payload = r#"{
             "e": "depthUpdate",
@@ -2309,5 +2686,24 @@ mod tests {
         assert!(endpoint.ends_with("/btcusdt@depth20@100ms"));
         assert_eq!(to_binance_ws_depth_levels(10), 10);
         assert_eq!(to_binance_ws_depth_levels(20), 20);
+    }
+
+    #[test]
+    fn build_bybit_orderbook_ws_endpoint_uses_default_linear_ws() {
+        let config = parse_run(&[
+            "orderbook",
+            "--exchange",
+            "bybit",
+            "--transport",
+            "ws",
+            "--coin",
+            "BTC",
+        ]);
+
+        let endpoint = build_bybit_orderbook_ws_endpoint(&config).expect("endpoint should build");
+        assert_eq!(endpoint, "wss://stream.bybit.com/v5/public/linear");
+        assert_eq!(to_bybit_ws_depth_levels(1), 1);
+        assert_eq!(to_bybit_ws_depth_levels(20), 50);
+        assert_eq!(to_bybit_ws_depth_levels(120), 200);
     }
 }
