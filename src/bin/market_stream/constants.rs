@@ -1,0 +1,10 @@
+pub(crate) const DEFAULT_EXCHANGE: &str = "hyperliquid";
+pub(crate) const DEFAULT_SYMBOL: &str = "BTC/USDC:USDC";
+pub(crate) const DEFAULT_TRADE_LIMIT: usize = 25;
+pub(crate) const DEFAULT_ORDERBOOK_LEVELS: usize = 10;
+pub(crate) const MIN_ORDERBOOK_LEVELS: usize = 10;
+pub(crate) const DEFAULT_HYPERLIQUID_WS_URL: &str = "wss://api.hyperliquid.xyz/ws";
+pub(crate) const DEFAULT_BINANCE_FUTURES_WS_URL: &str = "wss://fstream.binance.com/ws";
+pub(crate) const DEFAULT_BYBIT_LINEAR_WS_URL: &str = "wss://stream.bybit.com/v5/public/linear";
+pub(crate) const MAX_ORDERBOOK_LEVELS: usize = 20;
+pub(crate) const TRADE_DEDUP_CAPACITY: usize = 20_000;
