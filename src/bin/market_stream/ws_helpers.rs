@@ -8,7 +8,7 @@ use crate::{
     constants::{
         DEFAULT_BINANCE_FUTURES_WS_URL, DEFAULT_BYBIT_LINEAR_WS_URL, DEFAULT_HYPERLIQUID_WS_URL,
     },
-    view::{iso8601_millis, OrderBookSnapshot, TradeRow},
+    view::{iso8601_millis, OhlcvRow, OrderBookSnapshot, TradeRow},
 };
 
 pub(crate) fn ensure_hyperliquid_ws(config: &Config) -> anyhow::Result<()> {
@@ -79,6 +79,22 @@ pub(crate) fn build_binance_orderbook_ws_endpoint(config: &Config) -> anyhow::Re
     ))
 }
 
+pub(crate) fn build_binance_ohlcv_ws_endpoint(config: &Config) -> anyhow::Result<String> {
+    let base_url = resolved_ws_base_url(config);
+    let symbol = resolve_binance_ws_symbol(config)?;
+    let interval = to_binance_ws_interval(&config.ohlcv_timeframe)?;
+    let stream_name = format!("{}@kline_{}", symbol.to_ascii_lowercase(), interval);
+    Ok(format!(
+        "{}/{}",
+        base_url.trim_end_matches('/'),
+        stream_name
+    ))
+}
+
+pub(crate) fn build_bybit_ohlcv_ws_endpoint(config: &Config) -> anyhow::Result<String> {
+    build_bybit_trade_ws_endpoint(config)
+}
+
 pub(crate) fn to_binance_ws_depth_levels(levels: usize) -> usize {
     if levels <= 5 {
         5
@@ -98,6 +114,60 @@ pub(crate) fn to_bybit_ws_depth_levels(levels: usize) -> usize {
         200
     } else {
         1_000
+    }
+}
+
+pub(crate) fn to_binance_ws_interval(timeframe: &str) -> anyhow::Result<&'static str> {
+    let trimmed = timeframe.trim();
+    if trimmed == "1M" {
+        return Ok("1M");
+    }
+    let normalized = trimmed.to_ascii_lowercase();
+    match normalized.as_str() {
+        "1m" => Ok("1m"),
+        "3m" => Ok("3m"),
+        "5m" => Ok("5m"),
+        "15m" => Ok("15m"),
+        "30m" => Ok("30m"),
+        "1h" => Ok("1h"),
+        "2h" => Ok("2h"),
+        "4h" => Ok("4h"),
+        "6h" => Ok("6h"),
+        "8h" => Ok("8h"),
+        "12h" => Ok("12h"),
+        "1d" => Ok("1d"),
+        "3d" => Ok("3d"),
+        "1w" => Ok("1w"),
+        _ => bail!(
+            "unsupported Binance OHLCV timeframe `{}`; supported: 1m,3m,5m,15m,30m,1h,2h,4h,6h,8h,12h,1d,3d,1w,1M",
+            timeframe
+        ),
+    }
+}
+
+pub(crate) fn to_bybit_ws_interval(timeframe: &str) -> anyhow::Result<&'static str> {
+    let trimmed = timeframe.trim();
+    if trimmed == "1M" {
+        return Ok("M");
+    }
+    let normalized = trimmed.to_ascii_lowercase();
+    match normalized.as_str() {
+        "1m" => Ok("1"),
+        "3m" => Ok("3"),
+        "5m" => Ok("5"),
+        "15m" => Ok("15"),
+        "30m" => Ok("30"),
+        "1h" => Ok("60"),
+        "2h" => Ok("120"),
+        "4h" => Ok("240"),
+        "6h" => Ok("360"),
+        "12h" => Ok("720"),
+        "1d" => Ok("D"),
+        "1w" => Ok("W"),
+        _ => bail!(
+            "unsupported Bybit OHLCV timeframe `{}`; supported: 1m,3m,5m,15m,30m,1h,2h,4h,6h,12h,1d,1w,1M",
+            timeframe
+        ),
     }
 }
 
@@ -259,6 +329,15 @@ pub(crate) async fn send_bybit_orderbook_subscription(
 ) -> anyhow::Result<()> {
     let topic = format!("orderbook.{depth}.{symbol}");
     send_bybit_subscription(stream, &topic, "orderbook").await
+}
+
+pub(crate) async fn send_bybit_ohlcv_subscription(
+    stream: &mut HyperliquidWsStream,
+    symbol: &str,
+    interval: &str,
+) -> anyhow::Result<()> {
+    let topic = format!("kline.{interval}.{symbol}");
+    send_bybit_subscription(stream, &topic, "kline").await
 }
 
 pub(crate) async fn send_bybit_subscription(
@@ -456,6 +535,42 @@ pub(crate) fn parse_binance_trades_message(payload: &str) -> Vec<TradeRow> {
     }]
 }
 
+pub(crate) fn parse_binance_ohlcv_message(payload: &str) -> Vec<OhlcvRow> {
+    let Ok(value) = serde_json::from_str::<Value>(payload) else {
+        return Vec::new();
+    };
+
+    let data = value.get("data").unwrap_or(&value);
+    if data.get("e").and_then(Value::as_str).unwrap_or_default() != "kline" {
+        return Vec::new();
+    }
+
+    let Some(kline) = data.get("k") else {
+        return Vec::new();
+    };
+
+    let Some(timestamp) = kline.get("t").and_then(parse_u64_lossy) else {
+        return Vec::new();
+    };
+    let Some(open) = kline.get("o").and_then(parse_f64_lossy) else {
+        return Vec::new();
+    };
+    let Some(high) = kline.get("h").and_then(parse_f64_lossy) else {
+        return Vec::new();
+    };
+    let Some(low) = kline.get("l").and_then(parse_f64_lossy) else {
+        return Vec::new();
+    };
+    let Some(close) = kline.get("c").and_then(parse_f64_lossy) else {
+        return Vec::new();
+    };
+    let Some(volume) = kline.get("v").and_then(parse_f64_lossy) else {
+        return Vec::new();
+    };
+
+    vec![OhlcvRow(timestamp, open, high, low, close, volume)]
+}
+
 pub(crate) fn parse_bybit_trades_message(payload: &str) -> Vec<TradeRow> {
     let Ok(value) = serde_json::from_str::<Value>(payload) else {
         return Vec::new();
@@ -505,6 +620,51 @@ pub(crate) fn parse_bybit_trades_message(payload: &str) -> Vec<TradeRow> {
     }
 
     parsed.sort_by_key(|trade| trade.timestamp.unwrap_or_default());
+    parsed
+}
+
+pub(crate) fn parse_bybit_ohlcv_message(payload: &str) -> Vec<OhlcvRow> {
+    let Ok(value) = serde_json::from_str::<Value>(payload) else {
+        return Vec::new();
+    };
+
+    let topic = value
+        .get("topic")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !topic.starts_with("kline.") {
+        return Vec::new();
+    }
+
+    let Some(rows) = value.get("data").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    let mut parsed = Vec::with_capacity(rows.len());
+    for row in rows {
+        let Some(timestamp) = row.get("start").and_then(parse_u64_lossy) else {
+            continue;
+        };
+        let Some(open) = row.get("open").and_then(parse_f64_lossy) else {
+            continue;
+        };
+        let Some(high) = row.get("high").and_then(parse_f64_lossy) else {
+            continue;
+        };
+        let Some(low) = row.get("low").and_then(parse_f64_lossy) else {
+            continue;
+        };
+        let Some(close) = row.get("close").and_then(parse_f64_lossy) else {
+            continue;
+        };
+        let Some(volume) = row.get("volume").and_then(parse_f64_lossy) else {
+            continue;
+        };
+
+        parsed.push(OhlcvRow(timestamp, open, high, low, close, volume));
+    }
+
+    parsed.sort_by_key(|candle| candle.timestamp());
     parsed
 }
 

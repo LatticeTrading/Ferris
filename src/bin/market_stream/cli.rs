@@ -6,6 +6,7 @@ const USAGE: &str = r#"Usage:
 Modes:
   trades       Print newly seen trades from websocket streams
   orderbook    Render a live in-terminal orderbook from websocket streams
+  ohlcv        Render a live in-terminal candle chart from websocket streams
 
 Common options:
   --exchange <id>          Exchange id (default: hyperliquid)
@@ -22,10 +23,16 @@ Mode-specific options:
   orderbook:
     --levels <count>       Depth levels to display/request (default: 10, min: 10, max: 20)
 
+  ohlcv:
+    --timeframe <value>    Candle timeframe (default: 1m)
+    --limit <count>        Candles kept in chart window (default: 120)
+    --chart-height <rows>  Candle chart height (default: 16, min: 6, max: 40)
+
 Examples:
   cargo run --bin market_stream -- trades --exchange bybit --coin BTC
   cargo run --bin market_stream -- orderbook --exchange bybit --coin BTC
-  cargo run --bin market_stream -- orderbook --exchange binance --symbol BTC/USDT:USDT
+  cargo run --bin market_stream -- ohlcv --exchange bybit --coin BTC --timeframe 1m
+  cargo run --bin market_stream -- ohlcv --exchange binance --symbol BTC/USDT:USDT
 
 Notes:
   market_stream is websocket-only. Poll transport is intentionally removed.
@@ -35,6 +42,7 @@ Notes:
 pub(crate) enum Mode {
     Trades,
     OrderBook,
+    Ohlcv,
 }
 
 impl Mode {
@@ -42,6 +50,7 @@ impl Mode {
         match self {
             Self::Trades => "trades",
             Self::OrderBook => "orderbook",
+            Self::Ohlcv => "ohlcv",
         }
     }
 }
@@ -57,6 +66,9 @@ pub(crate) struct Config {
     pub(crate) iterations: Option<u64>,
     pub(crate) trade_limit: usize,
     pub(crate) orderbook_levels: usize,
+    pub(crate) ohlcv_timeframe: String,
+    pub(crate) ohlcv_limit: usize,
+    pub(crate) ohlcv_chart_height: usize,
 }
 
 #[derive(Debug)]
@@ -86,6 +98,9 @@ pub(crate) fn parse_args(args: &[String]) -> Result<ParseResult, String> {
         iterations: None,
         trade_limit: DEFAULT_TRADE_LIMIT,
         orderbook_levels: DEFAULT_ORDERBOOK_LEVELS,
+        ohlcv_timeframe: DEFAULT_OHLCV_TIMEFRAME.to_string(),
+        ohlcv_limit: DEFAULT_OHLCV_LIMIT,
+        ohlcv_chart_height: DEFAULT_OHLCV_CHART_HEIGHT,
     };
 
     let mut index = 1usize;
@@ -121,14 +136,23 @@ pub(crate) fn parse_args(args: &[String]) -> Result<ParseResult, String> {
                 config.iterations = Some(parse_u64_gt_zero("--iterations", &value(&mut index)?)?);
             }
             "--limit" => {
-                config.trade_limit = parse_usize_gt_zero("--limit", &value(&mut index)?)?;
+                let limit = parse_usize_gt_zero("--limit", &value(&mut index)?)?;
+                config.trade_limit = limit;
+                config.ohlcv_limit = limit;
             }
             "--levels" => {
                 let levels = parse_usize_gt_zero("--levels", &value(&mut index)?)?;
                 config.orderbook_levels = levels.clamp(MIN_ORDERBOOK_LEVELS, MAX_ORDERBOOK_LEVELS);
             }
-            "--transport" | "--poll-ms" | "--base-url" | "--timeout-secs" | "--render-ms"
-            | "--timeframe" | "--chart-height" => {
+            "--timeframe" => {
+                config.ohlcv_timeframe = value(&mut index)?;
+            }
+            "--chart-height" => {
+                let chart_height = parse_usize_gt_zero("--chart-height", &value(&mut index)?)?;
+                config.ohlcv_chart_height =
+                    chart_height.clamp(MIN_OHLCV_CHART_HEIGHT, MAX_OHLCV_CHART_HEIGHT);
+            }
+            "--transport" | "--poll-ms" | "--base-url" | "--timeout-secs" | "--render-ms" => {
                 return Err(format!(
                     "`{flag}` is no longer supported; market_stream is websocket-only"
                 ));
@@ -150,6 +174,9 @@ pub(crate) fn parse_args(args: &[String]) -> Result<ParseResult, String> {
     if config.symbol.trim().is_empty() {
         return Err("`--symbol` cannot be empty".to_string());
     }
+    if config.ohlcv_timeframe.trim().is_empty() {
+        return Err("`--timeframe` cannot be empty".to_string());
+    }
     if let Some(coin) = config.coin.as_deref() {
         if coin.trim().is_empty() {
             return Err("`--coin` cannot be empty".to_string());
@@ -163,8 +190,9 @@ fn parse_mode(value: &str) -> Result<Mode, String> {
     match value {
         "trades" => Ok(Mode::Trades),
         "orderbook" => Ok(Mode::OrderBook),
+        "ohlcv" | "ohlc" => Ok(Mode::Ohlcv),
         _ => Err(format!(
-            "invalid mode `{value}` (expected `trades` or `orderbook`)"
+            "invalid mode `{value}` (expected `trades`, `orderbook`, or `ohlcv`)"
         )),
     }
 }

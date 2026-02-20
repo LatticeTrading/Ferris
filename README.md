@@ -176,7 +176,7 @@ Defaults:
 
 These helpers are separate from the main server runtime and connect directly to exchange websocket streams.
 
-`market_stream` is websocket-only and supports `trades` and `orderbook` modes.
+`market_stream` is websocket-only and supports `trades`, `orderbook`, and `ohlcv` modes.
 
 Trades stream:
 
@@ -196,6 +196,12 @@ Binance order book stream:
 cargo run --bin market_stream -- orderbook --exchange binance --symbol BTC/USDT:USDT
 ```
 
+Real-time OHLCV stream:
+
+```bash
+cargo run --bin market_stream -- ohlcv --exchange bybit --coin BTC --timeframe 1m
+```
+
 Useful optional flags:
 
 - `--exchange` (default `hyperliquid`)
@@ -204,6 +210,8 @@ Useful optional flags:
 - `--coin` (optional websocket coin override)
 - `--levels` (order book depth to display; default `10`, min `10`, max `20`)
 - `--limit` (trades dedup buffer sizing hint; default `25`)
+- `--timeframe` (OHLCV timeframe, for example `1m`, `5m`, `1h`)
+- `--chart-height` (OHLCV chart rows, default `16`)
 - `--duration-secs` (stop automatically after N seconds)
 - `--iterations` (stop automatically after N updates)
 
@@ -211,6 +219,7 @@ Supported exchanges for websocket modes:
 
 - `trades`: `hyperliquid`, `binance`, `bybit`
 - `orderbook`: `hyperliquid`, `binance`, `bybit`
+- `ohlcv`: `binance`, `bybit`
 
 ## Testing against a running server
 
