@@ -2,7 +2,7 @@
 
 This document tracks what is done, what is next, and what to watch as this backend grows.
 
-Last updated: 2026-02-19
+Last updated: 2026-02-20
 
 ## How To Use This Doc
 
@@ -31,7 +31,11 @@ Completed:
 - Binance USDS adapter integrated (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`)
 - Bybit adapter integrated (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`)
 - Websocket trade collector + in-memory trade cache
-- `market_stream` websocket parity for trades/orderbook on Hyperliquid, Binance, and Bybit
+- `market_stream` modularized and made websocket-only (poll transport removed)
+- `market_stream` websocket parity:
+  - `trades`: Hyperliquid, Binance, Bybit
+  - `orderbook`: Hyperliquid, Binance, Bybit
+  - `ohlcv`: Binance, Bybit
 - Smoke test scripts (Python + PowerShell)
 - Live ignored integration tests
 
@@ -137,8 +141,9 @@ Use this checklist every time a new exchange is added.
 - Websocket parity (tester)
   - Add websocket trades parser + endpoint builder in `market_stream`
   - Add websocket orderbook parser + endpoint builder in `market_stream`
+  - Add websocket OHLCV parser + endpoint builder in `market_stream` when supported upstream
   - Ensure default websocket path works with `--exchange <id>`
-  - Fallback to poll mode with clear message if websocket path is not implemented
+  - Return a clear unsupported-mode error if websocket path is not implemented (no poll fallback)
 - Errors and observability
   - Map bad symbol/timeframe/limit cases to `ExchangeError::BadSymbol`
   - Map network/upstream failures to `ExchangeError::UpstreamRequest`
@@ -146,10 +151,10 @@ Use this checklist every time a new exchange is added.
   - Emit adapter-level warnings for skipped malformed rows
 - Validation
   - Add unit tests for symbol normalization and payload mapping
-  - Add parser tests for websocket trade/orderbook messages
+  - Add parser tests for websocket trades/orderbook/OHLCV messages
   - Run `cargo test`
   - Run smoke checks (`scripts/smoke_endpoints.py` or `.ps1`) for the exchange
-  - Verify `market_stream` trades and orderbook workflows
+  - Verify `market_stream` trades, orderbook, and OHLCV workflows
 
 ## M4 - Public Rollout and Operations
 
@@ -188,8 +193,8 @@ Week 3:
 
 Week 4:
 
-- Finalize third exchange adapter (Bybit)
-- Expand smoke/live test coverage for multi-exchange routing
+- Improve startup diagnostics and request tracing for operator debugging
+- Publish production config examples and rollout checklist
 
 ## Risk Watchlist
 
@@ -235,6 +240,14 @@ Week 4:
 2026-02-19:
 
 - Added Bybit websocket parity in `market_stream` for both `trades` and `orderbook` modes.
+
+2026-02-20:
+
+- Refactored `market_stream` into modules and removed all poll transport paths so the tester is websocket-only.
+
+2026-02-20:
+
+- Added real-time websocket OHLCV mode to `market_stream` for Binance and Bybit, including candle parsing, timeframe mapping, and terminal chart rendering.
 
 ## Weekly Update Template
 

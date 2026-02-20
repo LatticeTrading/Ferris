@@ -202,6 +202,12 @@ Real-time OHLCV stream:
 cargo run --bin market_stream -- ohlcv --exchange bybit --coin BTC --timeframe 1m
 ```
 
+Binance real-time OHLCV stream:
+
+```bash
+cargo run --bin market_stream -- ohlcv --exchange binance --symbol BTC/USDT:USDT --timeframe 1m
+```
+
 Useful optional flags:
 
 - `--exchange` (default `hyperliquid`)
@@ -209,17 +215,24 @@ Useful optional flags:
 - `--ws-url` (websocket base URL override; default depends on `--exchange`)
 - `--coin` (optional websocket coin override)
 - `--levels` (order book depth to display; default `10`, min `10`, max `20`)
-- `--limit` (trades dedup buffer sizing hint; default `25`)
+- `--limit` (trades dedup buffer hint; also OHLCV candle window size, default `25` for trades, `120` for OHLCV)
 - `--timeframe` (OHLCV timeframe, for example `1m`, `5m`, `1h`)
 - `--chart-height` (OHLCV chart rows, default `16`)
 - `--duration-secs` (stop automatically after N seconds)
 - `--iterations` (stop automatically after N updates)
+
+OHLCV websocket timeframe support:
+
+- `binance`: `1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 8h, 12h, 1d, 3d, 1w, 1M`
+- `bybit`: `1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 12h, 1d, 1w, 1M`
 
 Supported exchanges for websocket modes:
 
 - `trades`: `hyperliquid`, `binance`, `bybit`
 - `orderbook`: `hyperliquid`, `binance`, `bybit`
 - `ohlcv`: `binance`, `bybit`
+
+If you run `ohlcv` with an unsupported exchange (for example `hyperliquid`), the CLI exits with a clear websocket support error.
 
 ## Testing against a running server
 
