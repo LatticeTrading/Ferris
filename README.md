@@ -174,57 +174,65 @@ Defaults:
 
 ## Terminal stream viewers
 
-These helpers are separate from the main server runtime and are meant for quick manual checks against a running backend.
+These helpers are separate from the main server runtime and connect directly to exchange websocket streams.
 
-Note: `market_stream` currently has `trades` and `orderbook` modes only. OHLCV is available through `POST /v1/fetchOHLCV`.
+`market_stream` is websocket-only and supports `trades`, `orderbook`, and `ohlcv` modes.
 
-Trades stream (prints only newly seen trades each poll):
+Trades stream:
 
 ```bash
-cargo run --bin market_stream -- trades --symbol BTC/USDC:USDC --poll-ms 500
+cargo run --bin market_stream -- trades --exchange bybit --coin BTC
 ```
 
-Order book stream (lightweight terminal redraw):
+Order book stream:
 
 ```bash
-cargo run --bin market_stream -- orderbook --symbol BTC/USDC:USDC --levels 10 --poll-ms 800
+cargo run --bin market_stream -- orderbook --exchange bybit --coin BTC
 ```
 
-Websocket order book stream (instant event-driven updates, no polling):
+Binance order book stream:
 
 ```bash
-cargo run --bin market_stream -- orderbook --transport ws --coin BTC --render-ms 16
+cargo run --bin market_stream -- orderbook --exchange binance --symbol BTC/USDT:USDT
 ```
 
-Websocket trades stream (instant event-driven updates, no polling):
+Real-time OHLCV stream:
 
 ```bash
-cargo run --bin market_stream -- trades --transport ws --coin BTC
+cargo run --bin market_stream -- ohlcv --exchange bybit --coin BTC --timeframe 1m
 ```
 
-Websocket trades stream for Bybit:
+Binance real-time OHLCV stream:
 
 ```bash
-cargo run --bin market_stream -- trades --exchange bybit --transport ws --coin BTC
-```
-
-Websocket order book stream for Bybit:
-
-```bash
-cargo run --bin market_stream -- orderbook --exchange bybit --transport ws --coin BTC --render-ms 16
+cargo run --bin market_stream -- ohlcv --exchange binance --symbol BTC/USDT:USDT --timeframe 1m
 ```
 
 Useful optional flags:
 
-- `--base-url` (default `http://127.0.0.1:8787`)
 - `--exchange` (default `hyperliquid`)
-- `--transport` (`poll` or `ws`, default `ws`)
-- `--ws-url` (default depends on `--exchange`)
+- `--symbol` (default `BTC/USDC:USDC`)
+- `--ws-url` (websocket base URL override; default depends on `--exchange`)
 - `--coin` (optional websocket coin override)
+- `--levels` (order book depth to display; default `10`, min `10`, max `20`)
+- `--limit` (trades dedup buffer hint; also OHLCV candle window size, default `25` for trades, `120` for OHLCV)
+- `--timeframe` (OHLCV timeframe, for example `1m`, `5m`, `1h`)
+- `--chart-height` (OHLCV chart rows, default `16`)
 - `--duration-secs` (stop automatically after N seconds)
-- `--iterations` (stop after N iterations)
+- `--iterations` (stop automatically after N updates)
 
-`--transport ws` supports `trades` for `hyperliquid`, `binance`, and `bybit`, and supports `orderbook` for `hyperliquid`, `binance`, and `bybit`; `--transport poll` continues to test your backend HTTP endpoints.
+OHLCV websocket timeframe support:
+
+- `binance`: `1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 8h, 12h, 1d, 3d, 1w, 1M`
+- `bybit`: `1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 12h, 1d, 1w, 1M`
+
+Supported exchanges for websocket modes:
+
+- `trades`: `hyperliquid`, `binance`, `bybit`
+- `orderbook`: `hyperliquid`, `binance`, `bybit`
+- `ohlcv`: `binance`, `bybit`
+
+If you run `ohlcv` with an unsupported exchange (for example `hyperliquid`), the CLI exits with a clear websocket support error.
 
 ## Testing against a running server
 
