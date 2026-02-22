@@ -7,7 +7,7 @@ default-run = "ferris-market-data-backend"
 [dependencies]
 anyhow = "1.0.100"
 async-trait = "0.1.89"
-axum = { version = "0.7.9", features = ["json", "macros"] }
+axum = { version = "0.7.9", features = ["json", "macros", "ws"] }
 chrono = { version = "0.4.42", default-features = false, features = ["clock", "std"] }
 reqwest = { version = "0.12.24", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1.0.228", features = ["derive"] }

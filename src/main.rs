@@ -1,9 +1,3 @@
-mod config;
-mod errors;
-mod exchanges;
-mod models;
-mod web;
-
 use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::Context;
@@ -11,16 +5,19 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use config::Config;
-use exchanges::{
-    binance::BinanceExchange, bybit::BybitExchange, hyperliquid::HyperliquidExchange,
-    registry::ExchangeRegistry,
+use ferris_market_data_backend::{
+    config::Config,
+    exchanges::{
+        binance::BinanceExchange, bybit::BybitExchange, hyperliquid::HyperliquidExchange,
+        registry::ExchangeRegistry,
+    },
+    realtime::TradesTopicManager,
+    web::{self, AppState},
 };
 use tokio::signal;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::{info, Level};
 use tracing_subscriber::{fmt, EnvFilter};
-use web::AppState;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -39,13 +36,15 @@ async fn main() -> anyhow::Result<()> {
         config.trade_collector_enabled,
     )?));
 
-    let state = AppState::new(Arc::new(registry));
+    let trades_topic_manager = TradesTopicManager::new(config.hyperliquid_base_url.clone());
+    let state = AppState::new(Arc::new(registry), trades_topic_manager);
 
     let app = Router::new()
         .route("/healthz", get(web::health))
         .route("/v1/fetchTrades", post(web::fetch_trades))
         .route("/v1/fetchOHLCV", post(web::fetch_ohlcv))
         .route("/v1/fetchOrderBook", post(web::fetch_order_book))
+        .route("/v1/ws", get(web::trades_stream_ws))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
         .with_state(state);

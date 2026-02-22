@@ -1,15 +1,19 @@
 # Ferris Market Data Backend
 
-Open-source Rust backend that gives your frontend a CCXT-like way to query exchange data.
+Open-source Rust backend that gives your frontend a CCXT-like way to fetch snapshots and subscribe to shared realtime market-data streams.
 
 Planning and delivery tracking lives in `ROADMAP.md`.
+
+Frontend integration guidance lives in `INTEGRATION_README.md`.
 
 This first version focuses on:
 
 - unified endpoint shapes (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`)
+- backend websocket fanout for realtime trades (`GET /v1/ws`)
 - pluggable exchange adapter architecture
 - market-data support for `hyperliquid`, `binance`, and `bybit`
-- background websocket trade collector with in-memory ring buffer for deeper trade history
+- one upstream trade stream per active topic with multi-client broadcast
+- background websocket trade collector with in-memory ring buffer for deeper snapshot history
 
 ## Why this exists
 
@@ -18,12 +22,24 @@ Frontend apps (including Electron and web frontends) often cannot directly use s
 - you can run it for public users (for example on Hetzner)
 - users can self-host their own backend
 - your frontend uses one clean API contract regardless of exchange
+- app clients subscribe to backend websocket topics instead of high-frequency HTTP polling for live trades
+
+## Realtime Architecture
+
+- app client connects once to `GET /v1/ws` and sends `subscribe` / `unsubscribe` commands
+- backend topic manager keys subscriptions by exchange + channel + symbol (+ params)
+- one upstream websocket stream is maintained per active trades topic
+- multiple client connections subscribed to the same topic receive the same broadcast updates
+- idle topics are closed, and dropped upstream streams reconnect with backoff
 
 ## Current scope
 
-- `POST /v1/fetchTrades`
-- `POST /v1/fetchOHLCV`
-- `POST /v1/fetchOrderBook`
+- Snapshot endpoints (bootstrap/fallback):
+  - `POST /v1/fetchTrades`
+  - `POST /v1/fetchOHLCV`
+  - `POST /v1/fetchOrderBook`
+- Realtime endpoint:
+  - `GET /v1/ws` (websocket subscribe/unsubscribe for realtime `trades`)
 - exchange supported:
   - `hyperliquid` (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`)
   - `binance` (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`)
@@ -32,9 +48,11 @@ Frontend apps (including Electron and web frontends) often cannot directly use s
 
 ## API
 
-### Fetch Trades
+### Fetch Trades (Snapshot)
 
 `POST /v1/fetchTrades`
+
+Use for initial bootstrap or fallback reads. For live trade updates, use `GET /v1/ws`.
 
 Request body:
 
@@ -81,9 +99,11 @@ Response body (CCXT-like `Trade[]`):
 ]
 ```
 
-### Fetch OHLCV
+### Fetch OHLCV (Snapshot)
 
 `POST /v1/fetchOHLCV`
+
+Snapshot endpoint for candles.
 
 Request body:
 
@@ -108,9 +128,90 @@ Response body (CCXT-like `OHLCV[]`):
 ]
 ```
 
-### Fetch Order Book
+### Realtime Trades Stream (WebSocket)
+
+`GET /v1/ws`
+
+The websocket endpoint currently supports realtime `trades` only. Backend topic fanout is shared, so multiple app clients subscribing to the same topic use one upstream exchange stream.
+
+Subscribe command:
+
+```json
+{
+  "op": "subscribe",
+  "channel": "trades",
+  "exchange": "bybit",
+  "symbol": "BTC/USDT:USDT",
+  "params": {
+    "category": "linear"
+  }
+}
+```
+
+Unsubscribe command:
+
+```json
+{
+  "op": "unsubscribe",
+  "channel": "trades",
+  "exchange": "bybit",
+  "symbol": "BTC/USDT:USDT",
+  "params": {
+    "category": "linear"
+  }
+}
+```
+
+Server trade update:
+
+```json
+{
+  "type": "trades",
+  "topic": {
+    "exchange": "bybit",
+    "symbol": "BTC/USDT:USDT",
+    "params": {
+      "category": "linear"
+    }
+  },
+  "data": [
+    {
+      "info": {
+        "T": 1700000000000,
+        "S": "Buy",
+        "p": "100.5",
+        "v": "0.25",
+        "i": "abc-123"
+      },
+      "amount": 0.25,
+      "datetime": "2023-11-14T22:13:20.000Z",
+      "id": "abc-123",
+      "order": null,
+      "price": 100.5,
+      "timestamp": 1700000000000,
+      "type": null,
+      "side": "buy",
+      "symbol": "BTC/USDT:USDT",
+      "takerOrMaker": null,
+      "cost": 25.125,
+      "fee": null
+    }
+  ]
+}
+```
+
+Recommended client flow for trades:
+
+1. Call `POST /v1/fetchTrades` for initial data.
+2. Open `GET /v1/ws` and subscribe to the same topic.
+3. Render live updates from `type="trades"` push messages.
+4. Use snapshot endpoints only for bootstrap/fallback, not high-frequency polling.
+
+### Fetch Order Book (Snapshot)
 
 `POST /v1/fetchOrderBook`
+
+Snapshot endpoint for order book reads.
 
 Request body:
 
@@ -309,6 +410,12 @@ You can override target server and test market with env vars:
 FERRIS_BASE_URL=http://127.0.0.1:8787 FERRIS_TEST_SYMBOL=ETH/USDC:USDC cargo test --test live_endpoints -- --ignored
 ```
 
+Realtime websocket fanout integration test (self-contained; spins up mock upstream + backend in-process):
+
+```bash
+cargo test --test realtime_ws
+```
+
 ## Docker
 
 Build:
@@ -338,4 +445,4 @@ This keeps the frontend contract stable while exchange integrations evolve indep
 
 ## Notes on Hyperliquid public trades
 
-Hyperliquid `recentTrades` returns only a short recent window. This backend still queries `recentTrades`, but also runs a websocket collector (`trades` channel) and stores data in an in-memory per-coin ring buffer. That allows `fetchTrades` to serve deeper recent history than the raw upstream REST endpoint alone.
+Hyperliquid `recentTrades` returns only a short recent window. This backend still queries `recentTrades`, but also runs a websocket collector (`trades` channel) and stores data in an in-memory per-coin ring buffer. That allows `fetchTrades` to serve deeper recent history than the raw upstream REST endpoint alone, while `GET /v1/ws` provides shared realtime trade fanout to app clients.
