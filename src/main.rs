@@ -11,7 +11,7 @@ use ferris_market_data_backend::{
         binance::BinanceExchange, bybit::BybitExchange, hyperliquid::HyperliquidExchange,
         registry::ExchangeRegistry,
     },
-    realtime::TradesTopicManager,
+    realtime::{OhlcvTopicManager, OrderBookTopicManager, TradesTopicManager},
     web::{self, AppState},
 };
 use tokio::signal;
@@ -37,7 +37,14 @@ async fn main() -> anyhow::Result<()> {
     )?));
 
     let trades_topic_manager = TradesTopicManager::new(config.hyperliquid_base_url.clone());
-    let state = AppState::new(Arc::new(registry), trades_topic_manager);
+    let order_book_topic_manager = OrderBookTopicManager::new(config.hyperliquid_base_url.clone());
+    let ohlcv_topic_manager = OhlcvTopicManager::new(config.hyperliquid_base_url.clone());
+    let state = AppState::new(
+        Arc::new(registry),
+        trades_topic_manager,
+        order_book_topic_manager,
+        ohlcv_topic_manager,
+    );
 
     let app = Router::new()
         .route("/healthz", get(web::health))

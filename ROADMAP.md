@@ -36,8 +36,11 @@ Completed:
   - `trades`: Hyperliquid, Binance, Bybit
   - `orderbook`: Hyperliquid, Binance, Bybit
   - `ohlcv`: Binance, Bybit
-- Backend client websocket endpoint (`GET /v1/ws`) for realtime trades with shared topic manager
-- Realtime trades fanout architecture: one upstream stream per active topic, many client subscribers
+- Backend client websocket endpoint (`GET /v1/ws`) for realtime market-data subscriptions
+- Realtime fanout architecture with one upstream stream per active topic and many client subscribers:
+  - `trades`: Hyperliquid, Binance, Bybit
+  - `orderbook`: Hyperliquid, Binance, Bybit
+  - `ohlcv`: Binance, Bybit
 - Smoke test scripts (Python + PowerShell)
 - Live ignored integration tests
 
@@ -51,7 +54,7 @@ Not started:
 
 - Persistent/shared cache (Redis or similar)
 - Public deployment automation
-- Backend websocket fanout channels beyond trades (`orderbook`, `ohlcv`)
+- Additional backend websocket fanout channels beyond current scope (for example funding/liquidations/ticker)
 
 ## Milestones
 
@@ -196,13 +199,13 @@ Week 3:
 
 - Introduce Redis cache option behind feature/config flag
 - Add cache integration tests
-- Design backend fanout path for orderbook channel (after trades)
+- Add orderbook/ohlcv stream reliability tests and reconnect soak checks
 
 Week 4:
 
 - Improve startup diagnostics and request tracing for operator debugging
 - Publish production config examples and rollout checklist
-- Design backend fanout path for OHLCV channel (after trades/orderbook)
+- Add topic-level observability dashboards for `trades`, `orderbook`, and `ohlcv`
 
 ## Risk Watchlist
 
@@ -270,7 +273,11 @@ Week 4:
 
 2026-02-22:
 
-- Added `INTEGRATION_README.md` with frontend implementation guidance for websocket-first trades integration (bootstrap snapshots + realtime fanout + reconnect/resubscribe patterns).
+- Added `INTEGRATION_README.md` with frontend implementation guidance for websocket-first market-data integration (bootstrap snapshots + realtime fanout + reconnect/resubscribe patterns).
+
+2026-02-22:
+
+- Extended backend websocket fanout to additional channels: realtime `orderbook` (Hyperliquid/Binance/Bybit) and realtime `ohlcv` (Binance/Bybit).
 
 ## Weekly Update Template
 

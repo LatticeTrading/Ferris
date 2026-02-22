@@ -28,23 +28,32 @@ use crate::{
         CcxtOhlcv, CcxtOrderBook, CcxtTrade, FetchOhlcvRequest, FetchOrderBookRequest,
         FetchTradesRequest, HealthResponse,
     },
-    realtime::{TradesTopic, TradesTopicManager},
+    realtime::{
+        OhlcvTopic, OhlcvTopicManager, OrderBookTopic, OrderBookTopicManager, TradesTopic,
+        TradesTopicManager,
+    },
 };
 
 #[derive(Clone)]
 pub struct AppState {
     exchange_registry: Arc<ExchangeRegistry>,
     trades_topic_manager: TradesTopicManager,
+    order_book_topic_manager: OrderBookTopicManager,
+    ohlcv_topic_manager: OhlcvTopicManager,
 }
 
 impl AppState {
     pub fn new(
         exchange_registry: Arc<ExchangeRegistry>,
         trades_topic_manager: TradesTopicManager,
+        order_book_topic_manager: OrderBookTopicManager,
+        ohlcv_topic_manager: OhlcvTopicManager,
     ) -> Self {
         Self {
             exchange_registry,
             trades_topic_manager,
+            order_book_topic_manager,
+            ohlcv_topic_manager,
         }
     }
 }
@@ -166,12 +175,46 @@ struct ClientStreamCommand {
 }
 
 enum ParsedStreamCommand {
-    Subscribe(TradesTopic),
-    Unsubscribe(TradesTopic),
+    Subscribe {
+        channel: RealtimeChannel,
+        topic: TradesTopic,
+    },
+    Unsubscribe {
+        channel: RealtimeChannel,
+        topic: TradesTopic,
+    },
     Ping,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RealtimeChannel {
+    Trades,
+    OrderBook,
+    Ohlcv,
+}
+
+impl RealtimeChannel {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Trades => "trades",
+            Self::OrderBook => "orderbook",
+            Self::Ohlcv => "ohlcv",
+        }
+    }
+
+    fn from_client_value(value: &str) -> Option<Self> {
+        match value {
+            "trades" => Some(Self::Trades),
+            "orderbook" | "order_book" => Some(Self::OrderBook),
+            "ohlcv" | "candles" | "kline" | "klines" => Some(Self::Ohlcv),
+            _ => None,
+        }
+    }
+}
+
 struct ClientSubscription {
+    channel: RealtimeChannel,
+    upstream_key: String,
     topic: TradesTopic,
     forward_task: JoinHandle<()>,
 }
@@ -201,6 +244,24 @@ struct WsTradesUpdate<'a> {
     message_type: &'static str,
     topic: &'a TradesTopic,
     data: &'a [CcxtTrade],
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WsOrderBookUpdate<'a> {
+    #[serde(rename = "type")]
+    message_type: &'static str,
+    topic: &'a TradesTopic,
+    data: &'a CcxtOrderBook,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WsOhlcvUpdate<'a> {
+    #[serde(rename = "type")]
+    message_type: &'static str,
+    topic: &'a TradesTopic,
+    data: &'a [CcxtOhlcv],
 }
 
 #[derive(Serialize)]
@@ -312,9 +373,9 @@ async fn handle_trades_stream_socket(socket: WebSocket, state: AppState) {
         }
     }
 
-    for (key, subscription) in subscriptions {
+    for (_key, subscription) in subscriptions {
         subscription.forward_task.abort();
-        state.trades_topic_manager.unsubscribe_by_key(&key).await;
+        unsubscribe_channel(&state, subscription.channel, &subscription.upstream_key).await;
     }
 
     drop(outgoing_sender);
@@ -335,13 +396,15 @@ async fn handle_stream_command(
                 message_type: "pong",
             },
         ),
-        ParsedStreamCommand::Subscribe(topic) => {
-            let topic_key = match state.trades_topic_manager.resolve_topic_key(topic.clone()) {
+        ParsedStreamCommand::Subscribe { channel, topic } => {
+            let topic_key = match resolve_topic_key_by_channel(state, channel, topic.clone()) {
                 Ok(topic_key) => topic_key,
                 Err(err) => return send_ws_error(outgoing_sender, "INVALID_TOPIC", err),
             };
 
-            if let Some(existing) = subscriptions.get(&topic_key) {
+            let local_key = to_local_subscription_key(channel, &topic_key);
+
+            if let Some(existing) = subscriptions.get(&local_key) {
                 return send_ws_json(
                     outgoing_sender,
                     &WsAckMessage {
@@ -352,43 +415,126 @@ async fn handle_stream_command(
                 );
             }
 
-            let subscription = match state.trades_topic_manager.subscribe(topic).await {
-                Ok(subscription) => subscription,
-                Err(err) => return send_ws_error(outgoing_sender, "SUBSCRIBE_FAILED", err),
-            };
+            match channel {
+                RealtimeChannel::Trades => {
+                    let subscription = match state.trades_topic_manager.subscribe(topic).await {
+                        Ok(subscription) => subscription,
+                        Err(err) => {
+                            return send_ws_error(outgoing_sender, "SUBSCRIBE_FAILED", err);
+                        }
+                    };
 
-            let topic = subscription.topic.clone();
-            let forward_task = spawn_topic_forwarder(
-                topic.clone(),
-                subscription.receiver,
-                outgoing_sender.clone(),
-                close_signal.clone(),
-            );
+                    let topic = subscription.topic.clone();
+                    let forward_task = spawn_trades_topic_forwarder(
+                        topic.clone(),
+                        subscription.receiver,
+                        outgoing_sender.clone(),
+                        close_signal.clone(),
+                    );
 
-            subscriptions.insert(
-                subscription.key,
-                ClientSubscription {
-                    topic: topic.clone(),
-                    forward_task,
-                },
-            );
+                    subscriptions.insert(
+                        local_key,
+                        ClientSubscription {
+                            channel,
+                            upstream_key: subscription.key,
+                            topic: topic.clone(),
+                            forward_task,
+                        },
+                    );
 
-            send_ws_json(
-                outgoing_sender,
-                &WsAckMessage {
-                    message_type: "subscribed",
-                    op: "subscribe",
-                    topic: &topic,
-                },
-            )
+                    send_ws_json(
+                        outgoing_sender,
+                        &WsAckMessage {
+                            message_type: "subscribed",
+                            op: "subscribe",
+                            topic: &topic,
+                        },
+                    )
+                }
+                RealtimeChannel::OrderBook => {
+                    let subscription = match state
+                        .order_book_topic_manager
+                        .subscribe(topic.clone())
+                        .await
+                    {
+                        Ok(subscription) => subscription,
+                        Err(err) => {
+                            return send_ws_error(outgoing_sender, "SUBSCRIBE_FAILED", err);
+                        }
+                    };
+
+                    let topic = subscription.topic.clone();
+                    let forward_task = spawn_orderbook_topic_forwarder(
+                        topic.clone(),
+                        subscription.receiver,
+                        outgoing_sender.clone(),
+                        close_signal.clone(),
+                    );
+
+                    subscriptions.insert(
+                        local_key,
+                        ClientSubscription {
+                            channel,
+                            upstream_key: subscription.key,
+                            topic: topic.clone(),
+                            forward_task,
+                        },
+                    );
+
+                    send_ws_json(
+                        outgoing_sender,
+                        &WsAckMessage {
+                            message_type: "subscribed",
+                            op: "subscribe",
+                            topic: &topic,
+                        },
+                    )
+                }
+                RealtimeChannel::Ohlcv => {
+                    let subscription = match state.ohlcv_topic_manager.subscribe(topic).await {
+                        Ok(subscription) => subscription,
+                        Err(err) => {
+                            return send_ws_error(outgoing_sender, "SUBSCRIBE_FAILED", err);
+                        }
+                    };
+
+                    let topic = subscription.topic.clone();
+                    let forward_task = spawn_ohlcv_topic_forwarder(
+                        topic.clone(),
+                        subscription.receiver,
+                        outgoing_sender.clone(),
+                        close_signal.clone(),
+                    );
+
+                    subscriptions.insert(
+                        local_key,
+                        ClientSubscription {
+                            channel,
+                            upstream_key: subscription.key,
+                            topic: topic.clone(),
+                            forward_task,
+                        },
+                    );
+
+                    send_ws_json(
+                        outgoing_sender,
+                        &WsAckMessage {
+                            message_type: "subscribed",
+                            op: "subscribe",
+                            topic: &topic,
+                        },
+                    )
+                }
+            }
         }
-        ParsedStreamCommand::Unsubscribe(topic) => {
-            let topic_key = match state.trades_topic_manager.resolve_topic_key(topic.clone()) {
+        ParsedStreamCommand::Unsubscribe { channel, topic } => {
+            let topic_key = match resolve_topic_key_by_channel(state, channel, topic.clone()) {
                 Ok(topic_key) => topic_key,
                 Err(err) => return send_ws_error(outgoing_sender, "INVALID_TOPIC", err),
             };
 
-            let Some(existing) = subscriptions.remove(&topic_key) else {
+            let local_key = to_local_subscription_key(channel, &topic_key);
+            let Some(existing) = subscriptions.remove(&local_key) else {
                 return send_ws_error(
                     outgoing_sender,
                     "NOT_SUBSCRIBED",
@@ -397,10 +543,7 @@ async fn handle_stream_command(
             };
 
             existing.forward_task.abort();
-            state
-                .trades_topic_manager
-                .unsubscribe_by_key(&topic_key)
-                .await;
+            unsubscribe_channel(state, channel, &topic_key).await;
 
             send_ws_json(
                 outgoing_sender,
@@ -414,7 +557,31 @@ async fn handle_stream_command(
     }
 }
 
-fn spawn_topic_forwarder(
+fn resolve_topic_key_by_channel(
+    state: &AppState,
+    channel: RealtimeChannel,
+    topic: TradesTopic,
+) -> Result<String, String> {
+    match channel {
+        RealtimeChannel::Trades => state.trades_topic_manager.resolve_topic_key(topic),
+        RealtimeChannel::OrderBook => state.order_book_topic_manager.resolve_topic_key(topic),
+        RealtimeChannel::Ohlcv => state.ohlcv_topic_manager.resolve_topic_key(topic),
+    }
+}
+
+async fn unsubscribe_channel(state: &AppState, channel: RealtimeChannel, key: &str) {
+    match channel {
+        RealtimeChannel::Trades => state.trades_topic_manager.unsubscribe_by_key(key).await,
+        RealtimeChannel::OrderBook => state.order_book_topic_manager.unsubscribe_by_key(key).await,
+        RealtimeChannel::Ohlcv => state.ohlcv_topic_manager.unsubscribe_by_key(key).await,
+    }
+}
+
+fn to_local_subscription_key(channel: RealtimeChannel, key: &str) -> String {
+    format!("{}|{key}", channel.as_str())
+}
+
+fn spawn_trades_topic_forwarder(
     topic: TradesTopic,
     mut receiver: broadcast::Receiver<Arc<Vec<CcxtTrade>>>,
     outgoing_sender: Sender<Message>,
@@ -459,6 +626,96 @@ fn spawn_topic_forwarder(
     })
 }
 
+fn spawn_orderbook_topic_forwarder(
+    topic: OrderBookTopic,
+    mut receiver: broadcast::Receiver<Arc<CcxtOrderBook>>,
+    outgoing_sender: Sender<Message>,
+    close_signal: Arc<Notify>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            match receiver.recv().await {
+                Ok(orderbook) => {
+                    if !send_ws_json(
+                        &outgoing_sender,
+                        &WsOrderBookUpdate {
+                            message_type: "orderbook",
+                            topic: &topic,
+                            data: orderbook.as_ref(),
+                        },
+                    ) {
+                        close_signal.notify_one();
+                        return;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    if !send_ws_json(
+                        &outgoing_sender,
+                        &WsLagWarning {
+                            message_type: "warning",
+                            code: "CLIENT_LAGGED",
+                            message: "client lagged behind realtime stream".to_string(),
+                            topic: &topic,
+                            dropped_messages: skipped,
+                        },
+                    ) {
+                        close_signal.notify_one();
+                        return;
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    return;
+                }
+            }
+        }
+    })
+}
+
+fn spawn_ohlcv_topic_forwarder(
+    topic: OhlcvTopic,
+    mut receiver: broadcast::Receiver<Arc<Vec<CcxtOhlcv>>>,
+    outgoing_sender: Sender<Message>,
+    close_signal: Arc<Notify>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            match receiver.recv().await {
+                Ok(candles) => {
+                    if !send_ws_json(
+                        &outgoing_sender,
+                        &WsOhlcvUpdate {
+                            message_type: "ohlcv",
+                            topic: &topic,
+                            data: candles.as_ref(),
+                        },
+                    ) {
+                        close_signal.notify_one();
+                        return;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    if !send_ws_json(
+                        &outgoing_sender,
+                        &WsLagWarning {
+                            message_type: "warning",
+                            code: "CLIENT_LAGGED",
+                            message: "client lagged behind realtime stream".to_string(),
+                            topic: &topic,
+                            dropped_messages: skipped,
+                        },
+                    ) {
+                        close_signal.notify_one();
+                        return;
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    return;
+                }
+            }
+        }
+    })
+}
+
 fn parse_stream_command(payload: &str) -> Result<ParsedStreamCommand, String> {
     let command = serde_json::from_str::<ClientStreamCommand>(payload)
         .map_err(|err| format!("invalid JSON command: {err}"))?;
@@ -467,24 +724,29 @@ fn parse_stream_command(payload: &str) -> Result<ParsedStreamCommand, String> {
     match op.as_str() {
         "ping" => Ok(ParsedStreamCommand::Ping),
         "subscribe" | "unsubscribe" => {
-            let channel = command
+            let channel_value = command
                 .channel
                 .unwrap_or_default()
                 .trim()
                 .to_ascii_lowercase();
-            if channel != "trades" {
+
+            let channel = if channel_value.is_empty() {
+                RealtimeChannel::Trades
+            } else if let Some(channel) = RealtimeChannel::from_client_value(&channel_value) {
+                channel
+            } else {
                 return Err(format!(
-                    "unsupported channel `{channel}`; only `trades` is supported right now"
+                    "unsupported channel `{channel_value}`; supported channels: `trades`, `orderbook`, `ohlcv`"
                 ));
-            }
+            };
 
             let topic =
                 TradesTopic::from_client_request(command.exchange, command.symbol, command.params)?;
 
             if op == "subscribe" {
-                Ok(ParsedStreamCommand::Subscribe(topic))
+                Ok(ParsedStreamCommand::Subscribe { channel, topic })
             } else {
-                Ok(ParsedStreamCommand::Unsubscribe(topic))
+                Ok(ParsedStreamCommand::Unsubscribe { channel, topic })
             }
         }
         other => Err(format!(
@@ -581,7 +843,7 @@ mod tests {
 
         let close_signal = Arc::new(Notify::new());
         let forwarder =
-            spawn_topic_forwarder(topic, receiver, outgoing_sender, close_signal.clone());
+            spawn_trades_topic_forwarder(topic, receiver, outgoing_sender, close_signal.clone());
 
         let _ = broadcast_sender
             .send(Arc::new(vec![sample_trade()]))
@@ -594,5 +856,59 @@ mod tests {
         let _ = timeout(Duration::from_secs(1), forwarder)
             .await
             .expect("forwarder task should complete");
+    }
+
+    #[test]
+    fn parse_stream_command_supports_all_realtime_channels() {
+        let orderbook_payload = json!({
+            "op": "subscribe",
+            "channel": "orderbook",
+            "exchange": "bybit",
+            "symbol": "BTC/USDT:USDT",
+            "params": {"category": "linear", "levels": 50}
+        })
+        .to_string();
+
+        let ohlcv_payload = json!({
+            "op": "unsubscribe",
+            "channel": "ohlcv",
+            "exchange": "binance",
+            "symbol": "BTC/USDT:USDT",
+            "params": {"timeframe": "1m"}
+        })
+        .to_string();
+
+        let orderbook_command = parse_stream_command(&orderbook_payload)
+            .expect("orderbook command should parse successfully");
+        let ohlcv_command =
+            parse_stream_command(&ohlcv_payload).expect("ohlcv command should parse successfully");
+
+        assert!(matches!(
+            orderbook_command,
+            ParsedStreamCommand::Subscribe {
+                channel: RealtimeChannel::OrderBook,
+                ..
+            }
+        ));
+
+        assert!(matches!(
+            ohlcv_command,
+            ParsedStreamCommand::Unsubscribe {
+                channel: RealtimeChannel::Ohlcv,
+                ..
+            }
+        ));
+
+        let unsupported = parse_stream_command(
+            &json!({
+                "op": "subscribe",
+                "channel": "funding",
+                "exchange": "bybit",
+                "symbol": "BTC/USDT:USDT",
+                "params": {}
+            })
+            .to_string(),
+        );
+        assert!(unsupported.is_err());
     }
 }

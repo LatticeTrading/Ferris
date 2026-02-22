@@ -9,10 +9,10 @@ Frontend integration guidance lives in `INTEGRATION_README.md`.
 This first version focuses on:
 
 - unified endpoint shapes (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`)
-- backend websocket fanout for realtime trades (`GET /v1/ws`)
+- backend websocket fanout for realtime channels (`GET /v1/ws`)
 - pluggable exchange adapter architecture
 - market-data support for `hyperliquid`, `binance`, and `bybit`
-- one upstream trade stream per active topic with multi-client broadcast
+- one upstream websocket stream per active topic with multi-client broadcast
 - background websocket trade collector with in-memory ring buffer for deeper snapshot history
 
 ## Why this exists
@@ -22,13 +22,13 @@ Frontend apps (including Electron and web frontends) often cannot directly use s
 - you can run it for public users (for example on Hetzner)
 - users can self-host their own backend
 - your frontend uses one clean API contract regardless of exchange
-- app clients subscribe to backend websocket topics instead of high-frequency HTTP polling for live trades
+- app clients subscribe to backend websocket topics instead of high-frequency HTTP polling for live updates
 
 ## Realtime Architecture
 
 - app client connects once to `GET /v1/ws` and sends `subscribe` / `unsubscribe` commands
 - backend topic manager keys subscriptions by exchange + channel + symbol (+ params)
-- one upstream websocket stream is maintained per active trades topic
+- one upstream websocket stream is maintained per active topic
 - multiple client connections subscribed to the same topic receive the same broadcast updates
 - idle topics are closed, and dropped upstream streams reconnect with backoff
 
@@ -39,7 +39,11 @@ Frontend apps (including Electron and web frontends) often cannot directly use s
   - `POST /v1/fetchOHLCV`
   - `POST /v1/fetchOrderBook`
 - Realtime endpoint:
-  - `GET /v1/ws` (websocket subscribe/unsubscribe for realtime `trades`)
+  - `GET /v1/ws` (websocket subscribe/unsubscribe for realtime `trades`, `orderbook`, `ohlcv`)
+- Realtime channel support:
+  - `trades`: `hyperliquid`, `binance`, `bybit`
+  - `orderbook`: `hyperliquid`, `binance`, `bybit`
+  - `ohlcv`: `binance`, `bybit`
 - exchange supported:
   - `hyperliquid` (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`)
   - `binance` (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`)
@@ -132,7 +136,7 @@ Response body (CCXT-like `OHLCV[]`):
 
 `GET /v1/ws`
 
-The websocket endpoint currently supports realtime `trades` only. Backend topic fanout is shared, so multiple app clients subscribing to the same topic use one upstream exchange stream.
+The websocket endpoint supports realtime `trades`, `orderbook`, and `ohlcv` channels. Backend topic fanout is shared, so multiple app clients subscribing to the same topic use one upstream exchange stream.
 
 Subscribe command:
 
@@ -206,6 +210,83 @@ Recommended client flow for trades:
 2. Open `GET /v1/ws` and subscribe to the same topic.
 3. Render live updates from `type="trades"` push messages.
 4. Use snapshot endpoints only for bootstrap/fallback, not high-frequency polling.
+
+### Realtime Order Book Stream (WebSocket)
+
+Subscribe command:
+
+```json
+{
+  "op": "subscribe",
+  "channel": "orderbook",
+  "exchange": "binance",
+  "symbol": "BTC/USDT:USDT",
+  "params": {
+    "levels": 20
+  }
+}
+```
+
+Server order book update:
+
+```json
+{
+  "type": "orderbook",
+  "topic": {
+    "exchange": "binance",
+    "symbol": "BTC/USDT:USDT",
+    "params": {
+      "levels": 20
+    }
+  },
+  "data": {
+    "asks": [[100.2, 1.5], [100.3, 0.9]],
+    "bids": [[100.1, 2.1], [100.0, 0.4]],
+    "datetime": "2026-02-22T00:00:00.000Z",
+    "timestamp": 1771718400000,
+    "nonce": null,
+    "symbol": "BTC/USDT:USDT"
+  }
+}
+```
+
+### Realtime OHLCV Stream (WebSocket)
+
+Supported exchanges: `binance`, `bybit`.
+
+Hyperliquid realtime OHLCV is not enabled yet on websocket fanout; use `POST /v1/fetchOHLCV` for Hyperliquid candles.
+
+Subscribe command:
+
+```json
+{
+  "op": "subscribe",
+  "channel": "ohlcv",
+  "exchange": "bybit",
+  "symbol": "BTC/USDT:USDT",
+  "params": {
+    "category": "linear",
+    "timeframe": "1m"
+  }
+}
+```
+
+Server OHLCV update:
+
+```json
+{
+  "type": "ohlcv",
+  "topic": {
+    "exchange": "bybit",
+    "symbol": "BTC/USDT:USDT",
+    "params": {
+      "category": "linear",
+      "timeframe": "1m"
+    }
+  },
+  "data": [[1771718400000, 100.0, 101.0, 99.8, 100.4, 23.5]]
+}
+```
 
 ### Fetch Order Book (Snapshot)
 
@@ -445,4 +526,4 @@ This keeps the frontend contract stable while exchange integrations evolve indep
 
 ## Notes on Hyperliquid public trades
 
-Hyperliquid `recentTrades` returns only a short recent window. This backend still queries `recentTrades`, but also runs a websocket collector (`trades` channel) and stores data in an in-memory per-coin ring buffer. That allows `fetchTrades` to serve deeper recent history than the raw upstream REST endpoint alone, while `GET /v1/ws` provides shared realtime trade fanout to app clients.
+Hyperliquid `recentTrades` returns only a short recent window. This backend still queries `recentTrades`, but also runs a websocket collector (`trades` channel) and stores data in an in-memory per-coin ring buffer. That allows `fetchTrades` to serve deeper recent history than the raw upstream REST endpoint alone, while `GET /v1/ws` provides shared realtime fanout for market-data channels.

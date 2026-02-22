@@ -17,7 +17,7 @@ use axum::{
 };
 use ferris_market_data_backend::{
     exchanges::registry::ExchangeRegistry,
-    realtime::TradesTopicManager,
+    realtime::{OhlcvTopicManager, OrderBookTopicManager, TradesTopicManager},
     web::{self, AppState},
 };
 use futures_util::{SinkExt, StreamExt};
@@ -197,7 +197,12 @@ async fn websocket_fanout_shares_upstream_for_same_topic() {
     let (upstream_bind, upstream_shutdown, upstream_task) = spawn_server(upstream_app).await;
 
     let topic_manager = TradesTopicManager::new(format!("http://{upstream_bind}"));
-    let app_state = AppState::new(Arc::new(ExchangeRegistry::new()), topic_manager);
+    let app_state = AppState::new(
+        Arc::new(ExchangeRegistry::new()),
+        topic_manager,
+        OrderBookTopicManager::new(format!("http://{upstream_bind}")),
+        OhlcvTopicManager::new(format!("http://{upstream_bind}")),
+    );
     let app = Router::new()
         .route("/v1/ws", get(web::trades_stream_ws))
         .with_state(app_state);
