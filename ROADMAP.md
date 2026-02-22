@@ -2,7 +2,7 @@
 
 This document tracks what is done, what is next, and what to watch as this backend grows.
 
-Last updated: 2026-02-20
+Last updated: 2026-02-22
 
 ## How To Use This Doc
 
@@ -13,7 +13,7 @@ Last updated: 2026-02-20
 
 ## Vision
 
-Build an open-source, hostable backend that gives web and Electron frontends a CCXT-like way to query exchange market data through one unified API.
+Build an open-source, hostable backend that gives web and Electron frontends one unified contract for market data: snapshot fetch endpoints plus shared realtime websocket fanout.
 
 ## Current Status Snapshot
 
@@ -36,18 +36,22 @@ Completed:
   - `trades`: Hyperliquid, Binance, Bybit
   - `orderbook`: Hyperliquid, Binance, Bybit
   - `ohlcv`: Binance, Bybit
+- Backend client websocket endpoint (`GET /v1/ws`) for realtime trades with shared topic manager
+- Realtime trades fanout architecture: one upstream stream per active topic, many client subscribers
 - Smoke test scripts (Python + PowerShell)
 - Live ignored integration tests
 
 In progress:
 
 - Production hardening and public-host readiness
+- Realtime stream hardening (limits, backpressure, visibility)
 - Exchange expansion follow-up (next adapter candidate after Bybit)
 
 Not started:
 
 - Persistent/shared cache (Redis or similar)
 - Public deployment automation
+- Backend websocket fanout channels beyond trades (`orderbook`, `ohlcv`)
 
 ## Milestones
 
@@ -180,21 +184,25 @@ Week 1:
 - Finalize CI pipeline
 - Add request rate limiting
 - Add response/request tracing improvements
+- Add websocket stream metrics (active clients, active topics, dropped/lag events)
 
 Week 2:
 
 - Add optional auth mode
 - Add production config examples
+- Add per-connection and per-topic websocket guardrails
 
 Week 3:
 
 - Introduce Redis cache option behind feature/config flag
 - Add cache integration tests
+- Design backend fanout path for orderbook channel (after trades)
 
 Week 4:
 
 - Improve startup diagnostics and request tracing for operator debugging
 - Publish production config examples and rollout checklist
+- Design backend fanout path for OHLCV channel (after trades/orderbook)
 
 ## Risk Watchlist
 
@@ -204,6 +212,9 @@ Week 4:
 - Memory growth from in-memory cache
   - Impact: instability under high traffic
   - Mitigation: strict per-coin capacity and retention, monitor usage
+- Repeated client polling load for live data
+  - Impact: unnecessary upstream and backend request amplification
+  - Mitigation: use `GET /v1/ws` realtime fanout for live trades; keep REST for bootstrap/fallback
 - Abuse on public endpoint
   - Impact: degraded performance/cost spikes
   - Mitigation: rate limits + optional auth + bot filtering
@@ -248,6 +259,18 @@ Week 4:
 2026-02-20:
 
 - Added real-time websocket OHLCV mode to `market_stream` for Binance and Bybit, including candle parsing, timeframe mapping, and terminal chart rendering.
+
+2026-02-22:
+
+- Added backend client websocket realtime trades endpoint (`GET /v1/ws`) with shared upstream topic manager (single upstream stream per active topic + multi-client fanout).
+
+2026-02-22:
+
+- Set backend live-trades delivery model to websocket fanout-first (shared topic streams) and positioned REST endpoints as snapshot bootstrap/fallback instead of high-frequency polling.
+
+2026-02-22:
+
+- Added `INTEGRATION_README.md` with frontend implementation guidance for websocket-first trades integration (bootstrap snapshots + realtime fanout + reconnect/resubscribe patterns).
 
 ## Weekly Update Template
 
