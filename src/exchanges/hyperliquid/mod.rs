@@ -21,8 +21,9 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use crate::{
     exchanges::traits::{ExchangeError, MarketDataExchange},
     models::{
-        CcxtOhlcv, CcxtOrderBook, CcxtTrade, FetchOhlcvParams, FetchOrderBookParams,
-        FetchTradesParams,
+        CcxtOhlcv, CcxtOrderBook, CcxtTrade, FetchMarketsParams, FetchOhlcvParams,
+        FetchOrderBookParams, FetchTradesParams, UnifiedMarket, UnifiedMarketInfo,
+        UnifiedMarketType,
     },
 };
 
@@ -461,6 +462,141 @@ impl MarketDataExchange for HyperliquidExchange {
             nonce: None,
             symbol: Some(resolved_symbol),
         })
+    }
+
+    async fn fetch_markets(
+        &self,
+        params: FetchMarketsParams,
+    ) -> Result<Vec<UnifiedMarket>, ExchangeError> {
+        let mut markets = Vec::<UnifiedMarket>::new();
+
+        let perps = self
+            .post_info(json!({ "type": "metaAndAssetCtxs" }))
+            .await?;
+        if let Some(universe) = perps
+            .get(0)
+            .and_then(|item| item.get("universe"))
+            .and_then(Value::as_array)
+        {
+            for item in universe {
+                let Some(base_raw) = item.get("name").and_then(Value::as_str) else {
+                    continue;
+                };
+
+                let Ok(base) = sanitize_asset_for_market(base_raw) else {
+                    continue;
+                };
+
+                let active = !item
+                    .get("isDelisted")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if !params.include_inactive && !active {
+                    continue;
+                }
+
+                markets.push(UnifiedMarket {
+                    exchange: "hyperliquid".to_string(),
+                    symbol: format!("{base}/USDC"),
+                    base,
+                    quote: "USDC".to_string(),
+                    market_type: UnifiedMarketType::Perp,
+                    active,
+                    min_order_size: item
+                        .get("minOrderSize")
+                        .and_then(parse_f64_lossy_for_market)
+                        .or_else(|| item.get("szDecimals").and_then(parse_f64_lossy_for_market)),
+                    tick_size: item.get("tickSize").and_then(parse_f64_lossy_for_market),
+                    contract_size: Some(1.0),
+                    info: UnifiedMarketInfo {
+                        category: None,
+                        raw_symbol: Some(base_raw.to_string()),
+                        exchange_symbol: Some(base_raw.to_string()),
+                    },
+                });
+            }
+        }
+
+        let spot_meta = self.post_info(json!({ "type": "spotMeta" })).await?;
+        if let Ok(token_map) = parse_token_map(&spot_meta) {
+            if let Some(universe) = spot_meta.get("universe").and_then(Value::as_array) {
+                for pair in universe {
+                    let Some(token_indexes) = pair.get("tokens").and_then(Value::as_array) else {
+                        continue;
+                    };
+                    if token_indexes.len() != 2 {
+                        continue;
+                    }
+
+                    let Some(base_idx) = token_indexes[0].as_u64() else {
+                        continue;
+                    };
+                    let Some(quote_idx) = token_indexes[1].as_u64() else {
+                        continue;
+                    };
+
+                    let Some(base_raw) = token_map.get(&base_idx) else {
+                        continue;
+                    };
+                    let Some(quote_raw) = token_map.get(&quote_idx) else {
+                        continue;
+                    };
+
+                    let Ok(base) = sanitize_asset_for_market(base_raw) else {
+                        continue;
+                    };
+                    let Ok(quote) = sanitize_asset_for_market(quote_raw) else {
+                        continue;
+                    };
+
+                    let active = !pair
+                        .get("isDelisted")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    if !params.include_inactive && !active {
+                        continue;
+                    }
+
+                    let raw_symbol = pair
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("{base}/{quote}"));
+
+                    markets.push(UnifiedMarket {
+                        exchange: "hyperliquid".to_string(),
+                        symbol: format!("{base}/{quote}"),
+                        base,
+                        quote,
+                        market_type: UnifiedMarketType::Spot,
+                        active,
+                        min_order_size: pair
+                            .get("minTradeNtl")
+                            .and_then(parse_f64_lossy_for_market),
+                        tick_size: None,
+                        contract_size: None,
+                        info: UnifiedMarketInfo {
+                            category: None,
+                            raw_symbol: Some(raw_symbol.clone()),
+                            exchange_symbol: Some(raw_symbol),
+                        },
+                    });
+                }
+            }
+        }
+
+        markets.sort_by(|left, right| {
+            left.symbol.cmp(&right.symbol).then_with(|| {
+                market_type_rank(left.market_type).cmp(&market_type_rank(right.market_type))
+            })
+        });
+        markets.dedup_by(|left, right| {
+            left.symbol == right.symbol
+                && market_type_rank(left.market_type) == market_type_rank(right.market_type)
+                && left.info.exchange_symbol == right.info.exchange_symbol
+        });
+
+        Ok(markets)
     }
 }
 
@@ -1090,6 +1226,40 @@ fn extract_u64_from_json_value(value: Option<&Value>) -> Option<u64> {
                 .and_then(|value| (value >= 0).then_some(value as u64))
         })
         .or_else(|| value.as_str().and_then(|value| value.parse::<u64>().ok()))
+}
+
+fn parse_f64_lossy_for_market(value: &Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_i64().map(|numeric| numeric as f64))
+        .or_else(|| value.as_u64().map(|numeric| numeric as f64))
+        .or_else(|| value.as_str().and_then(|raw| raw.parse::<f64>().ok()))
+}
+
+fn sanitize_asset_for_market(value: &str) -> Result<String, ExchangeError> {
+    let normalized = value
+        .trim()
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_uppercase();
+
+    if normalized.is_empty() {
+        return Err(ExchangeError::UpstreamData(
+            "symbol asset cannot be empty".to_string(),
+        ));
+    }
+
+    Ok(normalized)
+}
+
+fn market_type_rank(market_type: UnifiedMarketType) -> u8 {
+    match market_type {
+        UnifiedMarketType::Spot => 0,
+        UnifiedMarketType::Future => 1,
+        UnifiedMarketType::Perp => 2,
+        UnifiedMarketType::Option => 3,
+    }
 }
 
 fn interval_to_millis(interval: &str) -> Option<u64> {

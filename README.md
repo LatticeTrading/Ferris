@@ -8,7 +8,7 @@ Frontend integration guidance lives in `INTEGRATION_README.md`.
 
 This first version focuses on:
 
-- unified endpoint shapes (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`)
+- unified endpoint shapes (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`, `fetchMarkets`)
 - backend websocket fanout for realtime channels (`GET /v1/ws`)
 - pluggable exchange adapter architecture
 - market-data support for `hyperliquid`, `binance`, and `bybit`
@@ -38,6 +38,7 @@ Frontend apps (including Electron and web frontends) often cannot directly use s
   - `POST /v1/fetchTrades`
   - `POST /v1/fetchOHLCV`
   - `POST /v1/fetchOrderBook`
+  - `POST /v1/fetchMarkets`
 - Realtime endpoint:
   - `GET /v1/ws` (websocket subscribe/unsubscribe for realtime `trades`, `orderbook`, `ohlcv`)
 - Realtime channel support:
@@ -45,9 +46,9 @@ Frontend apps (including Electron and web frontends) often cannot directly use s
   - `orderbook`: `hyperliquid`, `binance`, `bybit`
   - `ohlcv`: `binance`, `bybit`
 - exchange supported:
-  - `hyperliquid` (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`)
-  - `binance` (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`)
-  - `bybit` (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`)
+  - `hyperliquid` (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`, `fetchMarkets`)
+  - `binance` (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`, `fetchMarkets`)
+  - `bybit` (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`, `fetchMarkets`)
 - market-data only (no private trading endpoints yet)
 
 ## API
@@ -321,6 +322,67 @@ Response body (CCXT-like `OrderBook`):
 }
 ```
 
+### Fetch Markets
+
+`POST /v1/fetchMarkets`
+
+Snapshot endpoint for exchange symbols/market metadata. Symbols are always returned in canonical `BASE/QUOTE` format (uppercase, no settlement suffix like `:USDT`).
+
+Request body:
+
+```json
+{
+  "exchange": "bybit",
+  "params": {
+    "category": "linear"
+  },
+  "includeInactive": false
+}
+```
+
+Response body:
+
+```json
+{
+  "exchange": "bybit",
+  "markets": [
+    {
+      "exchange": "bybit",
+      "symbol": "ADA/USDT",
+      "base": "ADA",
+      "quote": "USDT",
+      "type": "perp",
+      "active": true,
+      "minOrderSize": 1,
+      "tickSize": 0.0001,
+      "contractSize": 1,
+      "info": {
+        "category": "linear",
+        "rawSymbol": "ADAUSDT",
+        "exchangeSymbol": "ADAUSDT"
+      }
+    }
+  ],
+  "timestamp": 1760000000000
+}
+```
+
+Bybit notes:
+
+- If `params.category` is omitted, backend fetches and combines `linear`, `inverse`, and `spot` categories.
+- `info.category` is always included for Bybit rows so frontend can disambiguate contract families while keeping canonical `symbol`.
+
+Error shape for this endpoint:
+
+```json
+{
+  "error": {
+    "code": "INVALID_EXCHANGE",
+    "message": "Exchange 'foo' is not supported"
+  }
+}
+```
+
 ### Health
 
 `GET /healthz`
@@ -450,6 +512,7 @@ Optional overrides:
 
 - `--exchange` (default `hyperliquid`)
 - `--symbol` (default `BTC/USDC:USDC`)
+- `--markets-exchange` (default `bybit`; used for `fetchMarkets` smoke check)
 
 If you get `HTTP 404` on `/healthz`, you are likely hitting a different process on that port.
 
@@ -521,6 +584,13 @@ To add an exchange:
 2. Implement `MarketDataExchange`
 3. Register it in `src/main.rs` through `ExchangeRegistry`
 4. Reuse shared response models from `src/models.rs`
+
+Each adapter should implement the full snapshot contract:
+
+- `fetchTrades`
+- `fetchOHLCV`
+- `fetchOrderBook`
+- `fetchMarkets`
 
 This keeps the frontend contract stable while exchange integrations evolve independently.
 

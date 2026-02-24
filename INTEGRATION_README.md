@@ -6,6 +6,7 @@ Primary goal: consume live market data through backend websocket fanout (`GET /v
 
 ## What To Build
 
+- Load market/symbol catalog with `fetchMarkets` at app startup (or periodic refresh).
 - Use snapshot endpoints for initial render (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`).
 - Open one websocket connection to `GET /v1/ws`.
 - Send `subscribe` commands for the channels you need (`trades`, `orderbook`, `ohlcv`).
@@ -15,10 +16,14 @@ Primary goal: consume live market data through backend websocket fanout (`GET /v
 
 ## Base URLs
 
-Assume backend base URL is exposed as:
+Use one of these backend base URL options:
 
-- HTTP base: `https://your-backend.example.com`
-- WS URL: `wss://your-backend.example.com/v1/ws`
+- Self-hosted (localhost):
+  - HTTP base: `http://localhost:3000`
+  - WS URL: `ws://localhost:3000/v1/ws`
+- Hosted:
+  - HTTP base: `https://api.latticeterminal.com/`
+  - WS URL: `wss://api.latticeterminal.com/v1/ws`
 
 If you only have an HTTP base URL string, derive WS URL like this:
 
@@ -29,6 +34,7 @@ If you only have an HTTP base URL string, derive WS URL like this:
 ## Endpoints
 
 - Snapshot endpoints:
+  - `POST /v1/fetchMarkets`
   - `POST /v1/fetchTrades`
   - `POST /v1/fetchOHLCV`
   - `POST /v1/fetchOrderBook`
@@ -40,6 +46,68 @@ Supported realtime channels:
 - `trades`: `hyperliquid`, `binance`, `bybit`
 - `orderbook`: `hyperliquid`, `binance`, `bybit`
 - `ohlcv`: `binance`, `bybit`
+
+### Fetch Markets (Symbol Catalog)
+
+Use this endpoint to populate symbol dropdowns/search and unified market metadata.
+
+Request:
+
+```json
+{
+  "exchange": "bybit",
+  "params": {
+    "category": "linear"
+  },
+  "includeInactive": false
+}
+```
+
+Response:
+
+```json
+{
+  "exchange": "bybit",
+  "markets": [
+    {
+      "exchange": "bybit",
+      "symbol": "ADA/USDT",
+      "base": "ADA",
+      "quote": "USDT",
+      "type": "perp",
+      "active": true,
+      "minOrderSize": 1,
+      "tickSize": 0.0001,
+      "contractSize": 1,
+      "info": {
+        "category": "linear",
+        "rawSymbol": "ADAUSDT",
+        "exchangeSymbol": "ADAUSDT"
+      }
+    }
+  ],
+  "timestamp": 1760000000000
+}
+```
+
+Important frontend contract notes:
+
+- `symbol` is always canonical `BASE/QUOTE` uppercase.
+- `symbol` never includes settlement suffix (`:USDT`, `:BTC`) on this endpoint.
+- `type` is normalized to one of: `spot | future | perp | option`.
+- `includeInactive` defaults to `false` (active markets only).
+- For Bybit, if `params.category` is omitted backend infers/combines categories and still includes `info.category` per market row.
+
+Error payload shape for this endpoint:
+
+```json
+{
+  "error": {
+    "code": "INVALID_EXCHANGE",
+    "message": "Exchange 'foo' is not supported"
+  }
+}
+```
 
 ## Websocket Protocol
 
@@ -150,11 +218,14 @@ Important: use the `topic` returned in `subscribed` ack as your canonical local 
 
 For each market view:
 
-1. Call the matching snapshot endpoint once (`fetchTrades`, `fetchOrderBook`, or `fetchOHLCV`).
-2. Open websocket (or reuse shared app-level websocket).
-3. Send `subscribe` for the same logical market.
-4. Merge incoming updates by message type (`trades`, `orderbook`, `ohlcv`).
-5. On view unmount, send `unsubscribe`.
+1. Call `fetchMarkets` for the selected exchange and cache it (refresh around every 30s if needed).
+2. Use the returned canonical `symbol` (`BASE/QUOTE`) as your UI key.
+3. Map to exchange websocket/snapshot symbols only when needed in your existing channel params.
+4. Call the matching snapshot endpoint once (`fetchTrades`, `fetchOrderBook`, or `fetchOHLCV`).
+5. Open websocket (or reuse shared app-level websocket).
+6. Send `subscribe` for the same logical market.
+7. Merge incoming updates by message type (`trades`, `orderbook`, `ohlcv`).
+8. On view unmount, send `unsubscribe`.
 
 ## Backpressure And Disconnect Behavior
 
@@ -285,6 +356,9 @@ export class FerrisRealtimeClient {
 
 ## Quick Validation Checklist
 
+- Call `POST /v1/fetchMarkets`, confirm non-empty `markets`.
+- Confirm returned `symbol` format is always `BASE/QUOTE` uppercase and does not include `:`.
+- On Bybit, confirm each market row has `info.category`.
 - Connect one frontend client, subscribe, confirm `type="trades"` messages.
 - Subscribe to `orderbook`, confirm `type="orderbook"` messages.
 - Subscribe to `ohlcv`, confirm `type="ohlcv"` messages.
@@ -297,6 +371,9 @@ export class FerrisRealtimeClient {
 
 If another LLM session is integrating frontend code, tell it:
 
+- Use `POST /v1/fetchMarkets` for symbol catalogs and market metadata.
+- Treat `fetchMarkets.symbol` as canonical UI key (`BASE/QUOTE`, uppercase, no `:SETTLE`).
+- Preserve Bybit `info.category` in local models for contract-family disambiguation.
 - Live updates must use websocket `GET /v1/ws` with channel subscriptions (`trades`, `orderbook`, `ohlcv`).
 - REST endpoints are snapshot bootstrap/fallback, not live polling transport.
 - Implement reconnect+resubscribe and channel-specific merge logic.

@@ -3,9 +3,10 @@ use binance_sdk::{
     common::{config::ConfigurationRestApi, errors::ConnectorError},
     derivatives_trading_usds_futures::{
         rest_api::{
-            KlineCandlestickDataIntervalEnum, KlineCandlestickDataParams,
-            KlineCandlestickDataResponseItemInner, OrderBookParams, RecentTradesListParams,
-            RecentTradesListResponseInner,
+            ExchangeInformationResponseSymbolsInner,
+            ExchangeInformationResponseSymbolsInnerFiltersInner, KlineCandlestickDataIntervalEnum,
+            KlineCandlestickDataParams, KlineCandlestickDataResponseItemInner, OrderBookParams,
+            RecentTradesListParams, RecentTradesListResponseInner,
         },
         DerivativesTradingUsdsFuturesRestApi,
     },
@@ -16,8 +17,9 @@ use serde_json::Value;
 use crate::{
     exchanges::traits::{ExchangeError, MarketDataExchange},
     models::{
-        CcxtOhlcv, CcxtOrderBook, CcxtTrade, FetchOhlcvParams, FetchOrderBookParams,
-        FetchTradesParams,
+        CcxtOhlcv, CcxtOrderBook, CcxtTrade, FetchMarketsParams, FetchOhlcvParams,
+        FetchOrderBookParams, FetchTradesParams, UnifiedMarket, UnifiedMarketInfo,
+        UnifiedMarketType,
     },
 };
 
@@ -229,6 +231,31 @@ impl MarketDataExchange for BinanceExchange {
             symbol: Some(resolved_symbol),
         })
     }
+
+    async fn fetch_markets(
+        &self,
+        params: FetchMarketsParams,
+    ) -> Result<Vec<UnifiedMarket>, ExchangeError> {
+        let response = self
+            .client
+            .exchange_information()
+            .await
+            .map_err(map_anyhow_error)?;
+        let exchange_info = response.data().await.map_err(map_connector_error)?;
+
+        let mut markets = Vec::new();
+        for symbol in exchange_info.symbols.unwrap_or_default() {
+            match map_exchange_information_symbol(symbol, params.include_inactive) {
+                Ok(Some(market)) => markets.push(market),
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(error = %err, "unable to map Binance market row, skipping");
+                }
+            }
+        }
+
+        Ok(markets)
+    }
 }
 
 fn parse_kline_interval(timeframe: &str) -> Option<KlineCandlestickDataIntervalEnum> {
@@ -268,6 +295,174 @@ fn to_binance_depth_limit(requested: usize) -> usize {
     } else {
         1_000
     }
+}
+
+fn map_exchange_information_symbol(
+    raw: ExchangeInformationResponseSymbolsInner,
+    include_inactive: bool,
+) -> Result<Option<UnifiedMarket>, ExchangeError> {
+    let Some(exchange_symbol) = raw
+        .symbol
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+
+    let (base, quote) = resolve_exchange_assets(
+        exchange_symbol,
+        raw.base_asset.as_deref(),
+        raw.quote_asset.as_deref(),
+    )?;
+
+    let active = raw
+        .status
+        .as_deref()
+        .map(|status| status.eq_ignore_ascii_case("trading"))
+        .unwrap_or(true);
+
+    if !include_inactive && !active {
+        return Ok(None);
+    }
+
+    let market_type = map_binance_market_type(raw.contract_type.as_deref());
+    let min_order_size = extract_binance_min_qty(raw.filters.as_ref());
+    let tick_size = extract_binance_tick_size(raw.filters.as_ref());
+    let contract_size = matches!(
+        market_type,
+        UnifiedMarketType::Perp | UnifiedMarketType::Future | UnifiedMarketType::Option
+    )
+    .then_some(1.0);
+
+    Ok(Some(UnifiedMarket {
+        exchange: "binance".to_string(),
+        symbol: format!("{base}/{quote}"),
+        base,
+        quote,
+        market_type,
+        active,
+        min_order_size,
+        tick_size,
+        contract_size,
+        info: UnifiedMarketInfo {
+            category: None,
+            raw_symbol: Some(exchange_symbol.to_string()),
+            exchange_symbol: Some(exchange_symbol.to_string()),
+        },
+    }))
+}
+
+fn resolve_exchange_assets(
+    exchange_symbol: &str,
+    base_asset: Option<&str>,
+    quote_asset: Option<&str>,
+) -> Result<(String, String), ExchangeError> {
+    let base = base_asset
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(sanitize_asset)
+        .transpose()?;
+    let quote = quote_asset
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(sanitize_asset)
+        .transpose()?;
+
+    if let (Some(base), Some(quote)) = (base, quote) {
+        return Ok((base, quote));
+    }
+
+    if let Some((base, quote)) = split_market_symbol(exchange_symbol) {
+        return Ok((base, quote));
+    }
+
+    Err(ExchangeError::UpstreamData(format!(
+        "unable to resolve Binance market assets for symbol `{exchange_symbol}`"
+    )))
+}
+
+fn map_binance_market_type(contract_type: Option<&str>) -> UnifiedMarketType {
+    let normalized = contract_type
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    if normalized.contains("option") {
+        return UnifiedMarketType::Option;
+    }
+    if normalized.contains("spot") {
+        return UnifiedMarketType::Spot;
+    }
+    if normalized.contains("future")
+        || normalized.contains("quarter")
+        || normalized.contains("delivery")
+        || normalized.contains("current_")
+        || normalized.contains("next_")
+    {
+        return UnifiedMarketType::Future;
+    }
+
+    UnifiedMarketType::Perp
+}
+
+fn extract_binance_min_qty(
+    filters: Option<&Vec<ExchangeInformationResponseSymbolsInnerFiltersInner>>,
+) -> Option<f64> {
+    let Some(filters) = filters else {
+        return None;
+    };
+
+    let parse_min_qty = |filter: &ExchangeInformationResponseSymbolsInnerFiltersInner| {
+        filter
+            .min_qty
+            .as_deref()
+            .and_then(|value| value.parse::<f64>().ok())
+    };
+
+    filters
+        .iter()
+        .find(|filter| {
+            filter
+                .filter_type
+                .as_deref()
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("LOT_SIZE"))
+        })
+        .and_then(parse_min_qty)
+        .or_else(|| {
+            filters
+                .iter()
+                .find(|filter| {
+                    filter
+                        .filter_type
+                        .as_deref()
+                        .is_some_and(|kind| kind.eq_ignore_ascii_case("MARKET_LOT_SIZE"))
+                })
+                .and_then(parse_min_qty)
+        })
+}
+
+fn extract_binance_tick_size(
+    filters: Option<&Vec<ExchangeInformationResponseSymbolsInnerFiltersInner>>,
+) -> Option<f64> {
+    let Some(filters) = filters else {
+        return None;
+    };
+
+    filters
+        .iter()
+        .find(|filter| {
+            filter
+                .filter_type
+                .as_deref()
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("PRICE_FILTER"))
+        })
+        .and_then(|filter| {
+            filter
+                .tick_size
+                .as_deref()
+                .and_then(|value| value.parse::<f64>().ok())
+        })
 }
 
 fn map_ohlcv_row(
@@ -582,11 +777,14 @@ fn map_anyhow_error(error: anyhow::Error) -> ExchangeError {
 #[cfg(test)]
 mod tests {
     use super::{
-        map_ohlcv_row, map_order_book_levels, map_trade, normalize_market_symbol,
-        parse_kline_interval, resolve_public_symbol, to_binance_depth_limit,
+        map_exchange_information_symbol, map_ohlcv_row, map_order_book_levels, map_trade,
+        normalize_market_symbol, parse_kline_interval, resolve_public_symbol,
+        to_binance_depth_limit,
     };
     use binance_sdk::derivatives_trading_usds_futures::rest_api::{
-        KlineCandlestickDataResponseItemInner, RecentTradesListResponseInner,
+        ExchangeInformationResponseSymbolsInner,
+        ExchangeInformationResponseSymbolsInnerFiltersInner, KlineCandlestickDataResponseItemInner,
+        RecentTradesListResponseInner,
     };
 
     #[test]
@@ -681,5 +879,37 @@ mod tests {
         assert_eq!(to_binance_depth_limit(91), 100);
         assert_eq!(to_binance_depth_limit(300), 500);
         assert_eq!(to_binance_depth_limit(999), 1000);
+    }
+
+    #[test]
+    fn maps_binance_market_to_canonical_symbol_without_settlement_suffix() {
+        let raw = ExchangeInformationResponseSymbolsInner {
+            symbol: Some("ADAUSDT".to_string()),
+            contract_type: Some("PERPETUAL".to_string()),
+            status: Some("TRADING".to_string()),
+            base_asset: Some("ADA".to_string()),
+            quote_asset: Some("USDT".to_string()),
+            filters: Some(vec![
+                ExchangeInformationResponseSymbolsInnerFiltersInner {
+                    filter_type: Some("PRICE_FILTER".to_string()),
+                    tick_size: Some("0.0001".to_string()),
+                    ..Default::default()
+                },
+                ExchangeInformationResponseSymbolsInnerFiltersInner {
+                    filter_type: Some("LOT_SIZE".to_string()),
+                    min_qty: Some("1".to_string()),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        };
+
+        let mapped = map_exchange_information_symbol(raw, false)
+            .expect("market should map")
+            .expect("market should not be filtered");
+
+        assert_eq!(mapped.symbol, "ADA/USDT");
+        assert_eq!(mapped.base, "ADA");
+        assert_eq!(mapped.quote, "USDT");
     }
 }

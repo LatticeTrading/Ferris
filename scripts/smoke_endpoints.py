@@ -159,6 +159,44 @@ def test_fetch_order_book(base_url, exchange, symbol, timeout):
     print("ok  fetchOrderBook")
 
 
+def test_fetch_markets(base_url, exchange, timeout):
+    payload = {
+        "exchange": exchange,
+        "params": {},
+        "includeInactive": False,
+    }
+    status, body = http_json(
+        "POST", f"{base_url}/v1/fetchMarkets", payload, timeout=timeout
+    )
+    assert_true(status == 200, f"fetchMarkets status expected 200, got {status}")
+    assert_true(
+        isinstance(body, dict), f"fetchMarkets must return object, got: {type(body)}"
+    )
+
+    markets = body.get("markets", [])
+    assert_true(isinstance(markets, list), "fetchMarkets markets must be list")
+    assert_true(len(markets) > 0, "fetchMarkets returned no markets")
+
+    first = markets[0]
+    for key in ["exchange", "symbol", "base", "quote", "type", "active", "info"]:
+        assert_true(key in first, f"fetchMarkets missing key: {key}")
+
+    symbol = first.get("symbol")
+    assert_true(isinstance(symbol, str), "fetchMarkets symbol must be string")
+    assert_true("/" in symbol, "fetchMarkets symbol must be BASE/QUOTE")
+    assert_true(":" not in symbol, "fetchMarkets symbol must not contain ':'")
+    assert_true(symbol == symbol.upper(), "fetchMarkets symbol must be uppercase")
+
+    if exchange.lower() == "bybit":
+        info = first.get("info", {})
+        assert_true(
+            isinstance(info.get("category"), str),
+            "fetchMarkets bybit rows must include info.category",
+        )
+
+    print(f"ok  fetchMarkets ({len(markets)} rows)")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Smoke test Ferris market-data endpoints against a running server."
@@ -166,6 +204,7 @@ def main():
     parser.add_argument("--base-url", default="http://127.0.0.1:8787")
     parser.add_argument("--exchange", default="hyperliquid")
     parser.add_argument("--symbol", default="BTC/USDC:USDC")
+    parser.add_argument("--markets-exchange", default="bybit")
     parser.add_argument("--timeout", type=int, default=20)
     parser.add_argument(
         "--wait-seconds",
@@ -187,6 +226,7 @@ def main():
         test_fetch_trades(base_url, args.exchange, args.symbol, args.timeout)
         test_fetch_ohlcv(base_url, args.exchange, args.symbol, args.timeout)
         test_fetch_order_book(base_url, args.exchange, args.symbol, args.timeout)
+        test_fetch_markets(base_url, args.markets_exchange, args.timeout)
     except (AssertionError, RuntimeError, json.JSONDecodeError) as err:
         print(f"fail {err}", file=sys.stderr)
         print(

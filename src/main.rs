@@ -51,6 +51,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/fetchTrades", post(web::fetch_trades))
         .route("/v1/fetchOHLCV", post(web::fetch_ohlcv))
         .route("/v1/fetchOrderBook", post(web::fetch_order_book))
+        .route("/v1/fetchMarkets", post(web::fetch_markets))
         .route("/v1/ws", get(web::trades_stream_ws))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())

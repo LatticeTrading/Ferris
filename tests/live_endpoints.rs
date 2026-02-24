@@ -19,6 +19,10 @@ fn symbol() -> String {
     env_or_default("FERRIS_TEST_SYMBOL", "BTC/USDC:USDC")
 }
 
+fn markets_exchange() -> String {
+    env_or_default("FERRIS_TEST_MARKETS_EXCHANGE", "bybit")
+}
+
 fn http_client() -> Client {
     Client::builder()
         .timeout(Duration::from_secs(20))
@@ -226,4 +230,88 @@ async fn live_fetch_order_book_shape() {
     assert!(first_ask[1].as_f64().is_some(), "ask size must be number");
     assert!(first_bid[0].as_f64().is_some(), "bid price must be number");
     assert!(first_bid[1].as_f64().is_some(), "bid size must be number");
+}
+
+#[tokio::test]
+#[ignore = "requires a running backend; run with: cargo test --test live_endpoints -- --ignored"]
+async fn live_fetch_markets_shape() {
+    let client = http_client();
+    let test_exchange = markets_exchange();
+    let body = post_json(
+        &client,
+        "/v1/fetchMarkets",
+        json!({
+            "exchange": test_exchange,
+            "params": {},
+            "includeInactive": false
+        }),
+    )
+    .await;
+
+    let object = body
+        .as_object()
+        .expect("fetchMarkets response must be an object");
+
+    assert!(
+        object.get("timestamp").and_then(Value::as_u64).is_some(),
+        "fetchMarkets timestamp must be a number"
+    );
+    assert!(
+        object.get("exchange").and_then(Value::as_str).is_some(),
+        "fetchMarkets exchange must be a string"
+    );
+
+    let markets = object
+        .get("markets")
+        .and_then(Value::as_array)
+        .expect("fetchMarkets markets must be an array");
+    assert!(!markets.is_empty(), "fetchMarkets returned no markets");
+
+    let first = markets[0]
+        .as_object()
+        .expect("market entry must be a json object");
+
+    for key in [
+        "exchange", "symbol", "base", "quote", "type", "active", "info",
+    ] {
+        assert!(
+            first.contains_key(key),
+            "market missing expected key `{key}`"
+        );
+    }
+
+    let symbol = first
+        .get("symbol")
+        .and_then(Value::as_str)
+        .expect("market symbol must be string");
+    assert!(symbol.contains('/'), "market symbol must be BASE/QUOTE");
+    assert!(
+        !symbol.contains(':'),
+        "market symbol must not include settlement suffix"
+    );
+    assert_eq!(symbol, symbol.to_ascii_uppercase());
+
+    let market_type = first
+        .get("type")
+        .and_then(Value::as_str)
+        .expect("market type must be string");
+    assert!(
+        ["spot", "future", "perp", "option"].contains(&market_type),
+        "market type must be one of spot/future/perp/option"
+    );
+
+    if object
+        .get("exchange")
+        .and_then(Value::as_str)
+        .is_some_and(|exchange| exchange.eq_ignore_ascii_case("bybit"))
+    {
+        assert!(
+            first
+                .get("info")
+                .and_then(|info| info.get("category"))
+                .and_then(Value::as_str)
+                .is_some(),
+            "bybit market must include info.category"
+        );
+    }
 }

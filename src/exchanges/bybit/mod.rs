@@ -9,8 +9,9 @@ use serde_json::Value;
 use crate::{
     exchanges::traits::{ExchangeError, MarketDataExchange},
     models::{
-        CcxtOhlcv, CcxtOrderBook, CcxtTrade, FetchOhlcvParams, FetchOrderBookParams,
-        FetchTradesParams,
+        CcxtOhlcv, CcxtOrderBook, CcxtTrade, FetchMarketsParams, FetchOhlcvParams,
+        FetchOrderBookParams, FetchTradesParams, UnifiedMarket, UnifiedMarketInfo,
+        UnifiedMarketType,
     },
 };
 
@@ -24,6 +25,7 @@ const DEFAULT_FETCH_OHLCV_LIMIT: usize = 200;
 const MAX_FETCH_OHLCV_LIMIT: usize = 1_000;
 
 const DEFAULT_FETCH_ORDER_BOOK_LEVELS: usize = 100;
+const DEFAULT_FETCH_MARKETS_LIMIT: usize = 1_000;
 
 pub struct BybitExchange {
     http_client: reqwest::Client,
@@ -279,6 +281,68 @@ impl MarketDataExchange for BybitExchange {
             symbol: Some(resolved_symbol),
         })
     }
+
+    async fn fetch_markets(
+        &self,
+        params: FetchMarketsParams,
+    ) -> Result<Vec<UnifiedMarket>, ExchangeError> {
+        let categories = parse_market_categories_from_params(&params.params)?;
+        let mut markets = Vec::new();
+
+        for category in categories {
+            let mut cursor = None::<String>;
+
+            loop {
+                let mut query = vec![
+                    ("category", category.as_str().to_string()),
+                    ("limit", DEFAULT_FETCH_MARKETS_LIMIT.to_string()),
+                ];
+
+                if let Some(next_cursor) = cursor.as_ref() {
+                    if !next_cursor.is_empty() {
+                        query.push(("cursor", next_cursor.clone()));
+                    }
+                }
+
+                let result = self
+                    .get_public_market_result("/v5/market/instruments-info", &query)
+                    .await?;
+
+                let rows = result
+                    .get("list")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| {
+                        ExchangeError::UpstreamData(
+                            "Bybit instruments response missing `result.list`".to_string(),
+                        )
+                    })?;
+
+                for row in rows {
+                    match map_market_row(row, category, params.include_inactive) {
+                        Ok(Some(market)) => markets.push(market),
+                        Ok(None) => {}
+                        Err(err) => {
+                            tracing::warn!(error = %err, "unable to map Bybit market row, skipping");
+                        }
+                    }
+                }
+
+                let next_cursor = result
+                    .get("nextPageCursor")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .unwrap_or_default();
+
+                if next_cursor.is_empty() || cursor.as_deref() == Some(next_cursor) {
+                    break;
+                }
+
+                cursor = Some(next_cursor.to_string());
+            }
+        }
+
+        Ok(markets)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -344,6 +408,172 @@ fn parse_category_from_params(params: &Value) -> Result<BybitCategory, ExchangeE
             "unsupported Bybit category `{other}`"
         ))),
     }
+}
+
+fn parse_market_categories_from_params(
+    params: &Value,
+) -> Result<Vec<BybitCategory>, ExchangeError> {
+    let Some(raw_category) = params.get("category") else {
+        return Ok(vec![
+            BybitCategory::Linear,
+            BybitCategory::Inverse,
+            BybitCategory::Spot,
+        ]);
+    };
+
+    let raw_category = raw_category
+        .as_str()
+        .ok_or_else(|| ExchangeError::BadSymbol("Bybit `category` must be a string".to_string()))?;
+
+    let normalized = raw_category.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return Ok(vec![
+            BybitCategory::Linear,
+            BybitCategory::Inverse,
+            BybitCategory::Spot,
+        ]);
+    }
+
+    let category = match normalized.as_str() {
+        "spot" => BybitCategory::Spot,
+        "linear" => BybitCategory::Linear,
+        "inverse" => BybitCategory::Inverse,
+        "option" | "options" => BybitCategory::Option,
+        other => {
+            return Err(ExchangeError::BadSymbol(format!(
+                "unsupported Bybit category `{other}`"
+            )))
+        }
+    };
+
+    Ok(vec![category])
+}
+
+fn map_market_row(
+    raw: &Value,
+    category: BybitCategory,
+    include_inactive: bool,
+) -> Result<Option<UnifiedMarket>, ExchangeError> {
+    let exchange_symbol = raw
+        .get("symbol")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    if exchange_symbol.is_empty() {
+        return Ok(None);
+    }
+
+    let (base, quote) = resolve_market_assets(raw, exchange_symbol)?;
+    let active = raw
+        .get("status")
+        .and_then(Value::as_str)
+        .map(is_bybit_market_active)
+        .unwrap_or(true);
+
+    if !include_inactive && !active {
+        return Ok(None);
+    }
+
+    let market_type =
+        map_bybit_market_type(category, raw.get("contractType").and_then(Value::as_str));
+    let min_order_size = raw
+        .get("lotSizeFilter")
+        .and_then(|filter| filter.get("minOrderQty"))
+        .and_then(parse_f64_lossy)
+        .or_else(|| {
+            raw.get("lotSizeFilter")
+                .and_then(|filter| filter.get("minOrderAmt"))
+                .and_then(parse_f64_lossy)
+        });
+    let tick_size = raw
+        .get("priceFilter")
+        .and_then(|filter| filter.get("tickSize"))
+        .and_then(parse_f64_lossy);
+    let contract_size = raw
+        .get("contractSize")
+        .and_then(parse_f64_lossy)
+        .or_else(|| {
+            matches!(
+                market_type,
+                UnifiedMarketType::Perp | UnifiedMarketType::Future | UnifiedMarketType::Option
+            )
+            .then_some(1.0)
+        });
+
+    Ok(Some(UnifiedMarket {
+        exchange: "bybit".to_string(),
+        symbol: format!("{base}/{quote}"),
+        base,
+        quote,
+        market_type,
+        active,
+        min_order_size,
+        tick_size,
+        contract_size,
+        info: UnifiedMarketInfo {
+            category: Some(category.as_str().to_string()),
+            raw_symbol: Some(exchange_symbol.to_string()),
+            exchange_symbol: Some(exchange_symbol.to_string()),
+        },
+    }))
+}
+
+fn resolve_market_assets(
+    raw: &Value,
+    exchange_symbol: &str,
+) -> Result<(String, String), ExchangeError> {
+    let base = raw
+        .get("baseCoin")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(sanitize_asset)
+        .transpose()?;
+    let quote = raw
+        .get("quoteCoin")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(sanitize_asset)
+        .transpose()?;
+
+    if let (Some(base), Some(quote)) = (base, quote) {
+        return Ok((base, quote));
+    }
+
+    if let Some((base, quote)) = split_market_symbol(exchange_symbol) {
+        return Ok((base, quote));
+    }
+
+    Err(ExchangeError::UpstreamData(format!(
+        "unable to resolve Bybit market assets for symbol `{exchange_symbol}`"
+    )))
+}
+
+fn map_bybit_market_type(
+    category: BybitCategory,
+    contract_type: Option<&str>,
+) -> UnifiedMarketType {
+    match category {
+        BybitCategory::Spot => UnifiedMarketType::Spot,
+        BybitCategory::Option => UnifiedMarketType::Option,
+        BybitCategory::Linear | BybitCategory::Inverse => {
+            let normalized_contract_type = contract_type
+                .map(str::trim)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+
+            if normalized_contract_type.contains("future") {
+                UnifiedMarketType::Future
+            } else if normalized_contract_type.contains("option") {
+                UnifiedMarketType::Option
+            } else {
+                UnifiedMarketType::Perp
+            }
+        }
+    }
+}
+
+fn is_bybit_market_active(status: &str) -> bool {
+    status.trim().eq_ignore_ascii_case("trading")
 }
 
 fn map_trade_row(raw: &Value, symbol: &str) -> Result<CcxtTrade, ExchangeError> {
@@ -631,9 +861,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        map_bybit_api_error, map_kline_row, map_order_book_levels, map_timeframe_to_bybit_interval,
-        map_trade_row, max_order_book_limit_for_category, normalize_market_symbol,
-        parse_category_from_params, resolve_public_symbol, BybitCategory,
+        map_bybit_api_error, map_kline_row, map_market_row, map_order_book_levels,
+        map_timeframe_to_bybit_interval, map_trade_row, max_order_book_limit_for_category,
+        normalize_market_symbol, parse_category_from_params, resolve_public_symbol, BybitCategory,
     };
     use crate::exchanges::traits::ExchangeError;
 
@@ -752,5 +982,28 @@ mod tests {
     fn maps_bybit_symbol_errors_to_bad_symbol() {
         let mapped = map_bybit_api_error(10021, "Futures/Options symbol does not exist.");
         assert!(matches!(mapped, ExchangeError::BadSymbol(_)));
+    }
+
+    #[test]
+    fn maps_bybit_market_to_canonical_symbol_without_settlement_suffix() {
+        let raw = json!({
+            "symbol": "ADAUSDT",
+            "baseCoin": "ADA",
+            "quoteCoin": "USDT",
+            "status": "Trading",
+            "contractType": "LinearPerpetual",
+            "priceFilter": {"tickSize": "0.0001"},
+            "lotSizeFilter": {"minOrderQty": "1"}
+        });
+
+        let mapped = map_market_row(&raw, BybitCategory::Linear, false)
+            .expect("market should map")
+            .expect("market should not be filtered");
+
+        assert_eq!(mapped.symbol, "ADA/USDT");
+        assert_eq!(mapped.base, "ADA");
+        assert_eq!(mapped.quote, "USDT");
+        assert_eq!(mapped.info.category.as_deref(), Some("linear"));
+        assert_eq!(mapped.info.exchange_symbol.as_deref(), Some("ADAUSDT"));
     }
 }

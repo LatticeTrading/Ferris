@@ -2,6 +2,7 @@ param(
     [string]$BaseUrl = "http://127.0.0.1:8787",
     [string]$Exchange = "hyperliquid",
     [string]$Symbol = "BTC/USDC:USDC",
+    [string]$MarketsExchange = "bybit",
     [int]$WaitSeconds = 90,
     [int]$TimeoutSeconds = 20,
     [switch]$ShowData
@@ -118,6 +119,28 @@ Write-Host "ok  fetchOrderBook"
 if ($ShowData) {
     Write-Host "sample fetchOrderBook:"
     $orderBook | ConvertTo-Json -Depth 10
+}
+
+$marketsBody = @{
+    exchange = $MarketsExchange
+    params = @{}
+    includeInactive = $false
+} | ConvertTo-Json -Compress
+
+$marketsResponse = Invoke-RestMethod -Uri "$BaseUrl/v1/fetchMarkets" -Method Post -ContentType "application/json" -Body $marketsBody -TimeoutSec $TimeoutSeconds
+Assert-True ($null -ne $marketsResponse.markets) "fetchMarkets missing markets"
+Assert-True ($marketsResponse.markets.Count -gt 0) "fetchMarkets returned no data"
+$firstMarket = $marketsResponse.markets[0]
+Assert-True ($firstMarket.symbol -match "/") "fetchMarkets symbol must be BASE/QUOTE"
+Assert-True ($firstMarket.symbol -notmatch ":") "fetchMarkets symbol must not include settlement suffix"
+Assert-True ($firstMarket.symbol -ceq $firstMarket.symbol.ToUpperInvariant()) "fetchMarkets symbol must be uppercase"
+if ($MarketsExchange.ToLowerInvariant() -eq "bybit") {
+    Assert-True ($null -ne $firstMarket.info.category) "fetchMarkets bybit rows must include info.category"
+}
+Write-Host "ok  fetchMarkets ($($marketsResponse.markets.Count) rows)"
+if ($ShowData) {
+    Write-Host "sample fetchMarkets row:"
+    $firstMarket | ConvertTo-Json -Depth 10
 }
 
 Write-Host "all endpoint checks passed"

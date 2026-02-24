@@ -1,7 +1,8 @@
 use async_trait::async_trait;
 
 use crate::models::{
-    CcxtOhlcv, CcxtOrderBook, CcxtTrade, FetchOhlcvParams, FetchOrderBookParams, FetchTradesParams,
+    CcxtOhlcv, CcxtOrderBook, CcxtTrade, FetchMarketsParams, FetchOhlcvParams,
+    FetchOrderBookParams, FetchTradesParams, UnifiedMarket,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -31,4 +32,9 @@ pub trait MarketDataExchange: Send + Sync {
         &self,
         params: FetchOrderBookParams,
     ) -> Result<CcxtOrderBook, ExchangeError>;
+
+    async fn fetch_markets(
+        &self,
+        params: FetchMarketsParams,
+    ) -> Result<Vec<UnifiedMarket>, ExchangeError>;
 }

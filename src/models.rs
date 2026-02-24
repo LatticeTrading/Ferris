@@ -3,6 +3,32 @@ use serde_json::Value;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct FetchMarketsRequest {
+    #[serde(default = "default_exchange")]
+    pub exchange: String,
+    #[serde(default)]
+    pub params: Value,
+    #[serde(default)]
+    pub include_inactive: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct FetchMarketsParams {
+    pub params: Value,
+    pub include_inactive: bool,
+}
+
+impl FetchMarketsRequest {
+    pub fn into_params(self) -> FetchMarketsParams {
+        FetchMarketsParams {
+            params: self.params,
+            include_inactive: self.include_inactive,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FetchTradesRequest {
     #[serde(default = "default_exchange")]
     pub exchange: String,
@@ -136,6 +162,53 @@ pub struct CcxtOrderBook {
 #[derive(Debug, Serialize)]
 pub struct HealthResponse {
     pub status: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UnifiedMarketType {
+    Spot,
+    Future,
+    Perp,
+    Option,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct UnifiedMarketInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_symbol: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exchange_symbol: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnifiedMarket {
+    pub exchange: String,
+    pub symbol: String,
+    pub base: String,
+    pub quote: String,
+    #[serde(rename = "type")]
+    pub market_type: UnifiedMarketType,
+    pub active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_order_size: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tick_size: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contract_size: Option<f64>,
+    pub info: UnifiedMarketInfo,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FetchMarketsResponse {
+    pub exchange: String,
+    pub markets: Vec<UnifiedMarket>,
+    pub timestamp: u64,
 }
 
 fn default_exchange() -> String {

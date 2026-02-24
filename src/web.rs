@@ -1,21 +1,27 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
 use axum::{
     extract::{
+        rejection::JsonRejection,
         ws::{Message, WebSocket, WebSocketUpgrade},
         State,
     },
+    http::StatusCode,
     response::IntoResponse,
     Json,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use tokio::{
     sync::{
         broadcast,
         mpsc::{channel, error::TrySendError, Sender},
-        Notify,
+        Mutex, Notify, RwLock,
     },
     task::JoinHandle,
 };
@@ -23,10 +29,11 @@ use tracing::warn;
 
 use crate::{
     errors::ApiError,
-    exchanges::registry::ExchangeRegistry,
+    exchanges::{registry::ExchangeRegistry, traits::ExchangeError},
     models::{
-        CcxtOhlcv, CcxtOrderBook, CcxtTrade, FetchOhlcvRequest, FetchOrderBookRequest,
-        FetchTradesRequest, HealthResponse,
+        CcxtOhlcv, CcxtOrderBook, CcxtTrade, FetchMarketsParams, FetchMarketsRequest,
+        FetchMarketsResponse, FetchOhlcvRequest, FetchOrderBookRequest, FetchTradesRequest,
+        HealthResponse,
     },
     realtime::{
         OhlcvTopic, OhlcvTopicManager, OrderBookTopic, OrderBookTopicManager, TradesTopic,
@@ -40,6 +47,7 @@ pub struct AppState {
     trades_topic_manager: TradesTopicManager,
     order_book_topic_manager: OrderBookTopicManager,
     ohlcv_topic_manager: OhlcvTopicManager,
+    markets_cache: MarketsCache,
 }
 
 impl AppState {
@@ -54,7 +62,147 @@ impl AppState {
             trades_topic_manager,
             order_book_topic_manager,
             ohlcv_topic_manager,
+            markets_cache: MarketsCache::new(Duration::from_secs(30)),
         }
+    }
+}
+
+#[derive(Clone)]
+struct MarketsCache {
+    inner: Arc<MarketsCacheInner>,
+}
+
+struct MarketsCacheInner {
+    ttl: Duration,
+    entries: RwLock<HashMap<String, CachedMarketsResponse>>,
+    key_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+}
+
+#[derive(Clone)]
+struct CachedMarketsResponse {
+    response: FetchMarketsResponse,
+    expires_at: Instant,
+}
+
+impl MarketsCache {
+    fn new(ttl: Duration) -> Self {
+        Self {
+            inner: Arc::new(MarketsCacheInner {
+                ttl,
+                entries: RwLock::new(HashMap::new()),
+                key_locks: Mutex::new(HashMap::new()),
+            }),
+        }
+    }
+
+    async fn get(&self, key: &str) -> Option<FetchMarketsResponse> {
+        let now = Instant::now();
+
+        {
+            let entries = self.inner.entries.read().await;
+            if let Some(entry) = entries.get(key) {
+                if entry.expires_at > now {
+                    return Some(entry.response.clone());
+                }
+            } else {
+                return None;
+            }
+        }
+
+        let mut entries = self.inner.entries.write().await;
+        if let Some(entry) = entries.get(key) {
+            if entry.expires_at > now {
+                return Some(entry.response.clone());
+            }
+            entries.remove(key);
+        }
+
+        None
+    }
+
+    async fn insert(&self, key: String, response: FetchMarketsResponse) {
+        let expires_at = Instant::now() + self.inner.ttl;
+        let mut entries = self.inner.entries.write().await;
+        entries.insert(
+            key,
+            CachedMarketsResponse {
+                response,
+                expires_at,
+            },
+        );
+    }
+
+    async fn lock_for(&self, key: &str) -> Arc<Mutex<()>> {
+        let mut key_locks = self.inner.key_locks.lock().await;
+        key_locks
+            .entry(key.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum FetchMarketsApiError {
+    #[error("validation error: {0}")]
+    Validation(String),
+    #[error("invalid exchange: {0}")]
+    InvalidExchange(String),
+    #[error("internal error: {0}")]
+    Internal(String),
+    #[error(transparent)]
+    Exchange(#[from] ExchangeError),
+}
+
+#[derive(Debug, Serialize)]
+struct FetchMarketsErrorBody {
+    code: &'static str,
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
+struct FetchMarketsErrorEnvelope {
+    error: FetchMarketsErrorBody,
+}
+
+impl IntoResponse for FetchMarketsApiError {
+    fn into_response(self) -> axum::response::Response {
+        let (status, code, message) = match self {
+            FetchMarketsApiError::Validation(message) => {
+                (StatusCode::BAD_REQUEST, "VALIDATION_ERROR", message)
+            }
+            FetchMarketsApiError::InvalidExchange(exchange_id) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "INVALID_EXCHANGE",
+                format!("Exchange '{exchange_id}' is not supported"),
+            ),
+            FetchMarketsApiError::Internal(message) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", message)
+            }
+            FetchMarketsApiError::Exchange(exchange_error) => match exchange_error {
+                ExchangeError::BadSymbol(message) => {
+                    (StatusCode::BAD_REQUEST, "BAD_SYMBOL", message)
+                }
+                ExchangeError::UpstreamRequest(message) => {
+                    (StatusCode::BAD_GATEWAY, "UPSTREAM_REQUEST_FAILED", message)
+                }
+                ExchangeError::UpstreamData(message) => {
+                    (StatusCode::BAD_GATEWAY, "UPSTREAM_DATA_INVALID", message)
+                }
+                ExchangeError::Internal(message) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "INTERNAL_EXCHANGE_ERROR",
+                    message,
+                ),
+            },
+        };
+
+        (
+            status,
+            Json(FetchMarketsErrorEnvelope {
+                error: FetchMarketsErrorBody { code, message },
+            }),
+        )
+            .into_response()
     }
 }
 
@@ -161,6 +309,117 @@ pub async fn fetch_order_book(
 
     let order_book = exchange.fetch_order_book(request.into_params()).await?;
     Ok(Json(order_book))
+}
+
+pub async fn fetch_markets(
+    State(state): State<AppState>,
+    payload: Result<Json<FetchMarketsRequest>, JsonRejection>,
+) -> Result<Json<FetchMarketsResponse>, FetchMarketsApiError> {
+    let Json(request) = payload.map_err(|err| {
+        FetchMarketsApiError::Validation(format!("invalid request payload: {err}"))
+    })?;
+
+    if !(request.params.is_null() || request.params.is_object()) {
+        return Err(FetchMarketsApiError::Validation(
+            "`params` must be an object or null".to_string(),
+        ));
+    }
+
+    let exchange_id = request.exchange.trim().to_ascii_lowercase();
+    if exchange_id.is_empty() {
+        return Err(FetchMarketsApiError::Validation(
+            "`exchange` cannot be empty".to_string(),
+        ));
+    }
+
+    let Some(exchange) = state.exchange_registry.get(&exchange_id) else {
+        return Err(FetchMarketsApiError::InvalidExchange(exchange_id));
+    };
+
+    let canonical_params = normalize_markets_params(request.params);
+    let include_inactive = request.include_inactive;
+    let cache_key = markets_cache_key(&exchange_id, &canonical_params, include_inactive)?;
+
+    if let Some(cached) = state.markets_cache.get(&cache_key).await {
+        return Ok(Json(cached));
+    }
+
+    let key_lock = state.markets_cache.lock_for(&cache_key).await;
+    let _key_guard = key_lock.lock().await;
+
+    if let Some(cached) = state.markets_cache.get(&cache_key).await {
+        return Ok(Json(cached));
+    }
+
+    let markets = exchange
+        .fetch_markets(FetchMarketsParams {
+            params: canonical_params,
+            include_inactive,
+        })
+        .await?;
+
+    let response = FetchMarketsResponse {
+        exchange: exchange_id,
+        markets,
+        timestamp: now_unix_millis(),
+    };
+
+    state
+        .markets_cache
+        .insert(cache_key, response.clone())
+        .await;
+
+    Ok(Json(response))
+}
+
+fn normalize_markets_params(params: Value) -> Value {
+    if params.is_null() {
+        return Value::Object(Map::new());
+    }
+
+    canonicalize_json(&params)
+}
+
+fn markets_cache_key(
+    exchange: &str,
+    params: &Value,
+    include_inactive: bool,
+) -> Result<String, FetchMarketsApiError> {
+    let encoded_params = serde_json::to_string(params).map_err(|err| {
+        FetchMarketsApiError::Internal(format!("failed to encode markets params: {err}"))
+    })?;
+
+    Ok(format!(
+        "exchange={exchange}|includeInactive={include_inactive}|params={encoded_params}"
+    ))
+}
+
+fn canonicalize_json(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut entries = map
+                .iter()
+                .map(|(key, value)| (key.clone(), canonicalize_json(value)))
+                .collect::<Vec<_>>();
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+
+            let mut out = Map::new();
+            for (key, value) in entries {
+                out.insert(key, value);
+            }
+
+            Value::Object(out)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(canonicalize_json).collect()),
+        _ => value.clone(),
+    }
+}
+
+fn now_unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 #[derive(Debug, Deserialize)]
@@ -910,5 +1169,28 @@ mod tests {
             .to_string(),
         );
         assert!(unsupported.is_err());
+    }
+
+    #[test]
+    fn markets_cache_key_is_stable_for_equivalent_params() {
+        let params_a = normalize_markets_params(json!({
+            "b": 1,
+            "a": {
+                "y": 2,
+                "x": 1
+            }
+        }));
+        let params_b = normalize_markets_params(json!({
+            "a": {
+                "x": 1,
+                "y": 2
+            },
+            "b": 1
+        }));
+
+        let key_a = markets_cache_key("bybit", &params_a, false).expect("key should build");
+        let key_b = markets_cache_key("bybit", &params_b, false).expect("key should build");
+
+        assert_eq!(key_a, key_b);
     }
 }
