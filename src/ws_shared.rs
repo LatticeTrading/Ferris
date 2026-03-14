@@ -171,6 +171,77 @@ pub fn parse_bybit_trades(payload: &str) -> Vec<WsTrade> {
     parsed
 }
 
+pub fn parse_lighter_trades(payload: &str) -> Vec<WsTrade> {
+    let Ok(value) = serde_json::from_str::<Value>(payload) else {
+        return Vec::new();
+    };
+
+    if value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        != "update/trade"
+    {
+        return Vec::new();
+    }
+
+    let channel = value
+        .get("channel")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !channel.starts_with("trade:") {
+        return Vec::new();
+    }
+
+    let trades_value = value.get("trades").unwrap_or(&Value::Null);
+    let rows = match trades_value {
+        Value::Array(rows) => rows.clone(),
+        Value::Object(_) => vec![trades_value.clone()],
+        _ => return Vec::new(),
+    };
+
+    let mut parsed = Vec::with_capacity(rows.len());
+    for row in rows {
+        let Some(price) = row.get("price").and_then(parse_f64_lossy) else {
+            continue;
+        };
+        let Some(amount) = row.get("size").and_then(parse_f64_lossy) else {
+            continue;
+        };
+        let timestamp = row
+            .get("timestamp")
+            .and_then(parse_u64_lossy)
+            .map(normalize_lighter_timestamp_ms);
+        let side = row
+            .get("is_maker_ask")
+            .and_then(Value::as_bool)
+            .map(|is_maker_ask| {
+                if is_maker_ask {
+                    "buy".to_string()
+                } else {
+                    "sell".to_string()
+                }
+            });
+        let cost = row
+            .get("usd_amount")
+            .and_then(parse_f64_lossy)
+            .or(Some(price * amount));
+
+        parsed.push(WsTrade {
+            info: row.clone(),
+            id: row.get("trade_id").and_then(stringify_json_value),
+            timestamp,
+            side,
+            price: Some(price),
+            amount: Some(amount),
+            cost,
+        });
+    }
+
+    parsed.sort_by_key(|trade| trade.timestamp.unwrap_or_default());
+    parsed
+}
+
 pub fn infer_hyperliquid_coin_from_symbol(symbol: &str) -> Option<String> {
     let trimmed = symbol.trim();
     if trimmed.is_empty() {
@@ -264,6 +335,16 @@ pub fn stringify_json_value(value: &Value) -> Option<String> {
         Value::String(text) => Some(text.clone()),
         Value::Number(number) => Some(number.to_string()),
         _ => None,
+    }
+}
+
+pub fn normalize_lighter_timestamp_ms(timestamp: u64) -> u64 {
+    if timestamp < 1_000_000_000_000 {
+        timestamp.saturating_mul(1_000)
+    } else if timestamp >= 1_000_000_000_000_000 {
+        timestamp / 1_000
+    } else {
+        timestamp
     }
 }
 

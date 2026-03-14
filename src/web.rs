@@ -656,7 +656,8 @@ async fn handle_stream_command(
             },
         ),
         ParsedStreamCommand::Subscribe { channel, topic } => {
-            let topic_key = match resolve_topic_key_by_channel(state, channel, topic.clone()) {
+            let topic_key = match resolve_topic_key_by_channel(state, channel, topic.clone()).await
+            {
                 Ok(topic_key) => topic_key,
                 Err(err) => return send_ws_error(outgoing_sender, "INVALID_TOPIC", err),
             };
@@ -788,7 +789,8 @@ async fn handle_stream_command(
             }
         }
         ParsedStreamCommand::Unsubscribe { channel, topic } => {
-            let topic_key = match resolve_topic_key_by_channel(state, channel, topic.clone()) {
+            let topic_key = match resolve_topic_key_by_channel(state, channel, topic.clone()).await
+            {
                 Ok(topic_key) => topic_key,
                 Err(err) => return send_ws_error(outgoing_sender, "INVALID_TOPIC", err),
             };
@@ -817,15 +819,20 @@ async fn handle_stream_command(
     }
 }
 
-fn resolve_topic_key_by_channel(
+async fn resolve_topic_key_by_channel(
     state: &AppState,
     channel: RealtimeChannel,
     topic: TradesTopic,
 ) -> Result<String, String> {
     match channel {
-        RealtimeChannel::Trades => state.trades_topic_manager.resolve_topic_key(topic),
-        RealtimeChannel::OrderBook => state.order_book_topic_manager.resolve_topic_key(topic),
-        RealtimeChannel::Ohlcv => state.ohlcv_topic_manager.resolve_topic_key(topic),
+        RealtimeChannel::Trades => state.trades_topic_manager.resolve_topic_key(topic).await,
+        RealtimeChannel::OrderBook => {
+            state
+                .order_book_topic_manager
+                .resolve_topic_key(topic)
+                .await
+        }
+        RealtimeChannel::Ohlcv => state.ohlcv_topic_manager.resolve_topic_key(topic).await,
     }
 }
 

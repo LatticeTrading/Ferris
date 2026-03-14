@@ -22,12 +22,14 @@ use crate::{
         fetch_bybit_full_snapshot, parse_bybit_full_delta, BufferDeltaOutcome, BybitFullBookSync,
         SnapshotSyncOutcome, BYBIT_FULL_DEPTH_THRESHOLD, BYBIT_MAX_FULL_DEPTH, BYBIT_REST_BASE_URL,
     },
+    exchanges::lighterxyz::LighterMarketCatalogService,
     models::{CcxtOhlcv, CcxtOrderBook, CcxtTrade},
     ws_shared::{
         infer_hyperliquid_coin_from_symbol as infer_hyperliquid_coin_from_symbol_shared,
         parse_binance_trades as parse_binance_trades_shared,
         parse_bybit_trades as parse_bybit_trades_shared, parse_f64_lossy as parse_f64_lossy_shared,
         parse_hyperliquid_trades as parse_hyperliquid_trades_shared,
+        parse_lighter_trades as parse_lighter_trades_shared,
         parse_u64_lossy as parse_u64_lossy_shared,
         resolve_binance_ws_symbol as resolve_binance_ws_symbol_shared,
         resolve_bybit_ws_symbol as resolve_bybit_ws_symbol_shared,
@@ -37,6 +39,7 @@ use crate::{
 };
 
 const DEFAULT_EXCHANGE: &str = "hyperliquid";
+
 const BYBIT_WS_SPOT_URL: &str = "wss://stream.bybit.com/v5/public/spot";
 const BYBIT_WS_LINEAR_URL: &str = "wss://stream.bybit.com/v5/public/linear";
 const BYBIT_WS_INVERSE_URL: &str = "wss://stream.bybit.com/v5/public/inverse";
@@ -45,8 +48,14 @@ const BYBIT_WS_OPTION_URL: &str = "wss://stream.bybit.com/v5/public/option";
 const TOPIC_BROADCAST_CAPACITY: usize = 512;
 const INITIAL_RECONNECT_DELAY_MS: u64 = 500;
 const MAX_RECONNECT_DELAY_MS: u64 = 15_000;
-const DEFAULT_ORDERBOOK_LEVELS: usize = 20;
 const DEFAULT_OHLCV_TIMEFRAME: &str = "1m";
+const BINANCE_WS_MAX_ORDERBOOK_LEVELS: usize = 1_000;
+const BYBIT_WS_DEFAULT_ORDERBOOK_LEVELS: usize = 1_000;
+const BYBIT_WS_MAX_ORDERBOOK_LEVELS: usize = 1_000;
+const BYBIT_WS_MAX_OPTION_ORDERBOOK_LEVELS: usize = 100;
+const HYPERLIQUID_WS_MAX_ORDERBOOK_LEVELS: usize = 20;
+const DEFAULT_ORDERBOOK_LEVELS: usize = 20;
+
 
 type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -111,8 +120,16 @@ struct ActiveTopic {
 }
 
 impl TradesTopicManager {
-    pub fn new(hyperliquid_base_url: String) -> Self {
-        let runner = Arc::new(RealTradesUpstreamRunner::new(hyperliquid_base_url));
+    pub fn new(
+        hyperliquid_base_url: String,
+        lighter_ws_endpoint: String,
+        lighter_catalog_service: Arc<LighterMarketCatalogService>,
+    ) -> Self {
+        let runner = Arc::new(RealTradesUpstreamRunner::new(
+            hyperliquid_base_url,
+            lighter_ws_endpoint,
+            lighter_catalog_service,
+        ));
         Self {
             inner: Arc::new(TradesTopicManagerInner {
                 topics: RwLock::new(HashMap::new()),
@@ -122,15 +139,16 @@ impl TradesTopicManager {
         }
     }
 
-    pub fn resolve_topic_key(&self, topic: TradesTopic) -> Result<String, String> {
+    pub async fn resolve_topic_key(&self, topic: TradesTopic) -> Result<String, String> {
         self.inner
             .runner
             .resolve(topic)
+            .await
             .map(|resolved| resolved.key)
     }
 
     pub async fn subscribe(&self, topic: TradesTopic) -> Result<TradesSubscription, String> {
-        let resolved = self.inner.runner.resolve(topic)?;
+        let resolved = self.inner.runner.resolve(topic).await?;
 
         let mut new_topic = None;
         let receiver = {
@@ -225,11 +243,15 @@ enum UpstreamTradesStream {
         ws_endpoint: String,
         subscribe_topic: String,
     },
+    Lighter {
+        ws_endpoint: String,
+        market_id: u64,
+    },
 }
 
 #[async_trait]
 trait TradesUpstreamRunner: Send + Sync {
-    fn resolve(&self, topic: TradesTopic) -> Result<ResolvedTradesTopic, String>;
+    async fn resolve(&self, topic: TradesTopic) -> Result<ResolvedTradesTopic, String>;
 
     async fn run(
         &self,
@@ -241,23 +263,39 @@ trait TradesUpstreamRunner: Send + Sync {
 
 struct RealTradesUpstreamRunner {
     hyperliquid_ws_endpoint: String,
+    lighter_ws_endpoint: String,
+    lighter_catalog_service: Arc<LighterMarketCatalogService>,
 }
 
 impl RealTradesUpstreamRunner {
-    fn new(hyperliquid_base_url: String) -> Self {
+    fn new(
+        hyperliquid_base_url: String,
+        lighter_ws_endpoint: String,
+        lighter_catalog_service: Arc<LighterMarketCatalogService>,
+    ) -> Self {
         Self {
             hyperliquid_ws_endpoint: to_hyperliquid_ws_url(&hyperliquid_base_url),
+            lighter_ws_endpoint,
+            lighter_catalog_service,
         }
     }
 }
 
 #[async_trait]
 impl TradesUpstreamRunner for RealTradesUpstreamRunner {
-    fn resolve(&self, topic: TradesTopic) -> Result<ResolvedTradesTopic, String> {
+    async fn resolve(&self, topic: TradesTopic) -> Result<ResolvedTradesTopic, String> {
         match topic.exchange.as_str() {
             "hyperliquid" => resolve_hyperliquid_topic(topic, &self.hyperliquid_ws_endpoint),
             "binance" => resolve_binance_topic(topic),
             "bybit" => resolve_bybit_topic(topic),
+            "lighterxyz" => {
+                resolve_lighter_trades_topic(
+                    topic,
+                    &self.lighter_ws_endpoint,
+                    self.lighter_catalog_service.clone(),
+                )
+                .await
+            }
             other => Err(format!(
                 "exchange `{other}` is not supported for realtime trades"
             )),
@@ -315,7 +353,8 @@ async fn run_single_connection(
     let ws_endpoint = match &topic.stream {
         UpstreamTradesStream::Hyperliquid { ws_endpoint, .. }
         | UpstreamTradesStream::Binance { ws_endpoint }
-        | UpstreamTradesStream::Bybit { ws_endpoint, .. } => ws_endpoint.as_str(),
+        | UpstreamTradesStream::Bybit { ws_endpoint, .. }
+        | UpstreamTradesStream::Lighter { ws_endpoint, .. } => ws_endpoint.as_str(),
     };
 
     let Ok((mut stream, _response)) = connect_async(ws_endpoint).await else {
@@ -345,6 +384,14 @@ async fn run_single_connection(
         } => {
             if let Err(err) = send_bybit_trade_subscription(&mut stream, subscribe_topic).await {
                 tracing::warn!(topic_key = %topic.key, error = %err, "failed to send Bybit trade subscription");
+                return ConnectionOutcome::Reconnect {
+                    reset_backoff: false,
+                };
+            }
+        }
+        UpstreamTradesStream::Lighter { market_id, .. } => {
+            if let Err(err) = send_lighter_subscription(&mut stream, "trade", *market_id).await {
+                tracing::warn!(topic_key = %topic.key, error = %err, "failed to send Lighter trade subscription");
                 return ConnectionOutcome::Reconnect {
                     reset_backoff: false,
                 };
@@ -405,6 +452,7 @@ fn forward_trades(
         }
         UpstreamTradesStream::Binance { .. } => parse_binance_trades_message(payload, symbol),
         UpstreamTradesStream::Bybit { .. } => parse_bybit_trades_message(payload, symbol),
+        UpstreamTradesStream::Lighter { .. } => parse_lighter_trades_message(payload, symbol),
     };
 
     if !trades.is_empty() {
@@ -491,6 +539,30 @@ fn resolve_bybit_topic(topic: TradesTopic) -> Result<ResolvedTradesTopic, String
     })
 }
 
+async fn resolve_lighter_trades_topic(
+    topic: TradesTopic,
+    lighter_ws_endpoint: &str,
+    lighter_catalog_service: Arc<LighterMarketCatalogService>,
+) -> Result<ResolvedTradesTopic, String> {
+    let market = lighter_catalog_service
+        .resolve_market(&topic.symbol, &topic.params)
+        .await
+        .map_err(|err| err.to_string())?;
+
+    Ok(ResolvedTradesTopic {
+        key: format!("lighterxyz|trades|market:{}", market.market_id),
+        topic: TradesTopic {
+            exchange: topic.exchange,
+            symbol: market.symbol,
+            params: topic.params,
+        },
+        stream: UpstreamTradesStream::Lighter {
+            ws_endpoint: lighter_ws_endpoint.to_string(),
+            market_id: market.market_id,
+        },
+    })
+}
+
 async fn send_hyperliquid_subscription(stream: &mut WsStream, coin: &str) -> Result<(), String> {
     let payload = json!({
         "method": "subscribe",
@@ -508,6 +580,22 @@ async fn send_hyperliquid_subscription(stream: &mut WsStream, coin: &str) -> Res
 
 async fn send_bybit_trade_subscription(stream: &mut WsStream, topic: &str) -> Result<(), String> {
     send_bybit_subscription(stream, &[topic], "trade").await
+}
+
+async fn send_lighter_subscription(
+    stream: &mut WsStream,
+    channel_prefix: &str,
+    market_id: u64,
+) -> Result<(), String> {
+    let payload = json!({
+        "type": "subscribe",
+        "channel": format!("{channel_prefix}/{market_id}"),
+    });
+
+    stream
+        .send(TungsteniteMessage::Text(payload.to_string().into()))
+        .await
+        .map_err(|err| format!("failed to send Lighter websocket subscription: {err}"))
 }
 
 async fn send_bybit_subscription(
@@ -544,6 +632,13 @@ fn parse_binance_trades_message(payload: &str, symbol: &str) -> Vec<CcxtTrade> {
 
 fn parse_bybit_trades_message(payload: &str, symbol: &str) -> Vec<CcxtTrade> {
     parse_bybit_trades_shared(payload)
+        .into_iter()
+        .map(|trade| ws_trade_to_ccxt(trade, symbol))
+        .collect()
+}
+
+fn parse_lighter_trades_message(payload: &str, symbol: &str) -> Vec<CcxtTrade> {
+    parse_lighter_trades_shared(payload)
         .into_iter()
         .map(|trade| ws_trade_to_ccxt(trade, symbol))
         .collect()
@@ -698,10 +793,14 @@ impl OrderBookTopicManager {
     pub fn new(
         hyperliquid_base_url: String,
         binance_snapshot_provider: Arc<dyn BinanceOrderBookSnapshotProvider>,
+        lighter_ws_endpoint: String,
+        lighter_catalog_service: Arc<LighterMarketCatalogService>,
     ) -> Self {
         let runner = Arc::new(RealOrderBookUpstreamRunner::new(
             hyperliquid_base_url,
             binance_snapshot_provider,
+            lighter_ws_endpoint,
+            lighter_catalog_service,
         ));
         Self {
             inner: Arc::new(OrderBookTopicManagerInner {
@@ -712,15 +811,16 @@ impl OrderBookTopicManager {
         }
     }
 
-    pub fn resolve_topic_key(&self, topic: OrderBookTopic) -> Result<String, String> {
+    pub async fn resolve_topic_key(&self, topic: OrderBookTopic) -> Result<String, String> {
         self.inner
             .runner
             .resolve(topic)
+            .await
             .map(|resolved| resolved.key)
     }
 
     pub async fn subscribe(&self, topic: OrderBookTopic) -> Result<OrderBookSubscription, String> {
-        let resolved = self.inner.runner.resolve(topic)?;
+        let resolved = self.inner.runner.resolve(topic).await?;
 
         let mut new_topic = None;
         let receiver = {
@@ -814,11 +914,15 @@ enum UpstreamOrderBookStream {
         category: String,
         market_symbol: String,
     },
+    Lighter {
+        ws_endpoint: String,
+        market_id: u64,
+    },
 }
 
 #[async_trait]
 trait OrderBookUpstreamRunner: Send + Sync {
-    fn resolve(&self, topic: OrderBookTopic) -> Result<ResolvedOrderBookTopic, String>;
+    async fn resolve(&self, topic: OrderBookTopic) -> Result<ResolvedOrderBookTopic, String>;
 
     async fn run(
         &self,
@@ -832,30 +936,44 @@ struct RealOrderBookUpstreamRunner {
     hyperliquid_ws_endpoint: String,
     bybit_http_client: reqwest::Client,
     binance_snapshot_provider: Arc<dyn BinanceOrderBookSnapshotProvider>,
+    lighter_ws_endpoint: String,
+    lighter_catalog_service: Arc<LighterMarketCatalogService>,
 }
 
 impl RealOrderBookUpstreamRunner {
     fn new(
         hyperliquid_base_url: String,
         binance_snapshot_provider: Arc<dyn BinanceOrderBookSnapshotProvider>,
+        lighter_ws_endpoint: String,
+        lighter_catalog_service: Arc<LighterMarketCatalogService>,
     ) -> Self {
         Self {
             hyperliquid_ws_endpoint: to_hyperliquid_ws_url(&hyperliquid_base_url),
             bybit_http_client: reqwest::Client::new(),
             binance_snapshot_provider,
+            lighter_ws_endpoint,
+            lighter_catalog_service,
         }
     }
 }
 
 #[async_trait]
 impl OrderBookUpstreamRunner for RealOrderBookUpstreamRunner {
-    fn resolve(&self, topic: OrderBookTopic) -> Result<ResolvedOrderBookTopic, String> {
+    async fn resolve(&self, topic: OrderBookTopic) -> Result<ResolvedOrderBookTopic, String> {
         match topic.exchange.as_str() {
             "hyperliquid" => {
                 resolve_hyperliquid_orderbook_topic(topic, &self.hyperliquid_ws_endpoint)
             }
             "binance" => resolve_binance_orderbook_topic(topic),
             "bybit" => resolve_bybit_orderbook_topic(topic),
+            "lighterxyz" => {
+                resolve_lighter_orderbook_topic(
+                    topic,
+                    &self.lighter_ws_endpoint,
+                    self.lighter_catalog_service.clone(),
+                )
+                .await
+            }
             other => Err(format!(
                 "exchange `{other}` is not supported for realtime orderbook"
             )),
@@ -918,7 +1036,8 @@ async fn run_single_orderbook_connection(
         | UpstreamOrderBookStream::BinancePartial { ws_endpoint }
         | UpstreamOrderBookStream::BinanceDiff { ws_endpoint, .. }
         | UpstreamOrderBookStream::BybitLimited { ws_endpoint, .. }
-        | UpstreamOrderBookStream::BybitFull { ws_endpoint, .. } => ws_endpoint.as_str(),
+        | UpstreamOrderBookStream::BybitFull { ws_endpoint, .. }
+        | UpstreamOrderBookStream::Lighter { ws_endpoint, .. } => ws_endpoint.as_str(),
     };
     let Ok((mut stream, _response)) = connect_async(ws_endpoint).await else {
         tracing::warn!(
@@ -977,6 +1096,15 @@ async fn run_single_orderbook_connection(
             )
             .await;
         }
+        UpstreamOrderBookStream::Lighter { market_id, .. } => {
+            if let Err(err) = send_lighter_subscription(&mut stream, "order_book", *market_id).await
+            {
+                tracing::warn!(topic_key = %topic.key, error = %err, "failed to send Lighter orderbook subscription");
+                return ConnectionOutcome::Reconnect {
+                    reset_backoff: false,
+                };
+            }
+        }
     }
 
     if let UpstreamOrderBookStream::BybitFull {
@@ -998,6 +1126,8 @@ async fn run_single_orderbook_connection(
     }
 
     let mut bybit_state: Option<CcxtOrderBook> = None;
+    let mut lighter_state: Option<LighterOrderBookState> = None;
+
     loop {
         tokio::select! {
             changed = shutdown.changed() => {
@@ -1009,26 +1139,42 @@ async fn run_single_orderbook_connection(
             message = stream.next() => {
                 match message {
                     Some(Ok(TungsteniteMessage::Text(text))) => {
-                        if let Some(book) = parse_orderbook_update(
+                        match parse_orderbook_update(
                             &topic.stream,
                             text.as_ref(),
                             &topic.topic.symbol,
                             topic.levels_limit,
                             &mut bybit_state,
+                            &mut lighter_state,
                         ) {
-                            let _ = sender.send(Arc::new(book));
+                            Ok(Some(book)) => {
+                                let _ = sender.send(Arc::new(book));
+                            }
+                            Ok(None) => {}
+                            Err(err) => {
+                                tracing::warn!(topic_key = %topic.key, error = %err, "failed to process orderbook update");
+                                return ConnectionOutcome::Reconnect { reset_backoff: true };
+                            }
                         }
                     }
                     Some(Ok(TungsteniteMessage::Binary(binary))) => {
                         if let Ok(text) = String::from_utf8(binary.to_vec()) {
-                            if let Some(book) = parse_orderbook_update(
+                            match parse_orderbook_update(
                                 &topic.stream,
                                 &text,
                                 &topic.topic.symbol,
                                 topic.levels_limit,
                                 &mut bybit_state,
+                                &mut lighter_state,
                             ) {
-                                let _ = sender.send(Arc::new(book));
+                                Ok(Some(book)) => {
+                                    let _ = sender.send(Arc::new(book));
+                                }
+                                Ok(None) => {}
+                                Err(err) => {
+                                    tracing::warn!(topic_key = %topic.key, error = %err, "failed to process orderbook update");
+                                    return ConnectionOutcome::Reconnect { reset_backoff: true };
+                                }
                             }
                         }
                     }
@@ -1293,21 +1439,30 @@ fn parse_orderbook_update(
     symbol: &str,
     levels_limit: usize,
     bybit_state: &mut Option<CcxtOrderBook>,
-) -> Option<CcxtOrderBook> {
+    lighter_state: &mut Option<LighterOrderBookState>,
+) -> Result<Option<CcxtOrderBook>, String> {
     match stream {
         UpstreamOrderBookStream::Hyperliquid { .. } => {
-            parse_hyperliquid_orderbook_message(payload, symbol, levels_limit)
+            Ok(parse_hyperliquid_orderbook_message(payload, symbol, levels_limit))
         }
         UpstreamOrderBookStream::BinancePartial { .. } => {
-            parse_binance_partial_orderbook(payload, symbol, levels_limit)
+            Ok(parse_binance_partial_orderbook(payload, symbol, levels_limit))
         }
-        UpstreamOrderBookStream::BinanceDiff { .. } => None,
+        UpstreamOrderBookStream::BinanceDiff { .. } => Ok(None),
         UpstreamOrderBookStream::BybitLimited { .. } => {
-            let event = parse_bybit_orderbook_message(payload)?;
+            let Some(event) = parse_bybit_orderbook_message(payload) else {
+                return Ok(None);
+            };
             let updated = apply_bybit_orderbook_event(bybit_state, event, levels_limit, symbol);
-            updated.then(|| bybit_state.clone()).flatten()
+            Ok(updated.then(|| bybit_state.clone()).flatten())
         }
-        UpstreamOrderBookStream::BybitFull { .. } => None,
+        UpstreamOrderBookStream::Lighter { .. } => {
+            let Some(event) = parse_lighter_orderbook_message(payload) else {
+                return Ok(None);
+            };
+            apply_lighter_orderbook_event(lighter_state, event, levels_limit, symbol)
+        }
+        UpstreamOrderBookStream::BybitFull { .. } => Ok(None),
     }
 }
 
@@ -1323,7 +1478,7 @@ fn resolve_hyperliquid_orderbook_topic(
                 topic.symbol
             )
         })?;
-    let levels_limit = resolve_orderbook_levels(&topic.params);
+    let levels_limit = HYPERLIQUID_WS_MAX_ORDERBOOK_LEVELS;
     let n_sig_figs = extract_u64_param(&topic.params, "nSigFigs")
         .or_else(|| extract_u64_param(&topic.params, "n_sig_figs"));
     let mantissa = extract_u64_param(&topic.params, "mantissa");
@@ -1466,6 +1621,45 @@ fn resolve_bybit_orderbook_topic(topic: OrderBookTopic) -> Result<ResolvedOrderB
     })
 }
 
+async fn resolve_lighter_orderbook_topic(
+    topic: OrderBookTopic,
+    lighter_ws_endpoint: &str,
+    lighter_catalog_service: Arc<LighterMarketCatalogService>,
+) -> Result<ResolvedOrderBookTopic, String> {
+    let market = lighter_catalog_service
+        .resolve_market(&topic.symbol, &topic.params)
+        .await
+        .map_err(|err| err.to_string())?;
+    let levels_limit = extract_usize_param(&topic.params, "levels")
+        .or_else(|| extract_usize_param(&topic.params, "depth"))
+        .or_else(|| extract_usize_param(&topic.params, "limit"))
+        .unwrap_or(usize::MAX)
+        .max(1);
+    let levels_key = if levels_limit == usize::MAX {
+        "all".to_string()
+    } else {
+        levels_limit.to_string()
+    };
+
+    Ok(ResolvedOrderBookTopic {
+        key: format!(
+            "lighterxyz|orderbook|market:{}|levels:{}",
+            market.market_id, levels_key
+        ),
+        topic: OrderBookTopic {
+            exchange: topic.exchange,
+            symbol: market.symbol,
+            params: topic.params,
+        },
+        stream: UpstreamOrderBookStream::Lighter {
+            ws_endpoint: lighter_ws_endpoint.to_string(),
+            market_id: market.market_id,
+        },
+        levels_limit,
+        display_levels_limit: levels_limit,
+    })
+}
+
 async fn send_hyperliquid_orderbook_subscription(
     stream: &mut WsStream,
     coin: &str,
@@ -1554,6 +1748,7 @@ fn parse_hyperliquid_levels(levels: &Value, limit: usize, descending: bool) -> V
 
     parsed
 }
+
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BybitOrderBookEventType {
@@ -1720,6 +1915,212 @@ fn bybit_price_eq(left: f64, right: f64) -> bool {
     (left - right).abs() <= 1e-12
 }
 
+#[derive(Debug, Clone)]
+struct LighterOrderBookState {
+    nonce: u64,
+    timestamp: Option<u64>,
+    bids: Vec<(f64, f64)>,
+    asks: Vec<(f64, f64)>,
+}
+
+#[derive(Debug)]
+struct LighterOrderBookEvent {
+    begin_nonce: Option<u64>,
+    nonce: u64,
+    timestamp: Option<u64>,
+    bids: Vec<(f64, f64)>,
+    asks: Vec<(f64, f64)>,
+}
+
+fn parse_lighter_orderbook_message(payload: &str) -> Option<LighterOrderBookEvent> {
+    let Ok(value) = serde_json::from_str::<Value>(payload) else {
+        return None;
+    };
+
+    if value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        != "update/order_book"
+    {
+        return None;
+    }
+
+    let channel = value
+        .get("channel")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !channel.starts_with("order_book:") {
+        return None;
+    }
+
+    let order_book = value.get("order_book")?;
+    let code = order_book
+        .get("code")
+        .and_then(parse_u64_lossy_shared)
+        .unwrap_or_default();
+    if code != 0 {
+        return None;
+    }
+
+    let nonce = order_book.get("nonce").and_then(parse_u64_lossy_shared)?;
+    let begin_nonce = order_book
+        .get("begin_nonce")
+        .and_then(parse_u64_lossy_shared);
+    let bids = parse_lighter_orderbook_side(order_book.get("bids"));
+    let asks = parse_lighter_orderbook_side(order_book.get("asks"));
+    let timestamp = value.get("timestamp").and_then(parse_u64_lossy_shared);
+
+    Some(LighterOrderBookEvent {
+        begin_nonce,
+        nonce,
+        timestamp,
+        bids,
+        asks,
+    })
+}
+
+fn parse_lighter_orderbook_side(value: Option<&Value>) -> Vec<(f64, f64)> {
+    let Some(rows) = value.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    let mut parsed = Vec::with_capacity(rows.len());
+    for row in rows {
+        let Some(price) = row.get("price").and_then(parse_f64_lossy_shared) else {
+            continue;
+        };
+        let Some(size) = row.get("size").and_then(parse_f64_lossy_shared) else {
+            continue;
+        };
+        parsed.push((price, size));
+    }
+
+    parsed
+}
+
+fn apply_lighter_orderbook_event(
+    state: &mut Option<LighterOrderBookState>,
+    event: LighterOrderBookEvent,
+    levels_limit: usize,
+    symbol: &str,
+) -> Result<Option<CcxtOrderBook>, String> {
+    match state {
+        Some(current) => {
+            let begin_nonce = event
+                .begin_nonce
+                .ok_or_else(|| "lighterxyz orderbook delta missing begin_nonce".to_string())?;
+            if begin_nonce != current.nonce {
+                return Err(format!(
+                    "lighterxyz orderbook nonce gap: expected begin_nonce {}, got {}",
+                    current.nonce, begin_nonce
+                ));
+            }
+
+            apply_lighter_level_updates(&mut current.bids, &event.bids, true);
+            apply_lighter_level_updates(&mut current.asks, &event.asks, false);
+            current.nonce = event.nonce;
+            current.timestamp = event.timestamp.or(current.timestamp);
+
+            Ok(Some(lighter_state_to_orderbook(
+                current,
+                symbol,
+                levels_limit,
+            )))
+        }
+        None => {
+            let mut bids = event.bids;
+            let mut asks = event.asks;
+            normalize_lighter_book_side(&mut bids, true, usize::MAX);
+            normalize_lighter_book_side(&mut asks, false, usize::MAX);
+
+            let initial_state = LighterOrderBookState {
+                nonce: event.nonce,
+                timestamp: event.timestamp,
+                bids,
+                asks,
+            };
+            let book = lighter_state_to_orderbook(&initial_state, symbol, levels_limit);
+            *state = Some(initial_state);
+            Ok(Some(book))
+        }
+    }
+}
+
+fn apply_lighter_level_updates(
+    levels: &mut Vec<(f64, f64)>,
+    updates: &[(f64, f64)],
+    descending: bool,
+) {
+    for (price, size) in updates {
+        let existing_index = levels
+            .iter()
+            .position(|(existing_price, _)| lighter_price_eq(*existing_price, *price));
+
+        if *size <= 0.0 {
+            if let Some(index) = existing_index {
+                levels.remove(index);
+            }
+            continue;
+        }
+
+        if let Some(index) = existing_index {
+            levels[index].1 = *size;
+        } else {
+            levels.push((*price, *size));
+        }
+    }
+
+    sort_lighter_book_side(levels, descending);
+}
+
+fn lighter_state_to_orderbook(
+    state: &LighterOrderBookState,
+    symbol: &str,
+    levels_limit: usize,
+) -> CcxtOrderBook {
+    let mut bids = state.bids.clone();
+    let mut asks = state.asks.clone();
+    normalize_lighter_book_side(&mut bids, true, levels_limit);
+    normalize_lighter_book_side(&mut asks, false, levels_limit);
+
+    let timestamp = state.timestamp;
+    let datetime = timestamp.and_then(iso8601_millis);
+
+    CcxtOrderBook {
+        asks,
+        bids,
+        datetime,
+        timestamp,
+        nonce: Some(state.nonce),
+        symbol: Some(symbol.to_string()),
+    }
+}
+
+fn normalize_lighter_book_side(
+    levels: &mut Vec<(f64, f64)>,
+    descending: bool,
+    levels_limit: usize,
+) {
+    levels.retain(|(_, size)| *size > 0.0);
+    sort_lighter_book_side(levels, descending);
+    if levels_limit != usize::MAX && levels.len() > levels_limit {
+        levels.truncate(levels_limit);
+    }
+}
+
+fn sort_lighter_book_side(levels: &mut [(f64, f64)], descending: bool) {
+    if descending {
+        levels.sort_by(|left, right| right.0.total_cmp(&left.0));
+    } else {
+        levels.sort_by(|left, right| left.0.total_cmp(&right.0));
+    }
+}
+
+fn lighter_price_eq(left: f64, right: f64) -> bool {
+    (left - right).abs() <= 1e-12
+}
+
 pub struct OhlcvSubscription {
     pub key: String,
     pub topic: OhlcvTopic,
@@ -1755,15 +2156,16 @@ impl OhlcvTopicManager {
         }
     }
 
-    pub fn resolve_topic_key(&self, topic: OhlcvTopic) -> Result<String, String> {
+    pub async fn resolve_topic_key(&self, topic: OhlcvTopic) -> Result<String, String> {
         self.inner
             .runner
             .resolve(topic)
+            .await
             .map(|resolved| resolved.key)
     }
 
     pub async fn subscribe(&self, topic: OhlcvTopic) -> Result<OhlcvSubscription, String> {
-        let resolved = self.inner.runner.resolve(topic)?;
+        let resolved = self.inner.runner.resolve(topic).await?;
 
         let mut new_topic = None;
         let receiver = {
@@ -1842,7 +2244,7 @@ enum UpstreamOhlcvStream {
 
 #[async_trait]
 trait OhlcvUpstreamRunner: Send + Sync {
-    fn resolve(&self, topic: OhlcvTopic) -> Result<ResolvedOhlcvTopic, String>;
+    async fn resolve(&self, topic: OhlcvTopic) -> Result<ResolvedOhlcvTopic, String>;
 
     async fn run(
         &self,
@@ -1862,7 +2264,7 @@ impl RealOhlcvUpstreamRunner {
 
 #[async_trait]
 impl OhlcvUpstreamRunner for RealOhlcvUpstreamRunner {
-    fn resolve(&self, topic: OhlcvTopic) -> Result<ResolvedOhlcvTopic, String> {
+    async fn resolve(&self, topic: OhlcvTopic) -> Result<ResolvedOhlcvTopic, String> {
         match topic.exchange.as_str() {
             "binance" => resolve_binance_ohlcv_topic(topic),
             "bybit" => resolve_bybit_ohlcv_topic(topic),
@@ -2171,7 +2573,6 @@ fn resolve_bybit_orderbook_levels(params: &Value, category: BybitCategory) -> us
         }
     }
 }
-
 fn resolve_ohlcv_timeframe(params: &Value) -> String {
     let timeframe = extract_non_empty_string(params, "timeframe")
         .or_else(|| extract_non_empty_string(params, "interval"))
@@ -2190,6 +2591,7 @@ fn normalize_ohlcv_timeframe(timeframe: &str) -> String {
 fn extract_u64_param(params: &Value, key: &str) -> Option<u64> {
     params.get(key).and_then(parse_u64_lossy_shared)
 }
+
 
 fn extract_usize_param(params: &Value, key: &str) -> Option<usize> {
     params.get(key).and_then(|value| {
@@ -2274,6 +2676,17 @@ mod tests {
     use super::*;
     use tokio::time::timeout;
 
+    fn lighter_catalog_service() -> Arc<LighterMarketCatalogService> {
+        Arc::new(
+            LighterMarketCatalogService::new(
+                1_000,
+                "https://explorer.elliot.ai/api/markets".to_string(),
+                60_000,
+            )
+            .expect("lighter catalog service should build"),
+        )
+    }
+
     struct MockRunner {
         run_count: Arc<AtomicUsize>,
         stop_count: Arc<AtomicUsize>,
@@ -2281,7 +2694,7 @@ mod tests {
 
     #[async_trait]
     impl TradesUpstreamRunner for MockRunner {
-        fn resolve(&self, topic: TradesTopic) -> Result<ResolvedTradesTopic, String> {
+        async fn resolve(&self, topic: TradesTopic) -> Result<ResolvedTradesTopic, String> {
             let key = format!(
                 "{}|{}",
                 topic.exchange,
@@ -2393,6 +2806,8 @@ mod tests {
         OrderBookTopicManager::new(
             "https://api.hyperliquid.xyz".to_string(),
             Arc::new(MockBinanceSnapshotProvider),
+            "wss://mainnet.zklighter.elliot.ai/stream".to_string(),
+            lighter_catalog_service(),
         )
     }
 
@@ -2433,15 +2848,163 @@ mod tests {
         )
         .expect("topic should be valid");
 
-        let key_a = manager
-            .resolve_topic_key(topic_a)
+        let key_a = tokio::runtime::Runtime::new()
+            .expect("runtime should build")
+            .block_on(manager.resolve_topic_key(topic_a))
             .expect("first key should resolve");
-        let key_b = manager
-            .resolve_topic_key(topic_b)
+        let key_b = tokio::runtime::Runtime::new()
+            .expect("runtime should build")
+            .block_on(manager.resolve_topic_key(topic_b))
             .expect("second key should resolve");
 
         assert_eq!(key_a, key_b);
         assert!(key_a.contains("orderbook"));
+    }
+
+    #[test]
+    fn bybit_perp_orderbook_resolution_uses_requested_depth_tier() {
+        let manager = orderbook_manager();
+
+        let topic_a = TradesTopic::from_client_request(
+            Some("bybit".to_string()),
+            Some("BTC/USDT:USDT".to_string()),
+            json!({"category": "linear", "levels": 50}),
+        )
+        .expect("topic should be valid");
+        let topic_b = TradesTopic::from_client_request(
+            Some("bybit".to_string()),
+            Some("BTCUSDT".to_string()),
+            json!({"category": "linear", "levels": 1000}),
+        )
+        .expect("topic should be valid");
+
+        let key_a = tokio::runtime::Runtime::new()
+            .expect("runtime should build")
+            .block_on(manager.resolve_topic_key(topic_a))
+            .expect("first key should resolve");
+        let key_b = tokio::runtime::Runtime::new()
+            .expect("runtime should build")
+            .block_on(manager.resolve_topic_key(topic_b))
+            .expect("second key should resolve");
+
+        assert_ne!(key_a, key_b);
+        assert!(key_a.contains("depth:50"));
+        assert!(key_b.contains("depth:1000"));
+    }
+
+    #[test]
+    fn bybit_perp_orderbook_resolution_defaults_to_max_depth_tier() {
+        let manager = orderbook_manager();
+
+        let topic = TradesTopic::from_client_request(
+            Some("bybit".to_string()),
+            Some("BTC/USDT:USDT".to_string()),
+            json!({"category": "linear"}),
+        )
+        .expect("topic should be valid");
+
+        let key = tokio::runtime::Runtime::new()
+            .expect("runtime should build")
+            .block_on(manager.resolve_topic_key(topic))
+            .expect("key should resolve");
+
+        assert!(key.contains("depth:50"));
+    }
+
+    #[test]
+    fn lighter_trade_parser_accepts_single_object_payloads() {
+        let trades = parse_lighter_trades_message(
+            &json!({
+                "channel": "trade:0",
+                "trades": {
+                    "trade_id": 14035051,
+                    "price": "3335.65",
+                    "size": "0.1187",
+                    "usd_amount": "13.67",
+                    "is_maker_ask": false,
+                    "timestamp": 1722339648u64
+                },
+                "type": "update/trade"
+            })
+            .to_string(),
+            "ETH/USD",
+        );
+
+        assert_eq!(trades.len(), 1);
+        assert_eq!(trades[0].id.as_deref(), Some("14035051"));
+        assert_eq!(trades[0].side.as_deref(), Some("sell"));
+        assert_eq!(trades[0].timestamp, Some(1_722_339_648_000));
+        assert_eq!(trades[0].symbol.as_deref(), Some("ETH/USD"));
+    }
+
+    #[test]
+    fn lighter_orderbook_applies_deltas_and_rejects_nonce_gaps() {
+        let snapshot = parse_lighter_orderbook_message(
+            &json!({
+                "channel": "order_book:0",
+                "timestamp": 1766434222583u64,
+                "type": "update/order_book",
+                "order_book": {
+                    "code": 0,
+                    "bids": [{"price": "3338.80", "size": "10.2898"}],
+                    "asks": [{"price": "3327.46", "size": "29.0915"}],
+                    "nonce": 100u64,
+                    "begin_nonce": 90u64
+                }
+            })
+            .to_string(),
+        )
+        .expect("snapshot should parse");
+
+        let mut state = None;
+        let initial = apply_lighter_orderbook_event(&mut state, snapshot, 50, "ETH/USD")
+            .expect("snapshot should apply")
+            .expect("snapshot should emit a book");
+        assert_eq!(initial.nonce, Some(100));
+
+        let delta = parse_lighter_orderbook_message(
+            &json!({
+                "channel": "order_book:0",
+                "timestamp": 1766434222600u64,
+                "type": "update/order_book",
+                "order_book": {
+                    "code": 0,
+                    "bids": [{"price": "3338.80", "size": "11.0000"}],
+                    "asks": [{"price": "3327.46", "size": "0"}],
+                    "nonce": 101u64,
+                    "begin_nonce": 100u64
+                }
+            })
+            .to_string(),
+        )
+        .expect("delta should parse");
+
+        let updated = apply_lighter_orderbook_event(&mut state, delta, 50, "ETH/USD")
+            .expect("delta should apply")
+            .expect("delta should emit a book");
+        assert_eq!(updated.nonce, Some(101));
+        assert_eq!(updated.bids.first().map(|row| row.1), Some(11.0));
+        assert!(updated.asks.is_empty());
+
+        let gap = parse_lighter_orderbook_message(
+            &json!({
+                "channel": "order_book:0",
+                "timestamp": 1766434222650u64,
+                "type": "update/order_book",
+                "order_book": {
+                    "code": 0,
+                    "bids": [],
+                    "asks": [],
+                    "nonce": 102u64,
+                    "begin_nonce": 99u64
+                }
+            })
+            .to_string(),
+        )
+        .expect("gap payload should parse");
+
+        let gap_result = apply_lighter_orderbook_event(&mut state, gap, 50, "ETH/USD");
+        assert!(gap_result.is_err());
     }
     #[test]
     fn binance_deep_depth_shares_diff_topic_and_preserves_display_limit() {
@@ -2514,17 +3077,14 @@ mod tests {
         )
         .expect("topic should be valid");
 
-        let resolved_a = manager
-            .inner
-            .runner
-            .resolve(topic_a)
+        let resolved_a = tokio::runtime::Runtime::new()
+            .expect("runtime should build")
+            .block_on(manager.inner.runner.resolve(topic_a))
             .expect("first full topic should resolve");
-        let resolved_b = manager
-            .inner
-            .runner
-            .resolve(topic_b)
+        let resolved_b = tokio::runtime::Runtime::new()
+            .expect("runtime should build")
+            .block_on(manager.inner.runner.resolve(topic_b))
             .expect("second full topic should resolve");
-
         assert_eq!(resolved_a.key, resolved_b.key);
         assert!(resolved_a.key.ends_with("depth:full"));
         assert_eq!(resolved_a.display_levels_limit, 1001);
@@ -2569,11 +3129,13 @@ mod tests {
         )
         .expect("topic should be valid");
 
-        let default_key = manager
-            .resolve_topic_key(default_topic)
+        let default_key = tokio::runtime::Runtime::new()
+            .expect("runtime should build")
+            .block_on(manager.resolve_topic_key(default_topic))
             .expect("default key should resolve");
-        let explicit_key = manager
-            .resolve_topic_key(explicit_topic)
+        let explicit_key = tokio::runtime::Runtime::new()
+            .expect("runtime should build")
+            .block_on(manager.resolve_topic_key(explicit_topic))
             .expect("explicit key should resolve");
 
         assert_eq!(default_key, explicit_key);
@@ -2585,7 +3147,9 @@ mod tests {
             json!({"timeframe": "1m"}),
         )
         .expect("topic should be valid");
-        let unsupported = manager.resolve_topic_key(unsupported_topic);
+        let unsupported = tokio::runtime::Runtime::new()
+            .expect("runtime should build")
+            .block_on(manager.resolve_topic_key(unsupported_topic));
         assert!(unsupported.is_err());
     }
 }

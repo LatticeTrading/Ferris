@@ -19,7 +19,7 @@ use ferris_market_data_backend::binance_orderbook::{
     BinanceDepthSnapshot, BinanceOrderBookSnapshotProvider,
 };
 use ferris_market_data_backend::{
-    exchanges::registry::ExchangeRegistry,
+    exchanges::{lighterxyz::LighterMarketCatalogService, registry::ExchangeRegistry},
     realtime::{OhlcvTopicManager, OrderBookTopicManager, TradesTopicManager},
     web::{self, AppState},
 };
@@ -216,13 +216,28 @@ async fn websocket_fanout_shares_upstream_for_same_topic() {
         .route("/ws", get(upstream_route))
         .with_state(upstream_state);
     let (upstream_bind, upstream_shutdown, upstream_task) = spawn_server(upstream_app).await;
-    let topic_manager = TradesTopicManager::new(format!("http://{upstream_bind}"));
+    let lighter_catalog_service = Arc::new(
+        LighterMarketCatalogService::new(
+            1_000,
+            "https://explorer.elliot.ai/api/markets".to_string(),
+            60_000,
+        )
+        .expect("lighter catalog service should build"),
+    );
+
+    let topic_manager = TradesTopicManager::new(
+        format!("http://{upstream_bind}"),
+        "wss://mainnet.zklighter.elliot.ai/stream".to_string(),
+        lighter_catalog_service.clone(),
+    );
     let app_state = AppState::new(
         Arc::new(ExchangeRegistry::new()),
         topic_manager,
         OrderBookTopicManager::new(
             format!("http://{upstream_bind}"),
             Arc::new(MockBinanceSnapshotProvider),
+            "wss://mainnet.zklighter.elliot.ai/stream".to_string(),
+            lighter_catalog_service,
         ),
         OhlcvTopicManager::new(format!("http://{upstream_bind}")),
     );

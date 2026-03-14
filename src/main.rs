@@ -8,7 +8,10 @@ use axum::{
 use ferris_market_data_backend::{
     config::Config,
     exchanges::{
-        binance::BinanceExchange, bybit::BybitExchange, hyperliquid::HyperliquidExchange,
+        binance::BinanceExchange,
+        bybit::BybitExchange,
+        hyperliquid::HyperliquidExchange,
+        lighterxyz::{LighterExchange, LighterMarketCatalogService},
         registry::ExchangeRegistry,
     },
     realtime::{OhlcvTopicManager, OrderBookTopicManager, TradesTopicManager},
@@ -26,9 +29,19 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::from_env().context("failed to load configuration")?;
 
     let binance_exchange = Arc::new(BinanceExchange::new(config.request_timeout_ms)?);
+    let lighter_catalog_service = Arc::new(LighterMarketCatalogService::new(
+        config.request_timeout_ms,
+        config.lighter_markets_url.clone(),
+        config.lighter_market_catalog_refresh_ms,
+    )?);
     let mut registry = ExchangeRegistry::new();
     registry.register(binance_exchange.clone());
     registry.register(Arc::new(BybitExchange::new(config.request_timeout_ms)?));
+    registry.register(Arc::new(LighterExchange::new(
+        config.lighter_rest_base_url.clone(),
+        config.request_timeout_ms,
+        lighter_catalog_service.clone(),
+    )?));
     registry.register(Arc::new(HyperliquidExchange::new(
         config.hyperliquid_base_url.clone(),
         config.request_timeout_ms,
@@ -37,9 +50,17 @@ async fn main() -> anyhow::Result<()> {
         config.trade_collector_enabled,
     )?));
 
-    let trades_topic_manager = TradesTopicManager::new(config.hyperliquid_base_url.clone());
-    let order_book_topic_manager =
-        OrderBookTopicManager::new(config.hyperliquid_base_url.clone(), binance_exchange);
+    let trades_topic_manager = TradesTopicManager::new(
+        config.hyperliquid_base_url.clone(),
+        config.lighter_ws_url.clone(),
+        lighter_catalog_service.clone(),
+    );
+    let order_book_topic_manager = OrderBookTopicManager::new(
+        config.hyperliquid_base_url.clone(),
+        binance_exchange,
+        config.lighter_ws_url.clone(),
+        lighter_catalog_service.clone(),
+    );
     let ohlcv_topic_manager = OhlcvTopicManager::new(config.hyperliquid_base_url.clone());
     let state = AppState::new(
         Arc::new(registry),
@@ -71,6 +92,10 @@ async fn main() -> anyhow::Result<()> {
         host = %config.host,
         port = config.port,
         hyperliquid_url = %config.hyperliquid_base_url,
+        lighter_rest_url = %config.lighter_rest_base_url,
+        lighter_markets_url = %config.lighter_markets_url,
+        lighter_ws_url = %config.lighter_ws_url,
+        lighter_market_catalog_refresh_ms = config.lighter_market_catalog_refresh_ms,
         trade_cache_capacity = config.trade_cache_capacity_per_coin,
         trade_cache_retention_ms = config.trade_cache_retention_ms,
         trade_collector_enabled = config.trade_collector_enabled,

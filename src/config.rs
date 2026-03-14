@@ -5,6 +5,10 @@ pub struct Config {
     pub host: String,
     pub port: u16,
     pub hyperliquid_base_url: String,
+    pub lighter_rest_base_url: String,
+    pub lighter_markets_url: String,
+    pub lighter_ws_url: String,
+    pub lighter_market_catalog_refresh_ms: u64,
     pub request_timeout_ms: u64,
     pub trade_cache_capacity_per_coin: usize,
     pub trade_cache_retention_ms: u64,
@@ -31,6 +35,34 @@ impl Config {
             .trim()
             .trim_end_matches('/')
             .to_string();
+
+        let lighter_rest_base_url = std::env::var("LIGHTER_REST_BASE_URL")
+            .unwrap_or_else(|_| {
+                crate::exchanges::lighterxyz::DEFAULT_LIGHTER_REST_BASE_URL.to_string()
+            })
+            .trim()
+            .trim_end_matches('/')
+            .to_string();
+
+        let lighter_markets_url = std::env::var("LIGHTER_MARKETS_URL")
+            .unwrap_or_else(|_| {
+                crate::exchanges::lighterxyz::DEFAULT_LIGHTER_MARKETS_URL.to_string()
+            })
+            .trim()
+            .to_string();
+
+        let lighter_ws_url = std::env::var("LIGHTER_WS_URL")
+            .unwrap_or_else(|_| crate::exchanges::lighterxyz::DEFAULT_LIGHTER_WS_URL.to_string())
+            .trim()
+            .to_string();
+
+        let lighter_market_catalog_refresh_ms =
+            match std::env::var("LIGHTER_MARKET_CATALOG_REFRESH_MS") {
+                Ok(value) => value.trim().parse::<u64>().with_context(|| {
+                    format!("invalid LIGHTER_MARKET_CATALOG_REFRESH_MS value: {value}")
+                })?,
+                Err(_) => crate::exchanges::lighterxyz::DEFAULT_LIGHTER_MARKET_CATALOG_REFRESH_MS,
+            };
 
         let request_timeout_ms = match std::env::var("REQUEST_TIMEOUT_MS") {
             Ok(value) => value
@@ -66,6 +98,10 @@ impl Config {
             host,
             port,
             hyperliquid_base_url,
+            lighter_rest_base_url,
+            lighter_markets_url,
+            lighter_ws_url,
+            lighter_market_catalog_refresh_ms,
             request_timeout_ms,
             trade_cache_capacity_per_coin,
             trade_cache_retention_ms,
