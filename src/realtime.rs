@@ -56,7 +56,6 @@ const BYBIT_WS_MAX_OPTION_ORDERBOOK_LEVELS: usize = 100;
 const HYPERLIQUID_WS_MAX_ORDERBOOK_LEVELS: usize = 20;
 const DEFAULT_ORDERBOOK_LEVELS: usize = 20;
 
-
 type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -1442,12 +1441,16 @@ fn parse_orderbook_update(
     lighter_state: &mut Option<LighterOrderBookState>,
 ) -> Result<Option<CcxtOrderBook>, String> {
     match stream {
-        UpstreamOrderBookStream::Hyperliquid { .. } => {
-            Ok(parse_hyperliquid_orderbook_message(payload, symbol, levels_limit))
-        }
-        UpstreamOrderBookStream::BinancePartial { .. } => {
-            Ok(parse_binance_partial_orderbook(payload, symbol, levels_limit))
-        }
+        UpstreamOrderBookStream::Hyperliquid { .. } => Ok(parse_hyperliquid_orderbook_message(
+            payload,
+            symbol,
+            levels_limit,
+        )),
+        UpstreamOrderBookStream::BinancePartial { .. } => Ok(parse_binance_partial_orderbook(
+            payload,
+            symbol,
+            levels_limit,
+        )),
         UpstreamOrderBookStream::BinanceDiff { .. } => Ok(None),
         UpstreamOrderBookStream::BybitLimited { .. } => {
             let Some(event) = parse_bybit_orderbook_message(payload) else {
@@ -1748,7 +1751,6 @@ fn parse_hyperliquid_levels(levels: &Value, limit: usize, descending: bool) -> V
 
     parsed
 }
-
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BybitOrderBookEventType {
@@ -2591,7 +2593,6 @@ fn normalize_ohlcv_timeframe(timeframe: &str) -> String {
 fn extract_u64_param(params: &Value, key: &str) -> Option<u64> {
     params.get(key).and_then(parse_u64_lossy_shared)
 }
-
 
 fn extract_usize_param(params: &Value, key: &str) -> Option<usize> {
     params.get(key).and_then(|value| {
