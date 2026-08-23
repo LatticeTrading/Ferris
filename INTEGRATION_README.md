@@ -185,17 +185,20 @@ Exchange-specific useful params:
 
 - Hyperliquid:
   - `params.coin` optional (otherwise inferred from `symbol`)
-- Binance:
+- Binance USDⓈ-M futures only:
   - `params.coin` optional shortcut (example `"BTC"` -> `BTCUSDT`)
+  - order-book `levels`, `depth`, and `limit` values are clamped to `1..=1000`
+  - values up to 20 use partial streams; values 21..=1000 share one futures diff stream synchronized with a REST `limit=1000` snapshot
+  - deep updates are full CCXT-like snapshots limited to the requested top N and carry the latest Binance `u` in non-null `nonce`
 - Bybit:
   - `params.coin` optional shortcut
   - `params.category` optional, default `linear`
   - valid `category`: `spot`, `linear`, `inverse`, `option`
 
 Channel-specific params:
-
 - Order book:
-  - `params.levels` (or `depth`) optional; backend clamps/maps per exchange
+  - `params.levels`, `depth`, or `limit` optional; backend clamps/maps per exchange
+  - Binance supports USDⓈ-M futures maximum 1,000 levels; Spot, Coin-M, and 5,000-level paths are unsupported
 - OHLCV:
   - `params.timeframe` optional; default `1m`
   - Hyperliquid realtime OHLCV is currently unsupported

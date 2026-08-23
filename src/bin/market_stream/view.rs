@@ -119,7 +119,7 @@ pub(crate) struct TradeRow {
     pub(crate) cost: Option<f64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct OrderBookSnapshot {
     pub(crate) asks: Vec<(f64, f64)>,

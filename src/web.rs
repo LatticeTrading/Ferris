@@ -725,6 +725,7 @@ async fn handle_stream_command(
                     let topic = subscription.topic.clone();
                     let forward_task = spawn_orderbook_topic_forwarder(
                         topic.clone(),
+                        subscription.levels_limit,
                         subscription.receiver,
                         outgoing_sender.clone(),
                         close_signal.clone(),
@@ -887,6 +888,7 @@ fn spawn_trades_topic_forwarder(
 
 fn spawn_orderbook_topic_forwarder(
     topic: OrderBookTopic,
+    levels_limit: usize,
     mut receiver: broadcast::Receiver<Arc<CcxtOrderBook>>,
     outgoing_sender: Sender<Message>,
     close_signal: Arc<Notify>,
@@ -895,12 +897,15 @@ fn spawn_orderbook_topic_forwarder(
         loop {
             match receiver.recv().await {
                 Ok(orderbook) => {
+                    let mut orderbook = orderbook.as_ref().clone();
+                    orderbook.bids.truncate(levels_limit);
+                    orderbook.asks.truncate(levels_limit);
                     if !send_ws_json(
                         &outgoing_sender,
                         &WsOrderBookUpdate {
                             message_type: "orderbook",
                             topic: &topic,
-                            data: orderbook.as_ref(),
+                            data: &orderbook,
                         },
                     ) {
                         close_signal.notify_one();
@@ -1115,6 +1120,51 @@ mod tests {
         let _ = timeout(Duration::from_secs(1), forwarder)
             .await
             .expect("forwarder task should complete");
+    }
+    #[tokio::test]
+    async fn orderbook_forwarder_truncates_shared_book_per_subscriber() {
+        let topic = TradesTopic::from_client_request(
+            Some("binance".to_string()),
+            Some("BTC/USDT:USDT".to_string()),
+            json!({"levels": 21}),
+        )
+        .expect("topic should be valid");
+        let source = Arc::new(CcxtOrderBook {
+            asks: (1..=30).map(|level| (100.0 + level as f64, 1.0)).collect(),
+            bids: (1..=30)
+                .rev()
+                .map(|level| (100.0 - level as f64, 2.0))
+                .collect(),
+            datetime: Some("2026-01-01T00:00:00.000Z".to_string()),
+            timestamp: Some(1_700_000_000_000),
+            nonce: Some(123),
+            symbol: Some("BTC/USDT:USDT".to_string()),
+        });
+        let (broadcast_sender, receiver) = broadcast::channel::<Arc<CcxtOrderBook>>(8);
+        let (outgoing_sender, mut outgoing_receiver) = channel::<Message>(8);
+        let close_signal = Arc::new(Notify::new());
+        let forwarder =
+            spawn_orderbook_topic_forwarder(topic, 21, receiver, outgoing_sender, close_signal);
+        broadcast_sender
+            .send(source.clone())
+            .expect("broadcast should succeed");
+        let Message::Text(payload) = timeout(Duration::from_secs(1), outgoing_receiver.recv())
+            .await
+            .expect("forwarder should send")
+            .expect("outgoing message should exist")
+        else {
+            panic!("expected text message");
+        };
+        let value: Value = serde_json::from_str(&payload).expect("forwarded JSON should parse");
+        assert_eq!(value["type"], "orderbook");
+        assert_eq!(value["topic"]["exchange"], "binance");
+        assert_eq!(value["data"]["bids"].as_array().unwrap().len(), 21);
+        assert_eq!(value["data"]["asks"].as_array().unwrap().len(), 21);
+        assert_eq!(value["data"]["nonce"], 123);
+        assert_eq!(value["data"]["symbol"], "BTC/USDT:USDT");
+        assert_eq!(source.bids.len(), 30);
+        assert_eq!(source.asks.len(), 30);
+        forwarder.abort();
     }
 
     #[test]

@@ -15,6 +15,10 @@ use chrono::{SecondsFormat, Utc};
 use serde_json::Value;
 
 use crate::{
+    binance_orderbook::{
+        BinanceDepthLevel, BinanceDepthSnapshot, BinanceOrderBookSnapshotProvider,
+        BINANCE_MAX_ORDERBOOK_LEVELS,
+    },
     exchanges::traits::{ExchangeError, MarketDataExchange},
     models::{
         CcxtOhlcv, CcxtOrderBook, CcxtTrade, FetchMarketsParams, FetchOhlcvParams,
@@ -28,7 +32,6 @@ const MAX_FETCH_TRADES_LIMIT: usize = 1_000;
 const DEFAULT_FETCH_OHLCV_LIMIT: usize = 200;
 const MAX_FETCH_OHLCV_LIMIT: usize = 1_000;
 const DEFAULT_FETCH_ORDER_BOOK_LEVELS: usize = 100;
-const MAX_FETCH_ORDER_BOOK_LEVELS: usize = 1_000;
 
 type BinanceRestApiClient = binance_sdk::derivatives_trading_usds_futures::rest_api::RestApi;
 
@@ -181,37 +184,19 @@ impl MarketDataExchange for BinanceExchange {
         let requested_levels = params
             .limit
             .unwrap_or(DEFAULT_FETCH_ORDER_BOOK_LEVELS)
-            .clamp(1, MAX_FETCH_ORDER_BOOK_LEVELS);
+            .clamp(1, BINANCE_MAX_ORDERBOOK_LEVELS);
         let upstream_levels = to_binance_depth_limit(requested_levels);
-
-        let request = OrderBookParams::builder(market_symbol)
-            .limit(upstream_levels as i64)
-            .build()
-            .map_err(|err| {
-                ExchangeError::Internal(format!(
-                    "failed to build Binance order book request: {err}"
-                ))
-            })?;
-
-        let response = self
-            .client
-            .order_book(request)
-            .await
-            .map_err(map_anyhow_error)?;
-        let raw = response.data().await.map_err(map_connector_error)?;
+        let raw = self
+            .fetch_order_book_response(&market_symbol, upstream_levels)
+            .await?;
 
         let mut bids = map_order_book_levels(raw.bids.as_ref(), "bids")?;
         let mut asks = map_order_book_levels(raw.asks.as_ref(), "asks")?;
 
         bids.sort_by(|left, right| right.0.total_cmp(&left.0));
         asks.sort_by(|left, right| left.0.total_cmp(&right.0));
-
-        if bids.len() > requested_levels {
-            bids.truncate(requested_levels);
-        }
-        if asks.len() > requested_levels {
-            asks.truncate(requested_levels);
-        }
+        bids.truncate(requested_levels);
+        asks.truncate(requested_levels);
 
         let timestamp = raw
             .t_uppercase
@@ -256,6 +241,89 @@ impl MarketDataExchange for BinanceExchange {
 
         Ok(markets)
     }
+}
+
+impl BinanceExchange {
+    async fn fetch_order_book_response(
+        &self,
+        market_symbol: &str,
+        upstream_levels: usize,
+    ) -> Result<
+        binance_sdk::derivatives_trading_usds_futures::rest_api::OrderBookResponse,
+        ExchangeError,
+    > {
+        let request = OrderBookParams::builder(market_symbol.to_string())
+            .limit(upstream_levels as i64)
+            .build()
+            .map_err(|err| {
+                ExchangeError::Internal(format!(
+                    "failed to build Binance order book request: {err}"
+                ))
+            })?;
+
+        let response = self
+            .client
+            .order_book(request)
+            .await
+            .map_err(map_anyhow_error)?;
+        response.data().await.map_err(map_connector_error)
+    }
+}
+
+#[async_trait]
+impl BinanceOrderBookSnapshotProvider for BinanceExchange {
+    async fn fetch_binance_order_book_snapshot(
+        &self,
+        market_symbol: &str,
+    ) -> Result<BinanceDepthSnapshot, String> {
+        let market_symbol =
+            normalize_market_symbol(market_symbol).map_err(|err| err.to_string())?;
+        let raw = self
+            .fetch_order_book_response(&market_symbol, BINANCE_MAX_ORDERBOOK_LEVELS)
+            .await
+            .map_err(|err| err.to_string())?;
+        let last_update_id = raw
+            .last_update_id
+            .and_then(|value| (value >= 0).then_some(value as u64))
+            .ok_or_else(|| {
+                "Binance order book snapshot missing nonnegative lastUpdateId".to_string()
+            })?;
+        let timestamp = raw
+            .t_uppercase
+            .or(raw.e_uppercase)
+            .and_then(|value| (value >= 0).then_some(value as u64));
+        let bids = map_exact_order_book_levels(raw.bids.as_ref(), "bids")
+            .map_err(|err| err.to_string())?;
+        let asks = map_exact_order_book_levels(raw.asks.as_ref(), "asks")
+            .map_err(|err| err.to_string())?;
+
+        Ok(BinanceDepthSnapshot {
+            last_update_id,
+            bids,
+            asks,
+            timestamp,
+        })
+    }
+}
+
+fn map_exact_order_book_levels(
+    levels: Option<&Vec<Vec<String>>>,
+    side: &str,
+) -> Result<Vec<BinanceDepthLevel>, ExchangeError> {
+    let Some(levels) = levels else {
+        return Ok(Vec::new());
+    };
+    levels
+        .iter()
+        .map(|level| {
+            if level.len() < 2 {
+                return Err(ExchangeError::UpstreamData(format!(
+                    "Binance {side} level must contain price and quantity"
+                )));
+            }
+            BinanceDepthLevel::parse(&level[0], &level[1]).map_err(ExchangeError::UpstreamData)
+        })
+        .collect()
 }
 
 fn parse_kline_interval(timeframe: &str) -> Option<KlineCandlestickDataIntervalEnum> {

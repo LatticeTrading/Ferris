@@ -12,6 +12,16 @@ use tokio::{
 use tokio_tungstenite::{connect_async, tungstenite::Message as TungsteniteMessage};
 
 use crate::{
+    binance_orderbook::{
+        parse_binance_depth_event, parse_binance_partial_orderbook,
+        resolve_binance_orderbook_stream, BinanceEventOutcome, BinanceOrderBookSnapshotProvider,
+        BinanceOrderBookStreamKind, BinanceOrderBookSync, BinanceSnapshotOutcome,
+        BINANCE_FUTURES_WS_BASE_URL, BINANCE_MAX_ORDERBOOK_LEVELS,
+    },
+    bybit_full_orderbook::{
+        fetch_bybit_full_snapshot, parse_bybit_full_delta, BufferDeltaOutcome, BybitFullBookSync,
+        SnapshotSyncOutcome, BYBIT_FULL_DEPTH_THRESHOLD, BYBIT_MAX_FULL_DEPTH, BYBIT_REST_BASE_URL,
+    },
     models::{CcxtOhlcv, CcxtOrderBook, CcxtTrade},
     ws_shared::{
         infer_hyperliquid_coin_from_symbol as infer_hyperliquid_coin_from_symbol_shared,
@@ -27,7 +37,6 @@ use crate::{
 };
 
 const DEFAULT_EXCHANGE: &str = "hyperliquid";
-const BINANCE_FUTURES_WS_BASE_URL: &str = "wss://fstream.binance.com/ws";
 const BYBIT_WS_SPOT_URL: &str = "wss://stream.bybit.com/v5/public/spot";
 const BYBIT_WS_LINEAR_URL: &str = "wss://stream.bybit.com/v5/public/linear";
 const BYBIT_WS_INVERSE_URL: &str = "wss://stream.bybit.com/v5/public/inverse";
@@ -665,6 +674,7 @@ pub type OhlcvTopic = TradesTopic;
 pub struct OrderBookSubscription {
     pub key: String,
     pub topic: OrderBookTopic,
+    pub levels_limit: usize,
     pub receiver: broadcast::Receiver<Arc<CcxtOrderBook>>,
 }
 
@@ -678,7 +688,6 @@ struct OrderBookTopicManagerInner {
     runner: Arc<dyn OrderBookUpstreamRunner>,
     broadcast_capacity: usize,
 }
-
 struct ActiveOrderBookTopic {
     sender: broadcast::Sender<Arc<CcxtOrderBook>>,
     subscribers: usize,
@@ -686,8 +695,14 @@ struct ActiveOrderBookTopic {
 }
 
 impl OrderBookTopicManager {
-    pub fn new(hyperliquid_base_url: String) -> Self {
-        let runner = Arc::new(RealOrderBookUpstreamRunner::new(hyperliquid_base_url));
+    pub fn new(
+        hyperliquid_base_url: String,
+        binance_snapshot_provider: Arc<dyn BinanceOrderBookSnapshotProvider>,
+    ) -> Self {
+        let runner = Arc::new(RealOrderBookUpstreamRunner::new(
+            hyperliquid_base_url,
+            binance_snapshot_provider,
+        ));
         Self {
             inner: Arc::new(OrderBookTopicManagerInner {
                 topics: RwLock::new(HashMap::new()),
@@ -741,6 +756,7 @@ impl OrderBookTopicManager {
         Ok(OrderBookSubscription {
             key: resolved.key,
             topic: resolved.topic,
+            levels_limit: resolved.display_levels_limit,
             receiver,
         })
     }
@@ -770,6 +786,7 @@ struct ResolvedOrderBookTopic {
     topic: OrderBookTopic,
     stream: UpstreamOrderBookStream,
     levels_limit: usize,
+    display_levels_limit: usize,
 }
 
 #[derive(Clone)]
@@ -780,12 +797,22 @@ enum UpstreamOrderBookStream {
         n_sig_figs: Option<u64>,
         mantissa: Option<u64>,
     },
-    Binance {
+    BinancePartial {
         ws_endpoint: String,
     },
-    Bybit {
+    BinanceDiff {
+        ws_endpoint: String,
+        market_symbol: String,
+    },
+    BybitLimited {
         ws_endpoint: String,
         subscribe_topic: String,
+    },
+    BybitFull {
+        ws_endpoint: String,
+        subscribe_topic: String,
+        category: String,
+        market_symbol: String,
     },
 }
 
@@ -803,12 +830,19 @@ trait OrderBookUpstreamRunner: Send + Sync {
 
 struct RealOrderBookUpstreamRunner {
     hyperliquid_ws_endpoint: String,
+    bybit_http_client: reqwest::Client,
+    binance_snapshot_provider: Arc<dyn BinanceOrderBookSnapshotProvider>,
 }
 
 impl RealOrderBookUpstreamRunner {
-    fn new(hyperliquid_base_url: String) -> Self {
+    fn new(
+        hyperliquid_base_url: String,
+        binance_snapshot_provider: Arc<dyn BinanceOrderBookSnapshotProvider>,
+    ) -> Self {
         Self {
             hyperliquid_ws_endpoint: to_hyperliquid_ws_url(&hyperliquid_base_url),
+            bybit_http_client: reqwest::Client::new(),
+            binance_snapshot_provider,
         }
     }
 }
@@ -840,9 +874,14 @@ impl OrderBookUpstreamRunner for RealOrderBookUpstreamRunner {
             if *shutdown.borrow() {
                 return;
             }
-
-            let connection_outcome =
-                run_single_orderbook_connection(&topic, &sender, &mut shutdown).await;
+            let connection_outcome = run_single_orderbook_connection(
+                &topic,
+                &sender,
+                &mut shutdown,
+                &self.bybit_http_client,
+                self.binance_snapshot_provider.clone(),
+            )
+            .await;
 
             match connection_outcome {
                 ConnectionOutcome::Stop => return,
@@ -871,13 +910,16 @@ async fn run_single_orderbook_connection(
     topic: &ResolvedOrderBookTopic,
     sender: &broadcast::Sender<Arc<CcxtOrderBook>>,
     shutdown: &mut watch::Receiver<bool>,
+    bybit_http_client: &reqwest::Client,
+    binance_snapshot_provider: Arc<dyn BinanceOrderBookSnapshotProvider>,
 ) -> ConnectionOutcome {
     let ws_endpoint = match &topic.stream {
         UpstreamOrderBookStream::Hyperliquid { ws_endpoint, .. }
-        | UpstreamOrderBookStream::Binance { ws_endpoint }
-        | UpstreamOrderBookStream::Bybit { ws_endpoint, .. } => ws_endpoint.as_str(),
+        | UpstreamOrderBookStream::BinancePartial { ws_endpoint }
+        | UpstreamOrderBookStream::BinanceDiff { ws_endpoint, .. }
+        | UpstreamOrderBookStream::BybitLimited { ws_endpoint, .. }
+        | UpstreamOrderBookStream::BybitFull { ws_endpoint, .. } => ws_endpoint.as_str(),
     };
-
     let Ok((mut stream, _response)) = connect_async(ws_endpoint).await else {
         tracing::warn!(
             topic_key = %topic.key,
@@ -908,7 +950,10 @@ async fn run_single_orderbook_connection(
                 };
             }
         }
-        UpstreamOrderBookStream::Bybit {
+        UpstreamOrderBookStream::BybitLimited {
+            subscribe_topic, ..
+        }
+        | UpstreamOrderBookStream::BybitFull {
             subscribe_topic, ..
         } => {
             if let Err(err) =
@@ -920,7 +965,36 @@ async fn run_single_orderbook_connection(
                 };
             }
         }
-        UpstreamOrderBookStream::Binance { .. } => {}
+        UpstreamOrderBookStream::BinancePartial { .. } => {}
+        UpstreamOrderBookStream::BinanceDiff { market_symbol, .. } => {
+            return run_binance_diff_orderbook_connection(
+                stream,
+                topic,
+                sender,
+                shutdown,
+                binance_snapshot_provider,
+                market_symbol,
+            )
+            .await;
+        }
+    }
+
+    if let UpstreamOrderBookStream::BybitFull {
+        category,
+        market_symbol,
+        ..
+    } = &topic.stream
+    {
+        return run_bybit_full_orderbook_connection(
+            stream,
+            topic,
+            sender,
+            shutdown,
+            bybit_http_client,
+            category,
+            market_symbol,
+        )
+        .await;
     }
 
     let mut bybit_state: Option<CcxtOrderBook> = None;
@@ -980,6 +1054,239 @@ async fn run_single_orderbook_connection(
     }
 }
 
+async fn run_binance_diff_orderbook_connection(
+    mut stream: WsStream,
+    topic: &ResolvedOrderBookTopic,
+    sender: &broadcast::Sender<Arc<CcxtOrderBook>>,
+    shutdown: &mut watch::Receiver<bool>,
+    snapshot_provider: Arc<dyn BinanceOrderBookSnapshotProvider>,
+    market_symbol: &str,
+) -> ConnectionOutcome {
+    use std::{future::Future, pin::Pin};
+
+    type SnapshotFuture = Pin<
+        Box<
+            dyn Future<Output = Result<crate::binance_orderbook::BinanceDepthSnapshot, String>>
+                + Send,
+        >,
+    >;
+
+    let mut sync = BinanceOrderBookSync::new();
+    let mut snapshot_request: Option<SnapshotFuture> = Some({
+        let provider = snapshot_provider.clone();
+        let market_symbol = market_symbol.to_string();
+        Box::pin(async move {
+            provider
+                .fetch_binance_order_book_snapshot(&market_symbol)
+                .await
+        })
+    });
+
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_ok() && *shutdown.borrow() {
+                    let _ = stream.close(None).await;
+                    return ConnectionOutcome::Stop;
+                }
+            }
+            snapshot = async {
+                match snapshot_request.as_mut() {
+                    Some(request) => Some(request.await),
+                    None => std::future::pending::<Option<Result<crate::binance_orderbook::BinanceDepthSnapshot, String>>>().await,
+                }
+            } => {
+                snapshot_request = None;
+                let Some(result) = snapshot else { continue; };
+                match result {
+                    Ok(snapshot) => match sync.apply_snapshot(snapshot) {
+                        BinanceSnapshotOutcome::Synchronized => {
+                            if let Some(book) = sync.to_ccxt(&topic.topic.symbol, topic.levels_limit) {
+                                let _ = sender.send(Arc::new(book));
+                            }
+                        }
+                        BinanceSnapshotOutcome::NeedMoreEvents => {}
+                        BinanceSnapshotOutcome::RefetchSnapshot => {
+                            let provider = snapshot_provider.clone();
+                            let market_symbol = market_symbol.to_string();
+                            snapshot_request = Some(Box::pin(async move {
+                                provider
+                                    .fetch_binance_order_book_snapshot(&market_symbol)
+                                    .await
+                            }));
+                        }
+                    },
+                    Err(err) => {
+                        tracing::warn!(topic_key = %topic.key, error = %err, "failed to fetch Binance orderbook snapshot");
+                        return ConnectionOutcome::Reconnect { reset_backoff: false };
+                    }
+                }
+            }
+            message = stream.next() => {
+                let payload = match message {
+                    Some(Ok(TungsteniteMessage::Text(text))) => Some(text.to_string()),
+                    Some(Ok(TungsteniteMessage::Binary(binary))) => String::from_utf8(binary.to_vec()).ok(),
+                    Some(Ok(TungsteniteMessage::Ping(payload))) => {
+                        if stream.send(TungsteniteMessage::Pong(payload)).await.is_err() {
+                            return ConnectionOutcome::Reconnect { reset_backoff: true };
+                        }
+                        None
+                    }
+                    Some(Ok(TungsteniteMessage::Close(_))) | None => {
+                        return ConnectionOutcome::Reconnect { reset_backoff: true };
+                    }
+                    Some(Err(err)) => {
+                        tracing::warn!(topic_key = %topic.key, error = %err, "upstream Binance orderbook websocket error");
+                        return ConnectionOutcome::Reconnect { reset_backoff: true };
+                    }
+                    _ => None,
+                };
+                let Some(payload) = payload else { continue; };
+                let event = match parse_binance_depth_event(&payload) {
+                    Ok(Some(event)) => event,
+                    Ok(None) => continue,
+                    Err(err) => {
+                        tracing::warn!(topic_key = %topic.key, error = %err, "invalid Binance depth event");
+                        return ConnectionOutcome::Reconnect { reset_backoff: true };
+                    }
+                };
+                match sync.push_event(event) {
+                    BinanceEventOutcome::Updated => {
+                        if let Some(book) = sync.to_ccxt(&topic.topic.symbol, topic.levels_limit) {
+                            let _ = sender.send(Arc::new(book));
+                        }
+                    }
+                    BinanceEventOutcome::Buffered => {
+                        match sync.try_pending_snapshot() {
+                            BinanceSnapshotOutcome::Synchronized => {
+                                if let Some(book) = sync.to_ccxt(&topic.topic.symbol, topic.levels_limit) {
+                                    let _ = sender.send(Arc::new(book));
+                                }
+                            }
+                            BinanceSnapshotOutcome::RefetchSnapshot if snapshot_request.is_none() => {
+                                let provider = snapshot_provider.clone();
+                                let market_symbol = market_symbol.to_string();
+                                snapshot_request = Some(Box::pin(async move {
+                                    provider
+                                        .fetch_binance_order_book_snapshot(&market_symbol)
+                                        .await
+                                }));
+                            }
+                            BinanceSnapshotOutcome::NeedMoreEvents
+                            | BinanceSnapshotOutcome::RefetchSnapshot => {}
+                        }
+                    }
+                    BinanceEventOutcome::NeedsSnapshot if snapshot_request.is_none() => {
+                        let provider = snapshot_provider.clone();
+                        let market_symbol = market_symbol.to_string();
+                        snapshot_request = Some(Box::pin(async move {
+                            provider
+                                .fetch_binance_order_book_snapshot(&market_symbol)
+                                .await
+                        }));
+                    }
+                    BinanceEventOutcome::NeedsSnapshot | BinanceEventOutcome::Ignored => {}
+                }
+            }
+        }
+    }
+}
+
+async fn run_bybit_full_orderbook_connection(
+    mut stream: WsStream,
+    topic: &ResolvedOrderBookTopic,
+    sender: &broadcast::Sender<Arc<CcxtOrderBook>>,
+    shutdown: &mut watch::Receiver<bool>,
+    http_client: &reqwest::Client,
+    category: &str,
+    market_symbol: &str,
+) -> ConnectionOutcome {
+    let mut sync = BybitFullBookSync::new();
+
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_ok() && *shutdown.borrow() {
+                    let _ = stream.close(None).await;
+                    return ConnectionOutcome::Stop;
+                }
+            }
+            message = stream.next() => {
+                let payload = match message {
+                    Some(Ok(TungsteniteMessage::Text(text))) => Some(text.to_string()),
+                    Some(Ok(TungsteniteMessage::Binary(binary))) => String::from_utf8(binary.to_vec()).ok(),
+                    Some(Ok(TungsteniteMessage::Ping(payload))) => {
+                        if stream.send(TungsteniteMessage::Pong(payload)).await.is_err() {
+                            return ConnectionOutcome::Reconnect { reset_backoff: true };
+                        }
+                        None
+                    }
+                    Some(Ok(TungsteniteMessage::Close(_))) | None => {
+                        return ConnectionOutcome::Reconnect { reset_backoff: true };
+                    }
+                    Some(Err(err)) => {
+                        tracing::warn!(topic_key = %topic.key, error = %err, "upstream Bybit full orderbook websocket error");
+                        return ConnectionOutcome::Reconnect { reset_backoff: true };
+                    }
+                    _ => None,
+                };
+
+                let Some(payload) = payload else {
+                    continue;
+                };
+                let delta = match parse_bybit_full_delta(&payload) {
+                    Ok(Some(delta)) => delta,
+                    Ok(None) => continue,
+                    Err(err) => {
+                        tracing::warn!(topic_key = %topic.key, error = %err, "invalid Bybit full orderbook delta");
+                        return ConnectionOutcome::Reconnect { reset_backoff: true };
+                    }
+                };
+
+                match sync.push_delta(delta) {
+                    BufferDeltaOutcome::Restart => {
+                        tracing::warn!(topic_key = %topic.key, "Bybit full orderbook update sequence requires resync");
+                        return ConnectionOutcome::Reconnect { reset_backoff: true };
+                    }
+                    BufferDeltaOutcome::Updated => {
+                        if let Some(book) = sync.to_ccxt(&topic.topic.symbol, topic.levels_limit) {
+                            let _ = sender.send(Arc::new(book));
+                        }
+                    }
+                    BufferDeltaOutcome::Ignored => {}
+                    BufferDeltaOutcome::Buffered => {
+                        let mut sync_outcome = sync.try_pending_snapshot();
+                        while matches!(sync_outcome, SnapshotSyncOutcome::RefetchSnapshot)
+                            || sync.needs_snapshot()
+                        {
+                            let snapshot = match fetch_bybit_full_snapshot(
+                                http_client,
+                                BYBIT_REST_BASE_URL,
+                                category,
+                                market_symbol,
+                            )
+                            .await
+                            {
+                                Ok(snapshot) => snapshot,
+                                Err(err) => {
+                                    tracing::warn!(topic_key = %topic.key, error = %err, "failed to fetch Bybit full orderbook snapshot");
+                                    return ConnectionOutcome::Reconnect { reset_backoff: false };
+                                }
+                            };
+                            sync_outcome = sync.apply_snapshot(snapshot);
+                        }
+
+                        if matches!(sync_outcome, SnapshotSyncOutcome::Synchronized) {
+                            if let Some(book) = sync.to_ccxt(&topic.topic.symbol, topic.levels_limit) {
+                                let _ = sender.send(Arc::new(book));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
 fn parse_orderbook_update(
     stream: &UpstreamOrderBookStream,
     payload: &str,
@@ -991,14 +1298,16 @@ fn parse_orderbook_update(
         UpstreamOrderBookStream::Hyperliquid { .. } => {
             parse_hyperliquid_orderbook_message(payload, symbol, levels_limit)
         }
-        UpstreamOrderBookStream::Binance { .. } => {
-            parse_binance_orderbook_message(payload, symbol, levels_limit)
+        UpstreamOrderBookStream::BinancePartial { .. } => {
+            parse_binance_partial_orderbook(payload, symbol, levels_limit)
         }
-        UpstreamOrderBookStream::Bybit { .. } => {
+        UpstreamOrderBookStream::BinanceDiff { .. } => None,
+        UpstreamOrderBookStream::BybitLimited { .. } => {
             let event = parse_bybit_orderbook_message(payload)?;
             let updated = apply_bybit_orderbook_event(bybit_state, event, levels_limit, symbol);
             updated.then(|| bybit_state.clone()).flatten()
         }
+        UpstreamOrderBookStream::BybitFull { .. } => None,
     }
 }
 
@@ -1018,7 +1327,6 @@ fn resolve_hyperliquid_orderbook_topic(
     let n_sig_figs = extract_u64_param(&topic.params, "nSigFigs")
         .or_else(|| extract_u64_param(&topic.params, "n_sig_figs"));
     let mantissa = extract_u64_param(&topic.params, "mantissa");
-
     let n_sig_figs_key = n_sig_figs
         .map(|value| value.to_string())
         .unwrap_or_else(|| "none".to_string());
@@ -1042,6 +1350,7 @@ fn resolve_hyperliquid_orderbook_topic(
             mantissa,
         },
         levels_limit,
+        display_levels_limit: levels_limit,
     })
 }
 
@@ -1052,28 +1361,40 @@ fn resolve_binance_orderbook_topic(
     let market_symbol = resolve_binance_ws_symbol_shared(&topic.symbol, coin_override.as_deref())?;
     let stream_symbol = market_symbol.to_ascii_lowercase();
     let public_symbol = resolve_public_symbol_shared(&topic.symbol, &market_symbol, BINANCE_QUOTES);
-    let levels_limit = resolve_orderbook_levels(&topic.params);
-    let depth_levels = to_binance_ws_depth_levels(levels_limit);
-
-    let ws_endpoint = format!(
-        "{}/{}@depth{}@100ms",
-        BINANCE_FUTURES_WS_BASE_URL.trim_end_matches('/'),
-        stream_symbol,
-        depth_levels,
+    let requested_levels = resolve_orderbook_levels(&topic.params);
+    let resolved = resolve_binance_orderbook_stream(
+        BINANCE_FUTURES_WS_BASE_URL,
+        &market_symbol,
+        requested_levels,
     );
+    let (key, stream, levels_limit) = match resolved.kind {
+        BinanceOrderBookStreamKind::Partial { depth } => (
+            format!("binance|orderbook|symbol:{stream_symbol}|depth:{depth}"),
+            UpstreamOrderBookStream::BinancePartial {
+                ws_endpoint: resolved.ws_endpoint,
+            },
+            depth,
+        ),
+        BinanceOrderBookStreamKind::Diff => (
+            format!("binance|orderbook|symbol:{stream_symbol}|depth:diff1000"),
+            UpstreamOrderBookStream::BinanceDiff {
+                ws_endpoint: resolved.ws_endpoint,
+                market_symbol: market_symbol.clone(),
+            },
+            BINANCE_MAX_ORDERBOOK_LEVELS,
+        ),
+    };
 
     Ok(ResolvedOrderBookTopic {
-        key: format!(
-            "binance|orderbook|symbol:{}|depth:{}",
-            stream_symbol, depth_levels
-        ),
+        key,
         topic: OrderBookTopic {
             exchange: topic.exchange,
             symbol: public_symbol,
             params: topic.params,
         },
-        stream: UpstreamOrderBookStream::Binance { ws_endpoint },
-        levels_limit: depth_levels,
+        stream,
+        levels_limit,
+        display_levels_limit: resolved.display_levels,
     })
 }
 
@@ -1082,8 +1403,7 @@ fn resolve_bybit_orderbook_topic(topic: OrderBookTopic) -> Result<ResolvedOrderB
     let coin_override = extract_non_empty_string(&topic.params, "coin");
     let market_symbol = resolve_bybit_ws_symbol_shared(&topic.symbol, coin_override.as_deref())?;
     let public_symbol = resolve_public_symbol_shared(&topic.symbol, &market_symbol, BYBIT_QUOTES);
-    let levels_limit = resolve_orderbook_levels(&topic.params);
-    let depth_levels = to_bybit_ws_depth_levels(levels_limit);
+    let display_levels_limit = resolve_bybit_orderbook_levels(&topic.params, category);
 
     let ws_endpoint = match category {
         BybitCategory::Spot => BYBIT_WS_SPOT_URL,
@@ -1091,26 +1411,58 @@ fn resolve_bybit_orderbook_topic(topic: OrderBookTopic) -> Result<ResolvedOrderB
         BybitCategory::Inverse => BYBIT_WS_INVERSE_URL,
         BybitCategory::Option => BYBIT_WS_OPTION_URL,
     };
-
-    let subscribe_topic = format!("orderbook.{depth_levels}.{market_symbol}");
-
-    Ok(ResolvedOrderBookTopic {
-        key: format!(
+    let is_full = display_levels_limit > BYBIT_FULL_DEPTH_THRESHOLD
+        && !matches!(category, BybitCategory::Option);
+    let subscribe_topic = if is_full {
+        format!("orderbook.full.{market_symbol}")
+    } else {
+        format!(
+            "orderbook.{}.{market_symbol}",
+            to_bybit_ws_depth_levels(display_levels_limit)
+        )
+    };
+    let key = if is_full {
+        format!(
+            "bybit|orderbook|category:{}|symbol:{}|depth:full",
+            category.as_str(),
+            market_symbol.to_ascii_lowercase()
+        )
+    } else {
+        format!(
             "bybit|orderbook|category:{}|symbol:{}|depth:{}",
             category.as_str(),
             market_symbol.to_ascii_lowercase(),
-            depth_levels
-        ),
+            to_bybit_ws_depth_levels(display_levels_limit)
+        )
+    };
+    let stream = if is_full {
+        UpstreamOrderBookStream::BybitFull {
+            ws_endpoint: ws_endpoint.to_string(),
+            subscribe_topic,
+            category: category.as_str().to_string(),
+            market_symbol: market_symbol.clone(),
+        }
+    } else {
+        UpstreamOrderBookStream::BybitLimited {
+            ws_endpoint: ws_endpoint.to_string(),
+            subscribe_topic,
+        }
+    };
+
+    Ok(ResolvedOrderBookTopic {
+        key,
         topic: OrderBookTopic {
             exchange: topic.exchange,
             symbol: public_symbol,
             params: topic.params,
         },
-        stream: UpstreamOrderBookStream::Bybit {
-            ws_endpoint: ws_endpoint.to_string(),
-            subscribe_topic,
+        stream,
+        levels_limit: if is_full {
+            BYBIT_MAX_FULL_DEPTH
+        } else {
+            to_bybit_ws_depth_levels(display_levels_limit)
         },
-        levels_limit,
+        display_levels_limit,
     })
 }
 
@@ -1201,76 +1553,6 @@ fn parse_hyperliquid_levels(levels: &Value, limit: usize, descending: bool) -> V
     }
 
     parsed
-}
-
-fn parse_binance_orderbook_message(
-    payload: &str,
-    symbol: &str,
-    levels_limit: usize,
-) -> Option<CcxtOrderBook> {
-    let Ok(value) = serde_json::from_str::<Value>(payload) else {
-        return None;
-    };
-
-    let data = value.get("data").unwrap_or(&value);
-    let event = data.get("e").and_then(Value::as_str).unwrap_or_default();
-    if event != "depthUpdate" {
-        return None;
-    }
-
-    let timestamp = data
-        .get("T")
-        .or_else(|| data.get("E"))
-        .and_then(parse_u64_lossy_shared);
-    let datetime = timestamp.and_then(iso8601_millis);
-
-    let mut bids = parse_binance_orderbook_side(data.get("b"), levels_limit);
-    let mut asks = parse_binance_orderbook_side(data.get("a"), levels_limit);
-
-    bids.sort_by(|left, right| right.0.total_cmp(&left.0));
-    asks.sort_by(|left, right| left.0.total_cmp(&right.0));
-
-    if bids.len() > levels_limit {
-        bids.truncate(levels_limit);
-    }
-    if asks.len() > levels_limit {
-        asks.truncate(levels_limit);
-    }
-
-    Some(CcxtOrderBook {
-        asks,
-        bids,
-        datetime,
-        timestamp,
-        nonce: None,
-        symbol: Some(symbol.to_string()),
-    })
-}
-
-fn parse_binance_orderbook_side(value: Option<&Value>, limit: usize) -> Vec<(f64, f64)> {
-    let Some(levels) = value.and_then(Value::as_array) else {
-        return Vec::new();
-    };
-
-    let mut output = Vec::with_capacity(levels.len().min(limit));
-    for row in levels.iter().take(limit) {
-        let Some(row) = row.as_array() else {
-            continue;
-        };
-        if row.len() < 2 {
-            continue;
-        }
-
-        let Some(price) = row.first().and_then(parse_f64_lossy_shared) else {
-            continue;
-        };
-        let Some(size) = row.get(1).and_then(parse_f64_lossy_shared) else {
-            continue;
-        };
-        output.push((price, size));
-    }
-
-    output
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1876,6 +2158,19 @@ fn resolve_orderbook_levels(params: &Value) -> usize {
         .unwrap_or(DEFAULT_ORDERBOOK_LEVELS)
         .clamp(1, 1_000)
 }
+fn resolve_bybit_orderbook_levels(params: &Value, category: BybitCategory) -> usize {
+    let requested = extract_usize_param(params, "levels")
+        .or_else(|| extract_usize_param(params, "depth"))
+        .or_else(|| extract_usize_param(params, "limit"))
+        .unwrap_or(DEFAULT_ORDERBOOK_LEVELS);
+
+    match category {
+        BybitCategory::Option => requested.clamp(1, 25),
+        BybitCategory::Spot | BybitCategory::Linear | BybitCategory::Inverse => {
+            requested.clamp(1, BYBIT_MAX_FULL_DEPTH)
+        }
+    }
+}
 
 fn resolve_ohlcv_timeframe(params: &Value) -> String {
     let timeframe = extract_non_empty_string(params, "timeframe")
@@ -1900,16 +2195,6 @@ fn extract_usize_param(params: &Value, key: &str) -> Option<usize> {
     params.get(key).and_then(|value| {
         parse_u64_lossy_shared(value).and_then(|numeric| usize::try_from(numeric).ok())
     })
-}
-
-fn to_binance_ws_depth_levels(levels: usize) -> usize {
-    if levels <= 5 {
-        5
-    } else if levels <= 10 {
-        10
-    } else {
-        20
-    }
 }
 
 fn to_bybit_ws_depth_levels(levels: usize) -> usize {
@@ -2087,6 +2372,30 @@ mod tests {
         assert_eq!(manager.active_topic_count().await, 0);
     }
 
+    struct MockBinanceSnapshotProvider;
+
+    #[async_trait]
+    impl BinanceOrderBookSnapshotProvider for MockBinanceSnapshotProvider {
+        async fn fetch_binance_order_book_snapshot(
+            &self,
+            _market_symbol: &str,
+        ) -> Result<crate::binance_orderbook::BinanceDepthSnapshot, String> {
+            Ok(crate::binance_orderbook::BinanceDepthSnapshot {
+                last_update_id: 0,
+                bids: Vec::new(),
+                asks: Vec::new(),
+                timestamp: None,
+            })
+        }
+    }
+
+    fn orderbook_manager() -> OrderBookTopicManager {
+        OrderBookTopicManager::new(
+            "https://api.hyperliquid.xyz".to_string(),
+            Arc::new(MockBinanceSnapshotProvider),
+        )
+    }
+
     #[test]
     fn normalizes_topic_params_and_validates_shape() {
         let topic = TradesTopic::from_client_request(
@@ -2109,7 +2418,7 @@ mod tests {
 
     #[test]
     fn orderbook_resolution_normalizes_depth_to_shared_topic_key() {
-        let manager = OrderBookTopicManager::new("https://api.hyperliquid.xyz".to_string());
+        let manager = orderbook_manager();
 
         let topic_a = TradesTopic::from_client_request(
             Some("binance".to_string()),
@@ -2133,6 +2442,114 @@ mod tests {
 
         assert_eq!(key_a, key_b);
         assert!(key_a.contains("orderbook"));
+    }
+    #[test]
+    fn binance_deep_depth_shares_diff_topic_and_preserves_display_limit() {
+        let partial = resolve_binance_orderbook_topic(
+            TradesTopic::from_client_request(
+                Some("binance".to_string()),
+                Some("BTCUSDT".to_string()),
+                json!({"levels": 20}),
+            )
+            .expect("partial topic should be valid"),
+        )
+        .expect("partial topic should resolve");
+        assert!(partial.key.ends_with("depth:20"));
+        assert_eq!(partial.levels_limit, 20);
+        assert!(matches!(
+            partial.stream,
+            UpstreamOrderBookStream::BinancePartial { .. }
+        ));
+
+        let resolved = [21, 50, 1_000]
+            .into_iter()
+            .map(|levels| {
+                resolve_binance_orderbook_topic(
+                    TradesTopic::from_client_request(
+                        Some("binance".to_string()),
+                        Some("BTCUSDT".to_string()),
+                        json!({"levels": levels}),
+                    )
+                    .expect("deep topic should be valid"),
+                )
+                .expect("deep topic should resolve")
+            })
+            .collect::<Vec<_>>();
+
+        assert!(resolved
+            .iter()
+            .all(|topic| topic.key.ends_with("depth:diff1000")));
+        assert!(resolved
+            .iter()
+            .all(|topic| topic.levels_limit == BINANCE_MAX_ORDERBOOK_LEVELS));
+        assert_eq!(
+            resolved
+                .iter()
+                .map(|topic| topic.display_levels_limit)
+                .collect::<Vec<_>>(),
+            vec![21, 50, 1_000]
+        );
+        for topic in resolved {
+            let UpstreamOrderBookStream::BinanceDiff { ws_endpoint, .. } = topic.stream else {
+                panic!("deep Binance topic should use diff stream");
+            };
+            assert!(ws_endpoint.ends_with("@depth@100ms"));
+            assert!(!ws_endpoint.contains("depth1000"));
+        }
+    }
+
+    #[test]
+    fn bybit_full_depth_shares_upstream_across_display_limits() {
+        let manager = orderbook_manager();
+        let topic_a = TradesTopic::from_client_request(
+            Some("bybit".to_string()),
+            Some("BTC/USDT:USDT".to_string()),
+            json!({"category": "linear", "levels": 1001}),
+        )
+        .expect("topic should be valid");
+        let topic_b = TradesTopic::from_client_request(
+            Some("bybit".to_string()),
+            Some("BTCUSDT".to_string()),
+            json!({"category": "linear", "levels": 10000}),
+        )
+        .expect("topic should be valid");
+
+        let resolved_a = manager
+            .inner
+            .runner
+            .resolve(topic_a)
+            .expect("first full topic should resolve");
+        let resolved_b = manager
+            .inner
+            .runner
+            .resolve(topic_b)
+            .expect("second full topic should resolve");
+
+        assert_eq!(resolved_a.key, resolved_b.key);
+        assert!(resolved_a.key.ends_with("depth:full"));
+        assert_eq!(resolved_a.display_levels_limit, 1001);
+        assert_eq!(resolved_b.display_levels_limit, 10000);
+        assert!(matches!(
+            resolved_a.stream,
+            UpstreamOrderBookStream::BybitFull { .. }
+        ));
+    }
+
+    #[test]
+    fn bybit_option_depth_stays_on_limited_topic() {
+        let topic = TradesTopic::from_client_request(
+            Some("bybit".to_string()),
+            Some("BTC/USDT:USDT".to_string()),
+            json!({"category": "option", "levels": 1001}),
+        )
+        .expect("topic should be valid");
+        let resolved = resolve_bybit_orderbook_topic(topic).expect("topic should resolve");
+
+        assert_eq!(resolved.display_levels_limit, 25);
+        assert!(matches!(
+            resolved.stream,
+            UpstreamOrderBookStream::BybitLimited { .. }
+        ));
     }
 
     #[test]

@@ -227,6 +227,8 @@ Subscribe command:
   }
 }
 ```
+For Bybit `spot`, `linear`, and `inverse`, `params.levels`, `params.depth`, or `params.limit` above `1000` selects `orderbook.full.{symbol}`. The backend buffers deltas, synchronizes them to a full REST snapshot, keeps the complete synchronized book internally, and truncates each client response to its requested depth. Full-depth subscribers for the same Bybit category and symbol share one upstream stream. Options remain limited to 25 levels.
+
 
 Server order book update:
 
@@ -308,6 +310,8 @@ Request body:
   }
 }
 ```
+Bybit `spot`, `linear`, and `inverse` requests above `1000` levels, up to `10000`, use `GET /v5/market/full_orderbook`. The full endpoint has no upstream `limit` parameter; FERRIS truncates its CCXT-like response to the requested depth. Requests at or below `1000` retain the limited endpoint, and options remain capped at 25 levels.
+
 
 Response body (CCXT-like `OrderBook`):
 
@@ -433,6 +437,12 @@ Order book stream:
 ```bash
 cargo run --bin market_stream -- orderbook --exchange bybit --coin BTC
 ```
+Bybit full-depth order book stream:
+
+```bash
+cargo run --bin market_stream -- orderbook --exchange bybit --symbol BTC/USDT:USDT --levels 10000
+```
+
 
 Binance order book stream:
 
@@ -458,7 +468,7 @@ Useful optional flags:
 - `--symbol` (default `BTC/USDC:USDC`)
 - `--ws-url` (websocket base URL override; default depends on `--exchange`)
 - `--coin` (optional websocket coin override)
-- `--levels` (order book depth to display; default `10`, min `10`, max `20`)
+- `--levels` (order book depth to display/request; default `10`, min `10`; Bybit max `10000`, other exchanges max `20`)
 - `--limit` (trades dedup buffer hint; also OHLCV candle window size, default `25` for trades, `120` for OHLCV)
 - `--timeframe` (OHLCV timeframe, for example `1m`, `5m`, `1h`)
 - `--chart-height` (OHLCV chart rows, default `16`)
@@ -597,3 +607,14 @@ This keeps the frontend contract stable while exchange integrations evolve indep
 ## Notes on Hyperliquid public trades
 
 Hyperliquid `recentTrades` returns only a short recent window. This backend still queries `recentTrades`, but also runs a websocket collector (`trades` channel) and stores data in an in-memory per-coin ring buffer. That allows `fetchTrades` to serve deeper recent history than the raw upstream REST endpoint alone, while `GET /v1/ws` provides shared realtime fanout for market-data channels.
+### Binance realtime order books
+
+Binance realtime order books use USDⓈ-M futures symbols only. Requests with `levels`, `depth`, or `limit` up to 20 retain the partial depth streams (`5`, `10`, or `20`). Requests from 21 through 1,000 share one futures diff stream and one REST snapshot requested at `limit=1000`; the backend maintains the synchronized top-1,000 book, returns each subscriber's requested top N levels, and carries the latest Binance `u` update ID in `nonce`.
+
+The terminal viewer supports the same limits. For example:
+
+```text
+cargo run --bin market_stream -- orderbook --exchange binance --symbol BTC/USDT:USDT --levels 1000 --iterations 3
+```
+
+Terminal order-book maxima are explicit: Hyperliquid 20, Binance USDⓈ-M futures 1,000, and Bybit 10,000. Binance Spot, Coin-M futures, and unsupported 5,000-level paths are not included.

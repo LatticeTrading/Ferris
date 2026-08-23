@@ -15,6 +15,9 @@ use axum::{
     routing::get,
     Router,
 };
+use ferris_market_data_backend::binance_orderbook::{
+    BinanceDepthSnapshot, BinanceOrderBookSnapshotProvider,
+};
 use ferris_market_data_backend::{
     exchanges::registry::ExchangeRegistry,
     realtime::{OhlcvTopicManager, OrderBookTopicManager, TradesTopicManager},
@@ -36,6 +39,24 @@ struct MockUpstreamState {
     active_connections: Arc<AtomicUsize>,
     subscription_count: Arc<AtomicUsize>,
     outbound_trades: broadcast::Sender<String>,
+}
+
+#[derive(Clone)]
+struct MockBinanceSnapshotProvider;
+
+#[async_trait::async_trait]
+impl BinanceOrderBookSnapshotProvider for MockBinanceSnapshotProvider {
+    async fn fetch_binance_order_book_snapshot(
+        &self,
+        _market_symbol: &str,
+    ) -> Result<BinanceDepthSnapshot, String> {
+        Ok(BinanceDepthSnapshot {
+            last_update_id: 0,
+            bids: Vec::new(),
+            asks: Vec::new(),
+            timestamp: None,
+        })
+    }
 }
 
 async fn spawn_server(app: Router) -> (String, oneshot::Sender<()>, JoinHandle<()>) {
@@ -195,12 +216,14 @@ async fn websocket_fanout_shares_upstream_for_same_topic() {
         .route("/ws", get(upstream_route))
         .with_state(upstream_state);
     let (upstream_bind, upstream_shutdown, upstream_task) = spawn_server(upstream_app).await;
-
     let topic_manager = TradesTopicManager::new(format!("http://{upstream_bind}"));
     let app_state = AppState::new(
         Arc::new(ExchangeRegistry::new()),
         topic_manager,
-        OrderBookTopicManager::new(format!("http://{upstream_bind}")),
+        OrderBookTopicManager::new(
+            format!("http://{upstream_bind}"),
+            Arc::new(MockBinanceSnapshotProvider),
+        ),
         OhlcvTopicManager::new(format!("http://{upstream_bind}")),
     );
     let app = Router::new()

@@ -7,6 +7,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::{
+    bybit_full_orderbook::{BybitFullSnapshot, BYBIT_FULL_DEPTH_THRESHOLD, BYBIT_MAX_FULL_DEPTH},
     exchanges::traits::{ExchangeError, MarketDataExchange},
     models::{
         CcxtOhlcv, CcxtOrderBook, CcxtTrade, FetchMarketsParams, FetchOhlcvParams,
@@ -239,47 +240,36 @@ impl MarketDataExchange for BybitExchange {
         let category = parse_category_from_params(&params.params)?;
         let market_symbol = normalize_market_symbol(&params.symbol)?;
         let resolved_symbol = resolve_public_symbol(&params.symbol, &market_symbol);
-
         let requested_levels = params
             .limit
             .unwrap_or(DEFAULT_FETCH_ORDER_BOOK_LEVELS)
-            .clamp(1, max_order_book_limit_for_category(category));
+            .clamp(1, max_requested_order_book_limit(category));
 
+        if uses_full_order_book(category, requested_levels) {
+            let query = vec![
+                ("category", category.as_str().to_string()),
+                ("symbol", market_symbol),
+            ];
+            let result = self
+                .get_public_market_result("/v5/market/full_orderbook", &query)
+                .await?;
+            let snapshot =
+                BybitFullSnapshot::from_result(&result).map_err(ExchangeError::UpstreamData)?;
+
+            return Ok(snapshot.to_ccxt(&resolved_symbol, requested_levels));
+        }
+
+        let limited_levels = requested_levels.min(max_limited_order_book_limit(category));
         let query = vec![
             ("category", category.as_str().to_string()),
             ("symbol", market_symbol),
-            ("limit", requested_levels.to_string()),
+            ("limit", limited_levels.to_string()),
         ];
-
         let result = self
             .get_public_market_result("/v5/market/orderbook", &query)
             .await?;
 
-        let mut bids = map_order_book_levels(result.get("b"), "bids")?;
-        let mut asks = map_order_book_levels(result.get("a"), "asks")?;
-
-        bids.sort_by(|left, right| right.0.total_cmp(&left.0));
-        asks.sort_by(|left, right| left.0.total_cmp(&right.0));
-
-        if bids.len() > requested_levels {
-            bids.truncate(requested_levels);
-        }
-        if asks.len() > requested_levels {
-            asks.truncate(requested_levels);
-        }
-
-        let timestamp = result.get("ts").and_then(parse_u64_lossy);
-        let datetime = timestamp.and_then(iso8601_millis);
-        let nonce = result.get("u").and_then(parse_u64_lossy);
-
-        Ok(CcxtOrderBook {
-            asks,
-            bids,
-            datetime,
-            timestamp,
-            nonce,
-            symbol: Some(resolved_symbol),
-        })
+        map_limited_order_book(&result, &resolved_symbol, limited_levels)
     }
 
     async fn fetch_markets(
@@ -381,12 +371,25 @@ fn max_trade_limit_for_category(category: BybitCategory) -> usize {
     }
 }
 
-fn max_order_book_limit_for_category(category: BybitCategory) -> usize {
+fn max_limited_order_book_limit(category: BybitCategory) -> usize {
     match category {
         BybitCategory::Spot => 200,
         BybitCategory::Linear | BybitCategory::Inverse => 500,
         BybitCategory::Option => 25,
     }
+}
+
+fn max_requested_order_book_limit(category: BybitCategory) -> usize {
+    match category {
+        BybitCategory::Spot | BybitCategory::Linear | BybitCategory::Inverse => {
+            BYBIT_MAX_FULL_DEPTH
+        }
+        BybitCategory::Option => max_limited_order_book_limit(category),
+    }
+}
+
+fn uses_full_order_book(category: BybitCategory, requested_levels: usize) -> bool {
+    !matches!(category, BybitCategory::Option) && requested_levels > BYBIT_FULL_DEPTH_THRESHOLD
 }
 
 fn parse_category_from_params(params: &Value) -> Result<BybitCategory, ExchangeError> {
@@ -654,6 +657,31 @@ fn map_kline_row(raw: &Value) -> Result<CcxtOhlcv, ExchangeError> {
     Ok((timestamp, open, high, low, close, volume))
 }
 
+fn map_limited_order_book(
+    result: &Value,
+    resolved_symbol: &str,
+    levels_limit: usize,
+) -> Result<CcxtOrderBook, ExchangeError> {
+    let mut bids = map_order_book_levels(result.get("b"), "bids")?;
+    let mut asks = map_order_book_levels(result.get("a"), "asks")?;
+
+    bids.sort_by(|left, right| right.0.total_cmp(&left.0));
+    asks.sort_by(|left, right| left.0.total_cmp(&right.0));
+    bids.truncate(levels_limit);
+    asks.truncate(levels_limit);
+
+    let timestamp = result.get("ts").and_then(parse_u64_lossy);
+
+    Ok(CcxtOrderBook {
+        asks,
+        bids,
+        datetime: timestamp.and_then(iso8601_millis),
+        timestamp,
+        nonce: result.get("u").and_then(parse_u64_lossy),
+        symbol: Some(resolved_symbol.to_string()),
+    })
+}
+
 fn map_order_book_levels(
     levels: Option<&Value>,
     side: &str,
@@ -862,8 +890,9 @@ mod tests {
 
     use super::{
         map_bybit_api_error, map_kline_row, map_market_row, map_order_book_levels,
-        map_timeframe_to_bybit_interval, map_trade_row, max_order_book_limit_for_category,
-        normalize_market_symbol, parse_category_from_params, resolve_public_symbol, BybitCategory,
+        map_timeframe_to_bybit_interval, map_trade_row, max_limited_order_book_limit,
+        max_requested_order_book_limit, normalize_market_symbol, parse_category_from_params,
+        resolve_public_symbol, uses_full_order_book, BybitCategory,
     };
     use crate::exchanges::traits::ExchangeError;
 
@@ -965,17 +994,17 @@ mod tests {
     }
 
     #[test]
-    fn maps_bybit_order_book_limit_by_category() {
-        assert_eq!(max_order_book_limit_for_category(BybitCategory::Spot), 200);
+    fn routes_bybit_order_book_depth_by_category() {
+        assert_eq!(max_limited_order_book_limit(BybitCategory::Spot), 200);
+        assert_eq!(max_limited_order_book_limit(BybitCategory::Linear), 500);
         assert_eq!(
-            max_order_book_limit_for_category(BybitCategory::Linear),
-            500
+            max_requested_order_book_limit(BybitCategory::Linear),
+            10_000
         );
-        assert_eq!(
-            max_order_book_limit_for_category(BybitCategory::Inverse),
-            500
-        );
-        assert_eq!(max_order_book_limit_for_category(BybitCategory::Option), 25);
+        assert_eq!(max_requested_order_book_limit(BybitCategory::Option), 25);
+        assert!(!uses_full_order_book(BybitCategory::Linear, 500));
+        assert!(uses_full_order_book(BybitCategory::Linear, 1_001));
+        assert!(!uses_full_order_book(BybitCategory::Option, 1_001));
     }
 
     #[test]

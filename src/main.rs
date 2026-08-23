@@ -25,8 +25,9 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Config::from_env().context("failed to load configuration")?;
 
+    let binance_exchange = Arc::new(BinanceExchange::new(config.request_timeout_ms)?);
     let mut registry = ExchangeRegistry::new();
-    registry.register(Arc::new(BinanceExchange::new(config.request_timeout_ms)?));
+    registry.register(binance_exchange.clone());
     registry.register(Arc::new(BybitExchange::new(config.request_timeout_ms)?));
     registry.register(Arc::new(HyperliquidExchange::new(
         config.hyperliquid_base_url.clone(),
@@ -37,7 +38,8 @@ async fn main() -> anyhow::Result<()> {
     )?));
 
     let trades_topic_manager = TradesTopicManager::new(config.hyperliquid_base_url.clone());
-    let order_book_topic_manager = OrderBookTopicManager::new(config.hyperliquid_base_url.clone());
+    let order_book_topic_manager =
+        OrderBookTopicManager::new(config.hyperliquid_base_url.clone(), binance_exchange);
     let ohlcv_topic_manager = OhlcvTopicManager::new(config.hyperliquid_base_url.clone());
     let state = AppState::new(
         Arc::new(registry),

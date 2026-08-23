@@ -21,7 +21,7 @@ Mode-specific options:
     --limit <count>        Dedup buffer sizing hint (default: 25)
 
   orderbook:
-    --levels <count>       Depth levels to display/request (default: 10, min: 10, max: 20)
+  --levels <count>       Depth levels to display/request (default: 10; Hyperliquid max: 20; Binance max: 1000; Bybit max: 10000)
 
   ohlcv:
     --timeframe <value>    Candle timeframe (default: 1m)
@@ -142,7 +142,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<ParseResult, String> {
             }
             "--levels" => {
                 let levels = parse_usize_gt_zero("--levels", &value(&mut index)?)?;
-                config.orderbook_levels = levels.clamp(MIN_ORDERBOOK_LEVELS, MAX_ORDERBOOK_LEVELS);
+                config.orderbook_levels = levels.max(MIN_ORDERBOOK_LEVELS);
             }
             "--timeframe" => {
                 config.ohlcv_timeframe = value(&mut index)?;
@@ -164,6 +164,15 @@ pub(crate) fn parse_args(args: &[String]) -> Result<ParseResult, String> {
 
         index += 1;
     }
+
+    let max_levels = if config.exchange.trim().eq_ignore_ascii_case("bybit") {
+        MAX_BYBIT_ORDERBOOK_LEVELS
+    } else if config.exchange.trim().eq_ignore_ascii_case("binance") {
+        ferris_market_data_backend::binance_orderbook::BINANCE_MAX_ORDERBOOK_LEVELS
+    } else {
+        MAX_HYPERLIQUID_ORDERBOOK_LEVELS
+    };
+    config.orderbook_levels = config.orderbook_levels.min(max_levels);
 
     if config.ws_url.trim().is_empty() {
         return Err("`--ws-url` cannot be empty".to_string());

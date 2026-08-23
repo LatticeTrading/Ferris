@@ -1,11 +1,19 @@
 use anyhow::{bail, Context};
-use ferris_market_data_backend::ws_shared::{
-    infer_hyperliquid_coin_from_symbol as infer_hyperliquid_coin_from_symbol_shared,
-    parse_binance_trades as parse_binance_trades_shared,
-    parse_bybit_trades as parse_bybit_trades_shared,
-    parse_hyperliquid_trades as parse_hyperliquid_trades_shared,
-    resolve_binance_ws_symbol as resolve_binance_ws_symbol_shared,
-    resolve_bybit_ws_symbol as resolve_bybit_ws_symbol_shared, WsTrade,
+use ferris_market_data_backend::{
+    binance_orderbook::{
+        parse_binance_partial_orderbook, resolve_binance_orderbook_stream,
+        to_binance_ws_depth_levels as to_binance_ws_depth_levels_shared,
+        BINANCE_FUTURES_WS_BASE_URL,
+    },
+    bybit_full_orderbook::BYBIT_FULL_DEPTH_THRESHOLD,
+    ws_shared::{
+        infer_hyperliquid_coin_from_symbol as infer_hyperliquid_coin_from_symbol_shared,
+        parse_binance_trades as parse_binance_trades_shared,
+        parse_bybit_trades as parse_bybit_trades_shared,
+        parse_hyperliquid_trades as parse_hyperliquid_trades_shared,
+        resolve_binance_ws_symbol as resolve_binance_ws_symbol_shared,
+        resolve_bybit_ws_symbol as resolve_bybit_ws_symbol_shared, WsTrade,
+    },
 };
 use futures_util::SinkExt;
 use serde_json::{json, Value};
@@ -13,9 +21,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::{
     cli::Config,
-    constants::{
-        DEFAULT_BINANCE_FUTURES_WS_URL, DEFAULT_BYBIT_LINEAR_WS_URL, DEFAULT_HYPERLIQUID_WS_URL,
-    },
+    constants::{DEFAULT_BYBIT_LINEAR_WS_URL, DEFAULT_HYPERLIQUID_WS_URL},
     view::{iso8601_millis, OhlcvRow, OrderBookSnapshot, TradeRow},
 };
 
@@ -41,7 +47,7 @@ pub(crate) fn resolved_ws_base_url(config: &Config) -> String {
     }
 
     match config.exchange.as_str() {
-        "binance" => DEFAULT_BINANCE_FUTURES_WS_URL.to_string(),
+        "binance" => BINANCE_FUTURES_WS_BASE_URL.to_string(),
         "bybit" => DEFAULT_BYBIT_LINEAR_WS_URL.to_string(),
         _ => DEFAULT_HYPERLIQUID_WS_URL.to_string(),
     }
@@ -74,17 +80,8 @@ pub(crate) fn build_bybit_orderbook_ws_endpoint(config: &Config) -> anyhow::Resu
 pub(crate) fn build_binance_orderbook_ws_endpoint(config: &Config) -> anyhow::Result<String> {
     let base_url = resolved_ws_base_url(config);
     let symbol = resolve_binance_ws_symbol(config)?;
-    let depth_levels = to_binance_ws_depth_levels(config.orderbook_levels);
-    let stream_name = format!(
-        "{}@depth{}@100ms",
-        symbol.to_ascii_lowercase(),
-        depth_levels
-    );
-    Ok(format!(
-        "{}/{}",
-        base_url.trim_end_matches('/'),
-        stream_name
-    ))
+    let stream = resolve_binance_orderbook_stream(&base_url, &symbol, config.orderbook_levels);
+    Ok(stream.ws_endpoint)
 }
 
 pub(crate) fn build_binance_ohlcv_ws_endpoint(config: &Config) -> anyhow::Result<String> {
@@ -104,15 +101,8 @@ pub(crate) fn build_bybit_ohlcv_ws_endpoint(config: &Config) -> anyhow::Result<S
 }
 
 pub(crate) fn to_binance_ws_depth_levels(levels: usize) -> usize {
-    if levels <= 5 {
-        5
-    } else if levels <= 10 {
-        10
-    } else {
-        20
-    }
+    to_binance_ws_depth_levels_shared(levels)
 }
-
 pub(crate) fn to_bybit_ws_depth_levels(levels: usize) -> usize {
     if levels <= 1 {
         1
@@ -233,7 +223,11 @@ pub(crate) async fn send_bybit_orderbook_subscription(
     symbol: &str,
     depth: usize,
 ) -> anyhow::Result<()> {
-    let topic = format!("orderbook.{depth}.{symbol}");
+    let topic = if depth > BYBIT_FULL_DEPTH_THRESHOLD {
+        format!("orderbook.full.{symbol}")
+    } else {
+        format!("orderbook.{depth}.{symbol}")
+    };
     send_bybit_subscription(stream, &topic, "orderbook").await
 }
 
@@ -626,69 +620,14 @@ pub(crate) fn parse_binance_orderbook_message(
     symbol: &str,
     levels_limit: usize,
 ) -> Option<OrderBookSnapshot> {
-    let Ok(value) = serde_json::from_str::<Value>(payload) else {
-        return None;
-    };
-
-    let data = value.get("data").unwrap_or(&value);
-    let event = data.get("e").and_then(Value::as_str).unwrap_or_default();
-    if event != "depthUpdate" {
-        return None;
-    }
-
-    let timestamp = data
-        .get("T")
-        .or_else(|| data.get("E"))
-        .and_then(parse_u64_lossy);
-    let datetime = timestamp.and_then(iso8601_millis);
-
-    let mut bids = parse_binance_orderbook_side(data.get("b"), levels_limit);
-    let mut asks = parse_binance_orderbook_side(data.get("a"), levels_limit);
-
-    bids.sort_by(|left, right| right.0.total_cmp(&left.0));
-    asks.sort_by(|left, right| left.0.total_cmp(&right.0));
-
-    if bids.len() > levels_limit {
-        bids.truncate(levels_limit);
-    }
-    if asks.len() > levels_limit {
-        asks.truncate(levels_limit);
-    }
-
+    let book = parse_binance_partial_orderbook(payload, symbol, levels_limit)?;
     Some(OrderBookSnapshot {
-        asks,
-        bids,
-        datetime,
-        timestamp,
-        symbol: Some(symbol.to_string()),
+        asks: book.asks,
+        bids: book.bids,
+        datetime: book.datetime,
+        timestamp: book.timestamp,
+        symbol: book.symbol,
     })
-}
-
-pub(crate) fn parse_binance_orderbook_side(value: Option<&Value>, limit: usize) -> Vec<(f64, f64)> {
-    let Some(levels) = value.and_then(Value::as_array) else {
-        return Vec::new();
-    };
-
-    let mut output = Vec::with_capacity(levels.len().min(limit));
-
-    for row in levels.iter().take(limit) {
-        let Some(row) = row.as_array() else {
-            continue;
-        };
-        if row.len() < 2 {
-            continue;
-        }
-
-        let Some(price) = row.first().and_then(parse_f64_lossy) else {
-            continue;
-        };
-        let Some(size) = row.get(1).and_then(parse_f64_lossy) else {
-            continue;
-        };
-        output.push((price, size));
-    }
-
-    output
 }
 
 pub(crate) fn parse_u64_lossy(value: &Value) -> Option<u64> {

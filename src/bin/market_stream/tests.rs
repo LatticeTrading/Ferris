@@ -83,10 +83,34 @@ fn parse_args_rejects_polling_flags() {
 }
 
 #[test]
-fn parse_args_caps_orderbook_levels() {
+fn parse_args_caps_hyperliquid_default_orderbook_levels() {
     let config = parse_run(&["orderbook", "--levels", "999"]);
     assert_eq!(config.mode, Mode::OrderBook);
     assert_eq!(config.orderbook_levels, 20);
+}
+
+#[test]
+fn parse_args_caps_binance_orderbook_levels() {
+    assert_eq!(
+        parse_run(&["orderbook", "--exchange", "binance", "--levels", "21"]).orderbook_levels,
+        21
+    );
+    assert_eq!(
+        parse_run(&["orderbook", "--exchange", "binance", "--levels", "1000"]).orderbook_levels,
+        1000
+    );
+    assert_eq!(
+        parse_run(&["orderbook", "--exchange", "binance", "--levels", "1001"]).orderbook_levels,
+        1000
+    );
+}
+#[test]
+fn parse_args_allows_bybit_full_orderbook_levels() {
+    let config = parse_run(&["orderbook", "--exchange", "bybit", "--levels", "1001"]);
+    assert_eq!(config.orderbook_levels, 1001);
+
+    let capped = parse_run(&["orderbook", "--exchange", "bybit", "--levels", "20000"]);
+    assert_eq!(capped.orderbook_levels, 10000);
 }
 
 #[test]
@@ -474,6 +498,24 @@ fn parse_binance_orderbook_message_maps_levels() {
     assert_eq!(parsed.symbol.as_deref(), Some("BTC/USDT:USDT"));
 }
 
+#[test]
+fn build_binance_orderbook_ws_endpoint_uses_shared_diff_stream_for_deep_levels() {
+    for levels in [21, 1000] {
+        let config = parse_run(&[
+            "orderbook",
+            "--exchange",
+            "binance",
+            "--symbol",
+            "BTC/USDT:USDT",
+            "--levels",
+            &levels.to_string(),
+        ]);
+        let endpoint =
+            build_binance_orderbook_ws_endpoint(&config).expect("deep endpoint should build");
+        assert!(endpoint.ends_with("/btcusdt@depth@100ms"));
+        assert!(!endpoint.contains("depth1000"));
+    }
+}
 #[test]
 fn build_binance_orderbook_ws_endpoint_applies_depth_bucket() {
     let config = parse_run(&[
