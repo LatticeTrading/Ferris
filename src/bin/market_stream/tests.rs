@@ -1,3 +1,7 @@
+use super::ws_helpers::{
+    build_aster_ohlcv_ws_endpoint, build_aster_orderbook_ws_endpoint,
+    build_aster_trade_ws_endpoint, to_aster_ws_interval,
+};
 use super::{
     apply_bybit_orderbook_event, build_binance_ohlcv_ws_endpoint,
     build_binance_orderbook_ws_endpoint, build_bybit_ohlcv_ws_endpoint,
@@ -11,6 +15,50 @@ use super::{
     to_bybit_ws_interval, trade_key, BybitOrderBookEventType, Config, Mode, OhlcvRow,
     OrderBookSnapshot, ParseResult, TradeDeduper, TradeRow,
 };
+
+#[test]
+fn aster_stream_endpoints_and_display_depth() {
+    let config = parse_run(&[
+        "orderbook",
+        "--exchange",
+        "aster",
+        "--symbol",
+        "BTCU",
+        "--levels",
+        "1",
+    ]);
+    assert_eq!(config.orderbook_levels, 1);
+    assert_eq!(
+        build_aster_trade_ws_endpoint(&config).unwrap(),
+        "wss://fstream.asterdex.com/ws/btcu@aggTrade"
+    );
+    assert_eq!(
+        build_aster_orderbook_ws_endpoint(&config).unwrap(),
+        "wss://fstream.asterdex.com/ws/btcu@depth@100ms"
+    );
+    assert_eq!(
+        build_aster_ohlcv_ws_endpoint(&config).unwrap(),
+        "wss://fstream.asterdex.com/ws/btcu@kline_1m"
+    );
+    let deep = parse_run(&[
+        "orderbook",
+        "--exchange",
+        "aster",
+        "--symbol",
+        "BTC/USD1:USD1",
+        "--levels",
+        "1500",
+        "--ws-url",
+        "ws://localhost:1234/ws/",
+    ]);
+    assert_eq!(deep.orderbook_levels, 1000);
+    assert_eq!(
+        build_aster_orderbook_ws_endpoint(&deep).unwrap(),
+        "ws://localhost:1234/ws/btcusd1@depth@100ms"
+    );
+    assert_eq!(to_aster_ws_interval("1M").unwrap(), "1M");
+    assert!(to_aster_ws_interval("2m").is_err());
+}
 
 fn parse_run(args: &[&str]) -> Config {
     let args = args

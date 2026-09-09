@@ -8,6 +8,7 @@ use axum::{
 use ferris_market_data_backend::{
     config::Config,
     exchanges::{
+        aster::AsterExchange,
         binance::BinanceExchange,
         bybit::BybitExchange,
         hyperliquid::HyperliquidExchange,
@@ -28,6 +29,7 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Config::from_env().context("failed to load configuration")?;
 
+    let aster_exchange = Arc::new(AsterExchange::new(config.request_timeout_ms)?);
     let binance_exchange = Arc::new(BinanceExchange::new(config.request_timeout_ms)?);
     let lighter_catalog_service = Arc::new(LighterMarketCatalogService::new(
         config.request_timeout_ms,
@@ -35,6 +37,7 @@ async fn main() -> anyhow::Result<()> {
         config.lighter_market_catalog_refresh_ms,
     )?);
     let mut registry = ExchangeRegistry::new();
+    registry.register(aster_exchange.clone());
     registry.register(binance_exchange.clone());
     registry.register(Arc::new(BybitExchange::new(config.request_timeout_ms)?));
     registry.register(Arc::new(LighterExchange::new(
@@ -58,6 +61,7 @@ async fn main() -> anyhow::Result<()> {
     let order_book_topic_manager = OrderBookTopicManager::new(
         config.hyperliquid_base_url.clone(),
         binance_exchange,
+        aster_exchange,
         config.lighter_ws_url.clone(),
         lighter_catalog_service.clone(),
     );

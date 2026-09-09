@@ -11,6 +11,7 @@ use ferris_market_data_backend::{
         parse_binance_trades as parse_binance_trades_shared,
         parse_bybit_trades as parse_bybit_trades_shared,
         parse_hyperliquid_trades as parse_hyperliquid_trades_shared,
+        resolve_aster_ws_symbol as resolve_aster_ws_symbol_shared,
         resolve_binance_ws_symbol as resolve_binance_ws_symbol_shared,
         resolve_bybit_ws_symbol as resolve_bybit_ws_symbol_shared, WsTrade,
     },
@@ -21,7 +22,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::{
     cli::Config,
-    constants::{DEFAULT_BYBIT_LINEAR_WS_URL, DEFAULT_HYPERLIQUID_WS_URL},
+    constants::{DEFAULT_ASTER_WS_URL, DEFAULT_BYBIT_LINEAR_WS_URL, DEFAULT_HYPERLIQUID_WS_URL},
     view::{iso8601_millis, OhlcvRow, OrderBookSnapshot, TradeRow},
 };
 
@@ -48,6 +49,7 @@ pub(crate) fn resolved_ws_base_url(config: &Config) -> String {
 
     match config.exchange.as_str() {
         "binance" => BINANCE_FUTURES_WS_BASE_URL.to_string(),
+        "aster" => DEFAULT_ASTER_WS_URL.to_string(),
         "bybit" => DEFAULT_BYBIT_LINEAR_WS_URL.to_string(),
         _ => DEFAULT_HYPERLIQUID_WS_URL.to_string(),
     }
@@ -61,6 +63,34 @@ pub(crate) fn build_binance_trade_ws_endpoint(config: &Config) -> anyhow::Result
         "{}/{}",
         base_url.trim_end_matches('/'),
         stream_name
+    ))
+}
+pub(crate) fn build_aster_trade_ws_endpoint(config: &Config) -> anyhow::Result<String> {
+    let symbol = resolve_aster_ws_symbol(config)?;
+    Ok(format!(
+        "{}/{}@aggTrade",
+        resolved_ws_base_url(config).trim_end_matches('/'),
+        symbol.to_ascii_lowercase()
+    ))
+}
+
+pub(crate) fn build_aster_orderbook_ws_endpoint(config: &Config) -> anyhow::Result<String> {
+    let symbol = resolve_aster_ws_symbol(config)?;
+    Ok(format!(
+        "{}/{}@depth@100ms",
+        resolved_ws_base_url(config).trim_end_matches('/'),
+        symbol.to_ascii_lowercase()
+    ))
+}
+
+pub(crate) fn build_aster_ohlcv_ws_endpoint(config: &Config) -> anyhow::Result<String> {
+    let symbol = resolve_aster_ws_symbol(config)?;
+    let interval = to_aster_ws_interval(&config.ohlcv_timeframe)?;
+    Ok(format!(
+        "{}/{}@kline_{}",
+        resolved_ws_base_url(config).trim_end_matches('/'),
+        symbol.to_ascii_lowercase(),
+        interval
     ))
 }
 
@@ -142,6 +172,10 @@ pub(crate) fn to_binance_ws_interval(timeframe: &str) -> anyhow::Result<&'static
         ),
     }
 }
+pub(crate) fn to_aster_ws_interval(timeframe: &str) -> anyhow::Result<&'static str> {
+    to_binance_ws_interval(timeframe)
+        .map_err(|_| anyhow::anyhow!("unsupported Aster OHLCV timeframe `{timeframe}`"))
+}
 
 pub(crate) fn to_bybit_ws_interval(timeframe: &str) -> anyhow::Result<&'static str> {
     let trimmed = timeframe.trim();
@@ -171,6 +205,11 @@ pub(crate) fn to_bybit_ws_interval(timeframe: &str) -> anyhow::Result<&'static s
 
 pub(crate) fn resolve_binance_ws_symbol(config: &Config) -> anyhow::Result<String> {
     resolve_binance_ws_symbol_shared(&config.symbol, config.coin.as_deref())
+        .map_err(anyhow::Error::msg)
+}
+
+pub(crate) fn resolve_aster_ws_symbol(config: &Config) -> anyhow::Result<String> {
+    resolve_aster_ws_symbol_shared(&config.symbol, config.coin.as_deref())
         .map_err(anyhow::Error::msg)
 }
 

@@ -347,8 +347,8 @@ fn parse_quantity(raw: &str) -> Result<f64, String> {
 }
 
 #[async_trait]
-pub trait BinanceOrderBookSnapshotProvider: Send + Sync {
-    async fn fetch_binance_order_book_snapshot(
+pub trait OrderBookSnapshotProvider: Send + Sync {
+    async fn fetch_order_book_snapshot(
         &self,
         market_symbol: &str,
     ) -> Result<BinanceDepthSnapshot, String>;

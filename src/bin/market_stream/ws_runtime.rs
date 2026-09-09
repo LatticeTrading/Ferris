@@ -10,30 +10,32 @@ use crate::{
         OrderBookSnapshot, TradeDeduper,
     },
     ws_helpers::{
-        apply_bybit_orderbook_event, build_binance_ohlcv_ws_endpoint,
-        build_binance_orderbook_ws_endpoint, build_binance_trade_ws_endpoint,
-        build_bybit_ohlcv_ws_endpoint, build_bybit_orderbook_ws_endpoint,
-        build_bybit_trade_ws_endpoint, ensure_hyperliquid_ws, parse_binance_ohlcv_message,
-        parse_binance_orderbook_message, parse_binance_trades_message, parse_bybit_ohlcv_message,
-        parse_bybit_orderbook_message, parse_bybit_trades_message,
+        apply_bybit_orderbook_event, build_aster_ohlcv_ws_endpoint,
+        build_aster_orderbook_ws_endpoint, build_aster_trade_ws_endpoint,
+        build_binance_ohlcv_ws_endpoint, build_binance_orderbook_ws_endpoint,
+        build_binance_trade_ws_endpoint, build_bybit_ohlcv_ws_endpoint,
+        build_bybit_orderbook_ws_endpoint, build_bybit_trade_ws_endpoint, ensure_hyperliquid_ws,
+        parse_binance_ohlcv_message, parse_binance_orderbook_message, parse_binance_trades_message,
+        parse_bybit_ohlcv_message, parse_bybit_orderbook_message, parse_bybit_trades_message,
         parse_hyperliquid_orderbook_message, parse_hyperliquid_trades_message,
-        resolve_binance_ws_symbol, resolve_bybit_ws_symbol, resolve_hyperliquid_coin,
-        resolved_ws_base_url, send_bybit_ohlcv_subscription, send_bybit_orderbook_subscription,
-        send_bybit_trade_subscription, send_hyperliquid_subscription, to_bybit_ws_depth_levels,
-        to_bybit_ws_interval, ws_message_text,
+        resolve_aster_ws_symbol, resolve_binance_ws_symbol, resolve_bybit_ws_symbol,
+        resolve_hyperliquid_coin, resolved_ws_base_url, send_bybit_ohlcv_subscription,
+        send_bybit_orderbook_subscription, send_bybit_trade_subscription,
+        send_hyperliquid_subscription, to_bybit_ws_depth_levels, to_bybit_ws_interval,
+        ws_message_text,
     },
 };
 use anyhow::{bail, Context};
 use ferris_market_data_backend::{
     binance_orderbook::{
-        parse_binance_depth_event, BinanceEventOutcome, BinanceOrderBookSnapshotProvider,
-        BinanceOrderBookSync, BinanceSnapshotOutcome, BINANCE_PARTIAL_DEPTH_THRESHOLD,
+        parse_binance_depth_event, BinanceEventOutcome, BinanceOrderBookSync,
+        BinanceSnapshotOutcome, OrderBookSnapshotProvider, BINANCE_PARTIAL_DEPTH_THRESHOLD,
     },
     bybit_full_orderbook::{
         fetch_bybit_full_snapshot, parse_bybit_full_delta, BufferDeltaOutcome, BybitFullBookSync,
         SnapshotSyncOutcome, BYBIT_FULL_DEPTH_THRESHOLD, BYBIT_REST_BASE_URL,
     },
-    exchanges::binance::BinanceExchange,
+    exchanges::{aster::AsterExchange, binance::BinanceExchange},
 };
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
@@ -42,10 +44,10 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 pub(crate) async fn run_trades_stream_ws(config: &Config) -> anyhow::Result<()> {
     match config.exchange.as_str() {
         "hyperliquid" => run_hyperliquid_trades_stream_ws(config).await,
-        "binance" => run_binance_trades_stream_ws(config).await,
+        "binance" | "aster" => run_binance_trades_stream_ws(config).await,
         "bybit" => run_bybit_trades_stream_ws(config).await,
         other => bail!(
-            "ws transport for trades supports exchange=hyperliquid, exchange=binance, or exchange=bybit (got `{other}`)"
+            "ws transport for trades supports exchange=hyperliquid, exchange=binance, exchange=aster, or exchange=bybit (got `{other}`)"
         ),
     }
 }
@@ -129,7 +131,11 @@ async fn run_hyperliquid_trades_stream_ws(config: &Config) -> anyhow::Result<()>
 }
 
 async fn run_binance_trades_stream_ws(config: &Config) -> anyhow::Result<()> {
-    let ws_endpoint = build_binance_trade_ws_endpoint(config)?;
+    let ws_endpoint = if config.exchange == "aster" {
+        build_aster_trade_ws_endpoint(config)?
+    } else {
+        build_binance_trade_ws_endpoint(config)?
+    };
 
     let (mut stream, _) = connect_async(&ws_endpoint)
         .await
@@ -284,27 +290,32 @@ async fn run_bybit_trades_stream_ws(config: &Config) -> anyhow::Result<()> {
 pub(crate) async fn run_orderbook_stream_ws(config: &Config) -> anyhow::Result<()> {
     match config.exchange.as_str() {
         "hyperliquid" => run_hyperliquid_orderbook_stream_ws(config).await,
-        "binance" => run_binance_orderbook_stream_ws(config).await,
+        "binance" | "aster" => run_binance_orderbook_stream_ws(config).await,
         "bybit" => run_bybit_orderbook_stream_ws(config).await,
-        other => bail!(
-            "ws transport for orderbook supports exchange=hyperliquid, exchange=binance, or exchange=bybit (got `{other}`)"
-        ),
+        other => bail!("ws transport for orderbook supports exchange=hyperliquid, exchange=binance, exchange=aster, or exchange=bybit (got `{other}`)"),
     }
 }
 
 pub(crate) async fn run_ohlcv_stream_ws(config: &Config) -> anyhow::Result<()> {
     match config.exchange.as_str() {
-        "binance" => run_binance_ohlcv_stream_ws(config).await,
+        "binance" | "aster" => run_binance_ohlcv_stream_ws(config).await,
         "bybit" => run_bybit_ohlcv_stream_ws(config).await,
-        other => bail!(
-            "ws transport for ohlcv currently supports exchange=binance or exchange=bybit (got `{other}`)"
-        ),
+        other => bail!("ws transport for ohlcv currently supports exchange=binance, exchange=aster, or exchange=bybit (got `{other}`)"),
     }
 }
 
 async fn run_binance_ohlcv_stream_ws(config: &Config) -> anyhow::Result<()> {
-    let ws_endpoint = build_binance_ohlcv_ws_endpoint(config)?;
-    let display_symbol = resolve_binance_ws_symbol(config)?;
+    let (ws_endpoint, display_symbol) = if config.exchange == "aster" {
+        (
+            build_aster_ohlcv_ws_endpoint(config)?,
+            resolve_aster_ws_symbol(config)?,
+        )
+    } else {
+        (
+            build_binance_ohlcv_ws_endpoint(config)?,
+            resolve_binance_ws_symbol(config)?,
+        )
+    };
 
     let (mut stream, _) = connect_async(&ws_endpoint)
         .await
@@ -630,7 +641,7 @@ async fn run_hyperliquid_orderbook_stream_ws(config: &Config) -> anyhow::Result<
 }
 
 async fn run_binance_orderbook_stream_ws(config: &Config) -> anyhow::Result<()> {
-    if config.orderbook_levels <= BINANCE_PARTIAL_DEPTH_THRESHOLD {
+    if config.exchange != "aster" && config.orderbook_levels <= BINANCE_PARTIAL_DEPTH_THRESHOLD {
         return run_binance_partial_orderbook_stream_ws(config).await;
     }
 
@@ -647,23 +658,29 @@ async fn run_binance_orderbook_stream_ws(config: &Config) -> anyhow::Result<()> 
         >,
     >;
 
-    let ws_endpoint = build_binance_orderbook_ws_endpoint(config)?;
-    let market_symbol = resolve_binance_ws_symbol(config)?;
+    let (ws_endpoint, market_symbol) = if config.exchange == "aster" {
+        (
+            build_aster_orderbook_ws_endpoint(config)?,
+            resolve_aster_ws_symbol(config)?,
+        )
+    } else {
+        (
+            build_binance_orderbook_ws_endpoint(config)?,
+            resolve_binance_ws_symbol(config)?,
+        )
+    };
     let (mut stream, _) = connect_async(&ws_endpoint)
         .await
         .with_context(|| format!("failed to connect websocket {ws_endpoint}"))?;
-    let provider: Arc<dyn BinanceOrderBookSnapshotProvider> = Arc::new(
-        BinanceExchange::new(BINANCE_SNAPSHOT_TIMEOUT_MS)
-            .map_err(|err| anyhow::anyhow!(err.to_string()))?,
-    );
+    let provider: Arc<dyn OrderBookSnapshotProvider> = if config.exchange == "aster" {
+        Arc::new(AsterExchange::new(BINANCE_SNAPSHOT_TIMEOUT_MS)?)
+    } else {
+        Arc::new(BinanceExchange::new(BINANCE_SNAPSHOT_TIMEOUT_MS)?)
+    };
     let mut snapshot_request: Option<SnapshotFuture> = Some({
         let provider = provider.clone();
         let market_symbol = market_symbol.clone();
-        Box::pin(async move {
-            provider
-                .fetch_binance_order_book_snapshot(&market_symbol)
-                .await
-        })
+        Box::pin(async move { provider.fetch_order_book_snapshot(&market_symbol).await })
     });
     let mut sync = BinanceOrderBookSync::new();
     let mut renderer = OrderBookRenderer::new()?;
@@ -673,7 +690,7 @@ async fn run_binance_orderbook_stream_ws(config: &Config) -> anyhow::Result<()> 
         iteration,
         started_at.elapsed(),
         &config.symbol,
-        "synchronizing Binance full-depth orderbook",
+        "synchronizing full-depth orderbook",
     ))?;
 
     let mut stop_check = tokio::time::interval(Duration::from_millis(50));
@@ -708,7 +725,7 @@ async fn run_binance_orderbook_stream_ws(config: &Config) -> anyhow::Result<()> 
                         let snapshot_symbol = market_symbol.clone();
                         snapshot_request = Some(Box::pin(async move {
                             snapshot_provider
-                                .fetch_binance_order_book_snapshot(&snapshot_symbol)
+                                .fetch_order_book_snapshot(&snapshot_symbol)
                                 .await
                         }));
                     }
@@ -741,7 +758,7 @@ async fn run_binance_orderbook_stream_ws(config: &Config) -> anyhow::Result<()> 
                                         let snapshot_symbol = market_symbol.clone();
                                         snapshot_request = Some(Box::pin(async move {
                                             snapshot_provider
-                                                .fetch_binance_order_book_snapshot(&snapshot_symbol)
+                                                .fetch_order_book_snapshot(&snapshot_symbol)
                                                 .await
                                         }));
                                     }
@@ -754,7 +771,7 @@ async fn run_binance_orderbook_stream_ws(config: &Config) -> anyhow::Result<()> 
                                 let snapshot_symbol = market_symbol.clone();
                                 snapshot_request = Some(Box::pin(async move {
                                     snapshot_provider
-                                        .fetch_binance_order_book_snapshot(&snapshot_symbol)
+                                        .fetch_order_book_snapshot(&snapshot_symbol)
                                         .await
                                 }));
                             }

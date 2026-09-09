@@ -6,12 +6,10 @@ Planning and delivery tracking lives in `ROADMAP.md`.
 
 Frontend integration guidance lives in `INTEGRATION_README.md`.
 
-This first version focuses on:
-
 - unified endpoint shapes (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`, `fetchMarkets`)
 - backend websocket fanout for realtime channels (`GET /v1/ws`)
 - pluggable exchange adapter architecture
-- market-data support for `hyperliquid`, `binance`, and `bybit`
+- market-data support for `hyperliquid`, `binance`, `bybit`, and `aster` futures
 - one upstream websocket stream per active topic with multi-client broadcast
 - background websocket trade collector with in-memory ring buffer for deeper snapshot history
 
@@ -42,13 +40,15 @@ Frontend apps (including Electron and web frontends) often cannot directly use s
 - Realtime endpoint:
   - `GET /v1/ws` (websocket subscribe/unsubscribe for realtime `trades`, `orderbook`, `ohlcv`)
 - Realtime channel support:
-  - `trades`: `hyperliquid`, `binance`, `bybit`
-  - `orderbook`: `hyperliquid`, `binance`, `bybit`
-  - `ohlcv`: `binance`, `bybit`
+  - `trades`: `hyperliquid`, `binance`, `bybit`, `aster`
+  - `orderbook`: `hyperliquid`, `binance`, `bybit`, `aster`
+  - `ohlcv`: `binance`, `bybit`, `aster`
 - exchange supported:
   - `hyperliquid` (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`, `fetchMarkets`)
   - `binance` (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`, `fetchMarkets`)
   - `bybit` (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`, `fetchMarkets`)
+  - `aster` futures/perpetual markets (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`, `fetchMarkets`)
+- Aster is futures-only; its canonical market symbols are `BASE/QUOTE` (for example `BTC/USDT`), while request and realtime symbols may use `BASE/QUOTE:QUOTE` (for example `BTC/USDT:USDT`). Aster also accepts the optional `params.coin` shortcut.
 - market-data only (no private trading endpoints yet)
 
 ## API
@@ -255,7 +255,9 @@ Server order book update:
 
 ### Realtime OHLCV Stream (WebSocket)
 
-Supported exchanges: `binance`, `bybit`.
+Supported exchanges: `binance`, `bybit`, `aster`.
+
+Aster supports these futures intervals: `1m`, `3m`, `5m`, `15m`, `30m`, `1h`, `2h`, `4h`, `6h`, `8h`, `12h`, `1d`, `3d`, `1w`, and `1M`.
 
 Hyperliquid realtime OHLCV is not enabled yet on websocket fanout; use `POST /v1/fetchOHLCV` for Hyperliquid candles.
 
@@ -608,13 +610,19 @@ This keeps the frontend contract stable while exchange integrations evolve indep
 
 Hyperliquid `recentTrades` returns only a short recent window. This backend still queries `recentTrades`, but also runs a websocket collector (`trades` channel) and stores data in an in-memory per-coin ring buffer. That allows `fetchTrades` to serve deeper recent history than the raw upstream REST endpoint alone, while `GET /v1/ws` provides shared realtime fanout for market-data channels.
 ### Binance realtime order books
-
 Binance realtime order books use USDⓈ-M futures symbols only. Requests with `levels`, `depth`, or `limit` up to 20 retain the partial depth streams (`5`, `10`, or `20`). Requests from 21 through 1,000 share one futures diff stream and one REST snapshot requested at `limit=1000`; the backend maintains the synchronized top-1,000 book, returns each subscriber's requested top N levels, and carries the latest Binance `u` update ID in `nonce`.
+
+### Aster futures realtime streams
+Aster supports perpetual futures market data only. REST order-book `limit` and realtime `params.levels`, `depth`, or `limit` are clamped to `1..=1000`. All display depths share one synchronized diff stream per market, with each subscriber receiving its requested top N and the latest update ID in `nonce`. The optional `params.coin` accepts a base asset (`BTC` -> `BTCUSDT`) or raw pair (`BTCUSD1`). Raw symbol suffixes `USDT`, `USD1`, and `U` are supported; explicit slash symbols are preserved in trade/order-book responses.
+
+REST trades default to 100 rows (maximum 1000); OHLCV defaults to 200 candles (maximum 1500). `since` filters trades/candles, and OHLCV also accepts `params.until` or `params.endTime`. Market catalogs include only `PERPETUAL` contracts; `includeInactive` includes non-trading perpetuals, not pending rows without a contract type.
+
+For implementation purposes, Aster REST uses `https://fapi.asterdex.com` and websocket streams use `wss://fstream.asterdex.com/ws`. These are backend upstream details; frontend clients always connect through this backend's `/v1/ws` endpoint.
 
 The terminal viewer supports the same limits. For example:
 
 ```text
-cargo run --bin market_stream -- orderbook --exchange binance --symbol BTC/USDT:USDT --levels 1000 --iterations 3
+cargo run --bin market_stream -- orderbook --exchange aster --symbol BTC/USDT:USDT --levels 5 --iterations 1
 ```
 
-Terminal order-book maxima are explicit: Hyperliquid 20, Binance USDⓈ-M futures 1,000, and Bybit 10,000. Binance Spot, Coin-M futures, and unsupported 5,000-level paths are not included.
+Terminal order-book maxima are explicit: Hyperliquid 20, Binance USDⓈ-M futures 1,000, Aster futures 1,000, and Bybit 10,000. Binance Spot, Coin-M futures, and unsupported 5,000-level paths are not included.

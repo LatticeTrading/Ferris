@@ -16,7 +16,7 @@ use serde_json::Value;
 
 use crate::{
     binance_orderbook::{
-        BinanceDepthLevel, BinanceDepthSnapshot, BinanceOrderBookSnapshotProvider,
+        BinanceDepthLevel, BinanceDepthSnapshot, OrderBookSnapshotProvider,
         BINANCE_MAX_ORDERBOOK_LEVELS,
     },
     exchanges::traits::{ExchangeError, MarketDataExchange},
@@ -271,8 +271,8 @@ impl BinanceExchange {
 }
 
 #[async_trait]
-impl BinanceOrderBookSnapshotProvider for BinanceExchange {
-    async fn fetch_binance_order_book_snapshot(
+impl OrderBookSnapshotProvider for BinanceExchange {
+    async fn fetch_order_book_snapshot(
         &self,
         market_symbol: &str,
     ) -> Result<BinanceDepthSnapshot, String> {

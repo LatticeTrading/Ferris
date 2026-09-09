@@ -42,10 +42,9 @@ If you only have an HTTP base URL string, derive WS URL like this:
   - `GET /v1/ws`
 
 Supported realtime channels:
-
-- `trades`: `hyperliquid`, `binance`, `bybit`
-- `orderbook`: `hyperliquid`, `binance`, `bybit`
-- `ohlcv`: `binance`, `bybit`
+- `trades`: `hyperliquid`, `binance`, `bybit`, `aster`
+- `orderbook`: `hyperliquid`, `binance`, `bybit`, `aster`
+- `ohlcv`: `binance`, `bybit`, `aster`
 
 ### Fetch Markets (Symbol Catalog)
 
@@ -90,12 +89,11 @@ Response:
 }
 ```
 
-Important frontend contract notes:
-
 - `symbol` is always canonical `BASE/QUOTE` uppercase.
 - `symbol` never includes settlement suffix (`:USDT`, `:BTC`) on this endpoint.
 - `type` is normalized to one of: `spot | future | perp | option`.
 - `includeInactive` defaults to `false` (active markets only).
+- Aster markets are perpetual futures only; use canonical symbols such as `BTC/USDT`.
 - For Bybit, if `params.category` is omitted backend infers/combines categories and still includes `info.category` per market row.
 
 Error payload shape for this endpoint:
@@ -181,8 +179,6 @@ Include all of these for `subscribe`/`unsubscribe`:
 - `symbol`: required
 - `params`: object or null
 
-Exchange-specific useful params:
-
 - Hyperliquid:
   - `params.coin` optional (otherwise inferred from `symbol`)
 - Binance USDⓈ-M futures only:
@@ -190,11 +186,18 @@ Exchange-specific useful params:
   - order-book `levels`, `depth`, and `limit` values are clamped to `1..=1000`
   - values up to 20 use partial streams; values 21..=1000 share one futures diff stream synchronized with a REST `limit=1000` snapshot
   - deep updates are full CCXT-like snapshots limited to the requested top N and carry the latest Binance `u` in non-null `nonce`
+- Aster futures/perpetuals:
+  - `params.coin` optional shortcut: base asset `BTC` resolves to `BTCUSDT`; raw pairs such as `BTCUSD1` are also accepted
+  - canonical markets use `BASE/QUOTE`; request and realtime symbols may use `BASE/QUOTE:QUOTE`
+  - raw symbol quote suffixes `USDT`, `USD1`, and `U` are supported
+  - order-book `levels`, `depth`, and `limit` values are clamped to `1..=1000`
+  - all display depths share one synchronized upstream diff stream per market; updates contain requested top N levels and the latest `u` as `nonce`
+  - supported OHLCV intervals: `1m`, `3m`, `5m`, `15m`, `30m`, `1h`, `2h`, `4h`, `6h`, `8h`, `12h`, `1d`, `3d`, `1w`, `1M`
+  - implementation upstreams are REST `https://fapi.asterdex.com` and websocket `wss://fstream.asterdex.com/ws`; frontend clients use this backend's `/v1/ws`
 - Bybit:
   - `params.coin` optional shortcut
   - `params.category` optional, default `linear`
   - valid `category`: `spot`, `linear`, `inverse`, `option`
-
 Channel-specific params:
 - Order book:
   - `params.levels`, `depth`, or `limit` optional; backend clamps/maps per exchange
@@ -214,6 +217,14 @@ If you subscribe with `channel="ohlcv"` and `exchange="hyperliquid"`, backend re
 ```
 
 Use `POST /v1/fetchOHLCV` for Hyperliquid candles (bootstrap/refresh path).
+### Aster Terminal Example
+
+The terminal viewer supports Aster perpetual futures market data:
+
+```text
+cargo run --bin market_stream -- orderbook --exchange aster --symbol BTC/USDT:USDT --levels 5 --iterations 1
+```
+
 
 Important: use the `topic` returned in `subscribed` ack as your canonical local key when possible.
 

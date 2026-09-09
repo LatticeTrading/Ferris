@@ -1,6 +1,8 @@
 use serde_json::Value;
 
 pub const BINANCE_QUOTES: &[&str] = &["USDT", "USDC", "BUSD", "FDUSD", "USDS"];
+pub const ASTER_QUOTES: &[&str] = &["USDT", "USD1", "U"];
+pub const ASTER_WS_BASE_URL: &str = "wss://fstream.asterdex.com/ws";
 pub const BYBIT_QUOTES: &[&str] = &["USDT", "USDC", "USD", "BTC", "ETH", "EUR"];
 
 #[derive(Debug, Clone)]
@@ -272,6 +274,28 @@ pub fn resolve_binance_ws_symbol(
     normalize_market_symbol(symbol, "Binance")
 }
 
+pub fn resolve_aster_ws_symbol(
+    symbol: &str,
+    coin_override: Option<&str>,
+) -> Result<String, String> {
+    if let Some(coin) = coin_override {
+        let asset = sanitize_asset(coin, "Aster")?;
+        if split_market_symbol(&asset, ASTER_QUOTES).is_some() {
+            return Ok(asset);
+        }
+        return Ok(format!("{asset}USDT"));
+    }
+    let market = if symbol.contains('/') {
+        normalize_market_symbol(symbol, "Aster")?
+    } else {
+        sanitize_asset(symbol.split(':').next().unwrap_or_default(), "Aster")?
+    };
+    if split_market_symbol(&market, ASTER_QUOTES).is_none() {
+        return Err(format!("invalid Aster symbol `{symbol}`"));
+    }
+    Ok(market)
+}
+
 pub fn resolve_bybit_ws_symbol(
     symbol: &str,
     coin_override: Option<&str>,
@@ -281,10 +305,8 @@ pub fn resolve_bybit_ws_symbol(
         if has_bybit_quote_suffix(&asset) {
             return Ok(asset);
         }
-
         return Ok(format!("{asset}USDT"));
     }
-
     normalize_market_symbol(symbol, "Bybit")
 }
 

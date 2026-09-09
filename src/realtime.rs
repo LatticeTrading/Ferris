@@ -14,8 +14,8 @@ use tokio_tungstenite::{connect_async, tungstenite::Message as TungsteniteMessag
 use crate::{
     binance_orderbook::{
         parse_binance_depth_event, parse_binance_partial_orderbook,
-        resolve_binance_orderbook_stream, BinanceEventOutcome, BinanceOrderBookSnapshotProvider,
-        BinanceOrderBookStreamKind, BinanceOrderBookSync, BinanceSnapshotOutcome,
+        resolve_binance_orderbook_stream, BinanceEventOutcome, BinanceOrderBookStreamKind,
+        BinanceOrderBookSync, BinanceSnapshotOutcome, OrderBookSnapshotProvider,
         BINANCE_FUTURES_WS_BASE_URL, BINANCE_MAX_ORDERBOOK_LEVELS,
     },
     bybit_full_orderbook::{
@@ -30,11 +30,11 @@ use crate::{
         parse_bybit_trades as parse_bybit_trades_shared, parse_f64_lossy as parse_f64_lossy_shared,
         parse_hyperliquid_trades as parse_hyperliquid_trades_shared,
         parse_lighter_trades as parse_lighter_trades_shared,
-        parse_u64_lossy as parse_u64_lossy_shared,
+        parse_u64_lossy as parse_u64_lossy_shared, resolve_aster_ws_symbol,
         resolve_binance_ws_symbol as resolve_binance_ws_symbol_shared,
         resolve_bybit_ws_symbol as resolve_bybit_ws_symbol_shared,
-        resolve_public_symbol as resolve_public_symbol_shared, WsTrade, BINANCE_QUOTES,
-        BYBIT_QUOTES,
+        resolve_public_symbol as resolve_public_symbol_shared, WsTrade, ASTER_QUOTES,
+        ASTER_WS_BASE_URL, BINANCE_QUOTES, BYBIT_QUOTES,
     },
 };
 
@@ -238,6 +238,9 @@ enum UpstreamTradesStream {
     Binance {
         ws_endpoint: String,
     },
+    Aster {
+        ws_endpoint: String,
+    },
     Bybit {
         ws_endpoint: String,
         subscribe_topic: String,
@@ -286,6 +289,7 @@ impl TradesUpstreamRunner for RealTradesUpstreamRunner {
         match topic.exchange.as_str() {
             "hyperliquid" => resolve_hyperliquid_topic(topic, &self.hyperliquid_ws_endpoint),
             "binance" => resolve_binance_topic(topic),
+            "aster" => resolve_aster_topic(topic),
             "bybit" => resolve_bybit_topic(topic),
             "lighterxyz" => {
                 resolve_lighter_trades_topic(
@@ -352,6 +356,7 @@ async fn run_single_connection(
     let ws_endpoint = match &topic.stream {
         UpstreamTradesStream::Hyperliquid { ws_endpoint, .. }
         | UpstreamTradesStream::Binance { ws_endpoint }
+        | UpstreamTradesStream::Aster { ws_endpoint }
         | UpstreamTradesStream::Bybit { ws_endpoint, .. }
         | UpstreamTradesStream::Lighter { ws_endpoint, .. } => ws_endpoint.as_str(),
     };
@@ -396,7 +401,7 @@ async fn run_single_connection(
                 };
             }
         }
-        UpstreamTradesStream::Binance { .. } => {}
+        UpstreamTradesStream::Binance { .. } | UpstreamTradesStream::Aster { .. } => {}
     }
 
     loop {
@@ -449,7 +454,9 @@ fn forward_trades(
         UpstreamTradesStream::Hyperliquid { .. } => {
             parse_hyperliquid_trades_message(payload, symbol)
         }
-        UpstreamTradesStream::Binance { .. } => parse_binance_trades_message(payload, symbol),
+        UpstreamTradesStream::Binance { .. } | UpstreamTradesStream::Aster { .. } => {
+            parse_binance_trades_message(payload, symbol)
+        }
         UpstreamTradesStream::Bybit { .. } => parse_bybit_trades_message(payload, symbol),
         UpstreamTradesStream::Lighter { .. } => parse_lighter_trades_message(payload, symbol),
     };
@@ -502,6 +509,20 @@ fn resolve_binance_topic(topic: TradesTopic) -> Result<ResolvedTradesTopic, Stri
             params: topic.params,
         },
         stream: UpstreamTradesStream::Binance { ws_endpoint },
+    })
+}
+
+fn resolve_aster_topic(topic: TradesTopic) -> Result<ResolvedTradesTopic, String> {
+    let coin = extract_non_empty_string(&topic.params, "coin");
+    let market = resolve_aster_ws_symbol(&topic.symbol, coin.as_deref())?;
+    let symbol = resolve_public_symbol_shared(&topic.symbol, &market, ASTER_QUOTES);
+    let stream_symbol = market.to_ascii_lowercase();
+    Ok(ResolvedTradesTopic {
+        key: format!("aster|trades|symbol:{stream_symbol}"),
+        topic: TradesTopic { symbol, ..topic },
+        stream: UpstreamTradesStream::Aster {
+            ws_endpoint: format!("{ASTER_WS_BASE_URL}/{stream_symbol}@aggTrade"),
+        },
     })
 }
 
@@ -791,13 +812,15 @@ struct ActiveOrderBookTopic {
 impl OrderBookTopicManager {
     pub fn new(
         hyperliquid_base_url: String,
-        binance_snapshot_provider: Arc<dyn BinanceOrderBookSnapshotProvider>,
+        binance_snapshot_provider: Arc<dyn OrderBookSnapshotProvider>,
+        aster_snapshot_provider: Arc<dyn OrderBookSnapshotProvider>,
         lighter_ws_endpoint: String,
         lighter_catalog_service: Arc<LighterMarketCatalogService>,
     ) -> Self {
         let runner = Arc::new(RealOrderBookUpstreamRunner::new(
             hyperliquid_base_url,
             binance_snapshot_provider,
+            aster_snapshot_provider,
             lighter_ws_endpoint,
             lighter_catalog_service,
         ));
@@ -903,6 +926,10 @@ enum UpstreamOrderBookStream {
         ws_endpoint: String,
         market_symbol: String,
     },
+    Aster {
+        ws_endpoint: String,
+        market_symbol: String,
+    },
     BybitLimited {
         ws_endpoint: String,
         subscribe_topic: String,
@@ -934,7 +961,8 @@ trait OrderBookUpstreamRunner: Send + Sync {
 struct RealOrderBookUpstreamRunner {
     hyperliquid_ws_endpoint: String,
     bybit_http_client: reqwest::Client,
-    binance_snapshot_provider: Arc<dyn BinanceOrderBookSnapshotProvider>,
+    binance_snapshot_provider: Arc<dyn OrderBookSnapshotProvider>,
+    aster_snapshot_provider: Arc<dyn OrderBookSnapshotProvider>,
     lighter_ws_endpoint: String,
     lighter_catalog_service: Arc<LighterMarketCatalogService>,
 }
@@ -942,7 +970,8 @@ struct RealOrderBookUpstreamRunner {
 impl RealOrderBookUpstreamRunner {
     fn new(
         hyperliquid_base_url: String,
-        binance_snapshot_provider: Arc<dyn BinanceOrderBookSnapshotProvider>,
+        binance_snapshot_provider: Arc<dyn OrderBookSnapshotProvider>,
+        aster_snapshot_provider: Arc<dyn OrderBookSnapshotProvider>,
         lighter_ws_endpoint: String,
         lighter_catalog_service: Arc<LighterMarketCatalogService>,
     ) -> Self {
@@ -950,6 +979,7 @@ impl RealOrderBookUpstreamRunner {
             hyperliquid_ws_endpoint: to_hyperliquid_ws_url(&hyperliquid_base_url),
             bybit_http_client: reqwest::Client::new(),
             binance_snapshot_provider,
+            aster_snapshot_provider,
             lighter_ws_endpoint,
             lighter_catalog_service,
         }
@@ -964,6 +994,7 @@ impl OrderBookUpstreamRunner for RealOrderBookUpstreamRunner {
                 resolve_hyperliquid_orderbook_topic(topic, &self.hyperliquid_ws_endpoint)
             }
             "binance" => resolve_binance_orderbook_topic(topic),
+            "aster" => resolve_aster_orderbook_topic(topic),
             "bybit" => resolve_bybit_orderbook_topic(topic),
             "lighterxyz" => {
                 resolve_lighter_orderbook_topic(
@@ -996,7 +1027,11 @@ impl OrderBookUpstreamRunner for RealOrderBookUpstreamRunner {
                 &sender,
                 &mut shutdown,
                 &self.bybit_http_client,
-                self.binance_snapshot_provider.clone(),
+                if matches!(topic.stream, UpstreamOrderBookStream::Aster { .. }) {
+                    self.aster_snapshot_provider.clone()
+                } else {
+                    self.binance_snapshot_provider.clone()
+                },
             )
             .await;
 
@@ -1028,12 +1063,13 @@ async fn run_single_orderbook_connection(
     sender: &broadcast::Sender<Arc<CcxtOrderBook>>,
     shutdown: &mut watch::Receiver<bool>,
     bybit_http_client: &reqwest::Client,
-    binance_snapshot_provider: Arc<dyn BinanceOrderBookSnapshotProvider>,
+    binance_snapshot_provider: Arc<dyn OrderBookSnapshotProvider>,
 ) -> ConnectionOutcome {
     let ws_endpoint = match &topic.stream {
         UpstreamOrderBookStream::Hyperliquid { ws_endpoint, .. }
         | UpstreamOrderBookStream::BinancePartial { ws_endpoint }
         | UpstreamOrderBookStream::BinanceDiff { ws_endpoint, .. }
+        | UpstreamOrderBookStream::Aster { ws_endpoint, .. }
         | UpstreamOrderBookStream::BybitLimited { ws_endpoint, .. }
         | UpstreamOrderBookStream::BybitFull { ws_endpoint, .. }
         | UpstreamOrderBookStream::Lighter { ws_endpoint, .. } => ws_endpoint.as_str(),
@@ -1084,7 +1120,8 @@ async fn run_single_orderbook_connection(
             }
         }
         UpstreamOrderBookStream::BinancePartial { .. } => {}
-        UpstreamOrderBookStream::BinanceDiff { market_symbol, .. } => {
+        UpstreamOrderBookStream::BinanceDiff { market_symbol, .. }
+        | UpstreamOrderBookStream::Aster { market_symbol, .. } => {
             return run_binance_diff_orderbook_connection(
                 stream,
                 topic,
@@ -1204,7 +1241,7 @@ async fn run_binance_diff_orderbook_connection(
     topic: &ResolvedOrderBookTopic,
     sender: &broadcast::Sender<Arc<CcxtOrderBook>>,
     shutdown: &mut watch::Receiver<bool>,
-    snapshot_provider: Arc<dyn BinanceOrderBookSnapshotProvider>,
+    snapshot_provider: Arc<dyn OrderBookSnapshotProvider>,
     market_symbol: &str,
 ) -> ConnectionOutcome {
     use std::{future::Future, pin::Pin};
@@ -1220,11 +1257,7 @@ async fn run_binance_diff_orderbook_connection(
     let mut snapshot_request: Option<SnapshotFuture> = Some({
         let provider = snapshot_provider.clone();
         let market_symbol = market_symbol.to_string();
-        Box::pin(async move {
-            provider
-                .fetch_binance_order_book_snapshot(&market_symbol)
-                .await
-        })
+        Box::pin(async move { provider.fetch_order_book_snapshot(&market_symbol).await })
     });
 
     loop {
@@ -1256,7 +1289,7 @@ async fn run_binance_diff_orderbook_connection(
                             let market_symbol = market_symbol.to_string();
                             snapshot_request = Some(Box::pin(async move {
                                 provider
-                                    .fetch_binance_order_book_snapshot(&market_symbol)
+                                    .fetch_order_book_snapshot(&market_symbol)
                                     .await
                             }));
                         }
@@ -1313,7 +1346,7 @@ async fn run_binance_diff_orderbook_connection(
                                 let market_symbol = market_symbol.to_string();
                                 snapshot_request = Some(Box::pin(async move {
                                     provider
-                                        .fetch_binance_order_book_snapshot(&market_symbol)
+                                        .fetch_order_book_snapshot(&market_symbol)
                                         .await
                                 }));
                             }
@@ -1326,7 +1359,7 @@ async fn run_binance_diff_orderbook_connection(
                         let market_symbol = market_symbol.to_string();
                         snapshot_request = Some(Box::pin(async move {
                             provider
-                                .fetch_binance_order_book_snapshot(&market_symbol)
+                                .fetch_order_book_snapshot(&market_symbol)
                                 .await
                         }));
                     }
@@ -1451,7 +1484,9 @@ fn parse_orderbook_update(
             symbol,
             levels_limit,
         )),
-        UpstreamOrderBookStream::BinanceDiff { .. } => Ok(None),
+        UpstreamOrderBookStream::BinanceDiff { .. } | UpstreamOrderBookStream::Aster { .. } => {
+            Ok(None)
+        }
         UpstreamOrderBookStream::BybitLimited { .. } => {
             let Some(event) = parse_bybit_orderbook_message(payload) else {
                 return Ok(None);
@@ -1553,6 +1588,24 @@ fn resolve_binance_orderbook_topic(
         stream,
         levels_limit,
         display_levels_limit: resolved.display_levels,
+    })
+}
+
+fn resolve_aster_orderbook_topic(topic: OrderBookTopic) -> Result<ResolvedOrderBookTopic, String> {
+    let coin = extract_non_empty_string(&topic.params, "coin");
+    let market_symbol = resolve_aster_ws_symbol(&topic.symbol, coin.as_deref())?;
+    let symbol = resolve_public_symbol_shared(&topic.symbol, &market_symbol, ASTER_QUOTES);
+    let stream_symbol = market_symbol.to_ascii_lowercase();
+    let display_levels_limit = resolve_orderbook_levels(&topic.params).clamp(1, 1_000);
+    Ok(ResolvedOrderBookTopic {
+        key: format!("aster|orderbook|symbol:{stream_symbol}|depth:diff1000"),
+        topic: OrderBookTopic { symbol, ..topic },
+        stream: UpstreamOrderBookStream::Aster {
+            ws_endpoint: format!("{ASTER_WS_BASE_URL}/{stream_symbol}@depth@100ms"),
+            market_symbol,
+        },
+        levels_limit: 1_000,
+        display_levels_limit,
     })
 }
 
@@ -2238,6 +2291,9 @@ enum UpstreamOhlcvStream {
     Binance {
         ws_endpoint: String,
     },
+    Aster {
+        ws_endpoint: String,
+    },
     Bybit {
         ws_endpoint: String,
         subscribe_topic: String,
@@ -2269,6 +2325,7 @@ impl OhlcvUpstreamRunner for RealOhlcvUpstreamRunner {
     async fn resolve(&self, topic: OhlcvTopic) -> Result<ResolvedOhlcvTopic, String> {
         match topic.exchange.as_str() {
             "binance" => resolve_binance_ohlcv_topic(topic),
+            "aster" => resolve_aster_ohlcv_topic(topic),
             "bybit" => resolve_bybit_ohlcv_topic(topic),
             "hyperliquid" => {
                 Err("exchange `hyperliquid` is not supported for realtime ohlcv yet".to_string())
@@ -2325,6 +2382,7 @@ async fn run_single_ohlcv_connection(
 ) -> ConnectionOutcome {
     let ws_endpoint = match &topic.stream {
         UpstreamOhlcvStream::Binance { ws_endpoint }
+        | UpstreamOhlcvStream::Aster { ws_endpoint }
         | UpstreamOhlcvStream::Bybit { ws_endpoint, .. } => ws_endpoint.as_str(),
     };
 
@@ -2399,7 +2457,9 @@ fn forward_ohlcv_update(
     sender: &broadcast::Sender<Arc<Vec<CcxtOhlcv>>>,
 ) {
     let candles = match stream {
-        UpstreamOhlcvStream::Binance { .. } => parse_binance_ohlcv_message(payload),
+        UpstreamOhlcvStream::Binance { .. } | UpstreamOhlcvStream::Aster { .. } => {
+            parse_binance_ohlcv_message(payload)
+        }
         UpstreamOhlcvStream::Bybit { .. } => parse_bybit_ohlcv_message(payload),
     };
 
@@ -2435,6 +2495,23 @@ fn resolve_binance_ohlcv_topic(topic: OhlcvTopic) -> Result<ResolvedOhlcvTopic, 
             params: topic.params,
         },
         stream: UpstreamOhlcvStream::Binance { ws_endpoint },
+    })
+}
+
+fn resolve_aster_ohlcv_topic(topic: OhlcvTopic) -> Result<ResolvedOhlcvTopic, String> {
+    let coin = extract_non_empty_string(&topic.params, "coin");
+    let market = resolve_aster_ws_symbol(&topic.symbol, coin.as_deref())?;
+    let symbol = resolve_public_symbol_shared(&topic.symbol, &market, ASTER_QUOTES);
+    let stream_symbol = market.to_ascii_lowercase();
+    let timeframe = resolve_ohlcv_timeframe(&topic.params);
+    let interval = to_binance_ws_interval(&timeframe)
+        .map_err(|_| format!("unsupported Aster OHLCV timeframe `{timeframe}`"))?;
+    Ok(ResolvedOhlcvTopic {
+        key: format!("aster|ohlcv|symbol:{stream_symbol}|timeframe:{interval}"),
+        topic: OhlcvTopic { symbol, ..topic },
+        stream: UpstreamOhlcvStream::Aster {
+            ws_endpoint: format!("{ASTER_WS_BASE_URL}/{stream_symbol}@kline_{interval}"),
+        },
     })
 }
 
@@ -2674,6 +2751,87 @@ mod tests {
         time::Duration,
     };
 
+    #[test]
+    fn aster_resolves_raw_streams_and_shares_depth_across_aliases() {
+        let topic = |symbol: &str, params: Value| TradesTopic {
+            exchange: "aster".to_string(),
+            symbol: symbol.to_string(),
+            params,
+        };
+        let trades = resolve_aster_topic(topic("BTCUSD1", Value::Null)).unwrap();
+        assert_eq!(trades.topic.symbol, "BTC/USD1:USD1");
+        assert_eq!(trades.key, "aster|trades|symbol:btcusd1");
+        let UpstreamTradesStream::Aster { ws_endpoint } = trades.stream else {
+            panic!("wrong stream")
+        };
+        assert_eq!(
+            ws_endpoint,
+            "wss://fstream.asterdex.com/ws/btcusd1@aggTrade"
+        );
+
+        let shallow = resolve_aster_orderbook_topic(topic("BTCU", json!({"levels": 1}))).unwrap();
+        let deep =
+            resolve_aster_orderbook_topic(topic("BTC/U:U", json!({"levels": 1000}))).unwrap();
+        assert_eq!(shallow.key, deep.key);
+        assert_eq!(shallow.display_levels_limit, 1);
+        assert_eq!(deep.display_levels_limit, 1000);
+        let UpstreamOrderBookStream::Aster {
+            ws_endpoint,
+            market_symbol,
+        } = deep.stream
+        else {
+            panic!("wrong stream")
+        };
+        assert_eq!(market_symbol, "BTCU");
+        assert_eq!(
+            ws_endpoint,
+            "wss://fstream.asterdex.com/ws/btcu@depth@100ms"
+        );
+
+        for interval in [
+            "1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w",
+            "1M",
+        ] {
+            let candles =
+                resolve_aster_ohlcv_topic(topic("BTC/USDT:USDT", json!({"timeframe": interval})))
+                    .unwrap();
+            let UpstreamOhlcvStream::Aster { ws_endpoint } = candles.stream else {
+                panic!("wrong stream")
+            };
+            assert_eq!(
+                ws_endpoint,
+                format!("wss://fstream.asterdex.com/ws/btcusdt@kline_{interval}")
+            );
+        }
+        assert!(resolve_aster_ohlcv_topic(topic("BTCUSDT", json!({"timeframe": "2m"}))).is_err());
+    }
+
+    #[test]
+    fn aster_dispatches_binance_compatible_trade_and_candle_updates() {
+        let (sender, mut receiver) = broadcast::channel(1);
+        forward_trades(
+            &UpstreamTradesStream::Aster {
+                ws_endpoint: String::new(),
+            },
+            &json!({"e":"aggTrade", "a":42, "p":"2.5", "q":"4", "T":1700000000000u64, "m":true})
+                .to_string(),
+            "BTC/USDT",
+            &sender,
+        );
+        let trades = receiver.try_recv().unwrap();
+        assert_eq!(trades[0].id.as_deref(), Some("42"));
+        assert_eq!(trades[0].side.as_deref(), Some("sell"));
+        assert_eq!(trades[0].cost, Some(10.0));
+
+        let (sender, mut receiver) = broadcast::channel(1);
+        forward_ohlcv_update(&UpstreamOhlcvStream::Aster { ws_endpoint: String::new() },
+            &json!({"e":"kline", "k":{"t":1700000000000u64,"o":"1","h":"2","l":"0.5","c":"1.5","v":"9"}}).to_string(), &sender);
+        assert_eq!(
+            *receiver.try_recv().unwrap(),
+            vec![(1700000000000, 1.0, 2.0, 0.5, 1.5, 9.0)]
+        );
+    }
+
     use super::*;
     use tokio::time::timeout;
 
@@ -2789,8 +2947,8 @@ mod tests {
     struct MockBinanceSnapshotProvider;
 
     #[async_trait]
-    impl BinanceOrderBookSnapshotProvider for MockBinanceSnapshotProvider {
-        async fn fetch_binance_order_book_snapshot(
+    impl OrderBookSnapshotProvider for MockBinanceSnapshotProvider {
+        async fn fetch_order_book_snapshot(
             &self,
             _market_symbol: &str,
         ) -> Result<crate::binance_orderbook::BinanceDepthSnapshot, String> {
@@ -2806,6 +2964,7 @@ mod tests {
     fn orderbook_manager() -> OrderBookTopicManager {
         OrderBookTopicManager::new(
             "https://api.hyperliquid.xyz".to_string(),
+            Arc::new(MockBinanceSnapshotProvider),
             Arc::new(MockBinanceSnapshotProvider),
             "wss://mainnet.zklighter.elliot.ai/stream".to_string(),
             lighter_catalog_service(),

@@ -16,7 +16,7 @@ use axum::{
     Router,
 };
 use ferris_market_data_backend::binance_orderbook::{
-    BinanceDepthSnapshot, BinanceOrderBookSnapshotProvider,
+    BinanceDepthSnapshot, OrderBookSnapshotProvider,
 };
 use ferris_market_data_backend::{
     exchanges::{lighterxyz::LighterMarketCatalogService, registry::ExchangeRegistry},
@@ -45,8 +45,8 @@ struct MockUpstreamState {
 struct MockBinanceSnapshotProvider;
 
 #[async_trait::async_trait]
-impl BinanceOrderBookSnapshotProvider for MockBinanceSnapshotProvider {
-    async fn fetch_binance_order_book_snapshot(
+impl OrderBookSnapshotProvider for MockBinanceSnapshotProvider {
+    async fn fetch_order_book_snapshot(
         &self,
         _market_symbol: &str,
     ) -> Result<BinanceDepthSnapshot, String> {
@@ -235,6 +235,7 @@ async fn websocket_fanout_shares_upstream_for_same_topic() {
         topic_manager,
         OrderBookTopicManager::new(
             format!("http://{upstream_bind}"),
+            Arc::new(MockBinanceSnapshotProvider),
             Arc::new(MockBinanceSnapshotProvider),
             "wss://mainnet.zklighter.elliot.ai/stream".to_string(),
             lighter_catalog_service,
