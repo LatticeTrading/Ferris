@@ -227,6 +227,7 @@ async fn websocket_fanout_shares_upstream_for_same_topic() {
 
     let topic_manager = TradesTopicManager::new(
         format!("http://{upstream_bind}"),
+        ferris_market_data_backend::ws_shared::EXTENDED_WS_BASE_URL.to_string(),
         "wss://mainnet.zklighter.elliot.ai/stream".to_string(),
         lighter_catalog_service.clone(),
     );
@@ -235,12 +236,16 @@ async fn websocket_fanout_shares_upstream_for_same_topic() {
         topic_manager,
         OrderBookTopicManager::new(
             format!("http://{upstream_bind}"),
+            ferris_market_data_backend::ws_shared::EXTENDED_WS_BASE_URL.to_string(),
             Arc::new(MockBinanceSnapshotProvider),
             Arc::new(MockBinanceSnapshotProvider),
             "wss://mainnet.zklighter.elliot.ai/stream".to_string(),
             lighter_catalog_service,
         ),
-        OhlcvTopicManager::new(format!("http://{upstream_bind}")),
+        OhlcvTopicManager::new(
+            format!("http://{upstream_bind}"),
+            ferris_market_data_backend::ws_shared::EXTENDED_WS_BASE_URL.to_string(),
+        ),
     );
     let app = Router::new()
         .route("/v1/ws", get(web::trades_stream_ws))

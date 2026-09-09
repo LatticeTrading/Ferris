@@ -5,6 +5,8 @@ pub struct Config {
     pub host: String,
     pub port: u16,
     pub hyperliquid_base_url: String,
+    pub extended_rest_base_url: String,
+    pub extended_ws_url: String,
     pub lighter_rest_base_url: String,
     pub lighter_markets_url: String,
     pub lighter_ws_url: String,
@@ -32,6 +34,20 @@ impl Config {
 
         let hyperliquid_base_url = std::env::var("HYPERLIQUID_BASE_URL")
             .unwrap_or_else(|_| "https://api.hyperliquid.xyz".to_string())
+            .trim()
+            .trim_end_matches('/')
+            .to_string();
+
+        let extended_rest_base_url = std::env::var("EXTENDED_REST_BASE_URL")
+            .unwrap_or_else(|_| {
+                crate::exchanges::extended::DEFAULT_EXTENDED_REST_BASE_URL.to_string()
+            })
+            .trim()
+            .trim_end_matches('/')
+            .to_string();
+
+        let extended_ws_url = std::env::var("EXTENDED_WS_URL")
+            .unwrap_or_else(|_| crate::ws_shared::EXTENDED_WS_BASE_URL.to_string())
             .trim()
             .trim_end_matches('/')
             .to_string();
@@ -98,6 +114,8 @@ impl Config {
             host,
             port,
             hyperliquid_base_url,
+            extended_rest_base_url,
+            extended_ws_url,
             lighter_rest_base_url,
             lighter_markets_url,
             lighter_ws_url,

@@ -12,6 +12,8 @@ pub(crate) const MAX_OHLCV_CHART_CANDLES: usize = 120;
 pub(crate) const DEFAULT_HYPERLIQUID_WS_URL: &str = "wss://api.hyperliquid.xyz/ws";
 pub(crate) const DEFAULT_BYBIT_LINEAR_WS_URL: &str = "wss://stream.bybit.com/v5/public/linear";
 pub(crate) const DEFAULT_ASTER_WS_URL: &str = "wss://fstream.asterdex.com/ws";
+pub(crate) const DEFAULT_EXTENDED_WS_URL: &str =
+    ferris_market_data_backend::ws_shared::EXTENDED_WS_BASE_URL;
 pub(crate) const MAX_HYPERLIQUID_ORDERBOOK_LEVELS: usize = 20;
 pub(crate) const BINANCE_SNAPSHOT_TIMEOUT_MS: u64 = 10_000;
 pub(crate) const MAX_ASTER_ORDERBOOK_LEVELS: usize = 1_000;

@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use crate::{
-    cli::Config,
+    cli::{Config, Mode},
     constants::{BINANCE_SNAPSHOT_TIMEOUT_MS, TRADE_DEDUP_CAPACITY},
     control::should_stop,
     view::{
@@ -14,9 +14,12 @@ use crate::{
         build_aster_orderbook_ws_endpoint, build_aster_trade_ws_endpoint,
         build_binance_ohlcv_ws_endpoint, build_binance_orderbook_ws_endpoint,
         build_binance_trade_ws_endpoint, build_bybit_ohlcv_ws_endpoint,
-        build_bybit_orderbook_ws_endpoint, build_bybit_trade_ws_endpoint, ensure_hyperliquid_ws,
-        parse_binance_ohlcv_message, parse_binance_orderbook_message, parse_binance_trades_message,
-        parse_bybit_ohlcv_message, parse_bybit_orderbook_message, parse_bybit_trades_message,
+        build_bybit_orderbook_ws_endpoint, build_bybit_trade_ws_endpoint,
+        build_extended_ohlcv_ws_endpoint, build_extended_orderbook_ws_endpoint,
+        build_extended_trade_ws_endpoint, ensure_hyperliquid_ws, parse_binance_ohlcv_message,
+        parse_binance_orderbook_message, parse_binance_trades_message, parse_bybit_ohlcv_message,
+        parse_bybit_orderbook_message, parse_bybit_trades_message, parse_extended_ohlcv_message,
+        parse_extended_orderbook_message, parse_extended_trades_message,
         parse_hyperliquid_orderbook_message, parse_hyperliquid_trades_message,
         resolve_aster_ws_symbol, resolve_binance_ws_symbol, resolve_bybit_ws_symbol,
         resolve_hyperliquid_coin, resolved_ws_base_url, send_bybit_ohlcv_subscription,
@@ -36,6 +39,10 @@ use ferris_market_data_backend::{
         SnapshotSyncOutcome, BYBIT_FULL_DEPTH_THRESHOLD, BYBIT_REST_BASE_URL,
     },
     exchanges::{aster::AsterExchange, binance::BinanceExchange},
+    ws_shared::{
+        extended_public_symbol, extended_ws_request, resolve_extended_ws_symbol,
+        ExtendedOrderBookState,
+    },
 };
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
@@ -46,8 +53,9 @@ pub(crate) async fn run_trades_stream_ws(config: &Config) -> anyhow::Result<()> 
         "hyperliquid" => run_hyperliquid_trades_stream_ws(config).await,
         "binance" | "aster" => run_binance_trades_stream_ws(config).await,
         "bybit" => run_bybit_trades_stream_ws(config).await,
+        "extended" => run_extended_stream_ws(config).await,
         other => bail!(
-            "ws transport for trades supports exchange=hyperliquid, exchange=binance, exchange=aster, or exchange=bybit (got `{other}`)"
+            "ws transport for trades supports exchange=hyperliquid, exchange=binance, exchange=aster, exchange=bybit, or exchange=extended (got `{other}`)"
         ),
     }
 }
@@ -292,7 +300,8 @@ pub(crate) async fn run_orderbook_stream_ws(config: &Config) -> anyhow::Result<(
         "hyperliquid" => run_hyperliquid_orderbook_stream_ws(config).await,
         "binance" | "aster" => run_binance_orderbook_stream_ws(config).await,
         "bybit" => run_bybit_orderbook_stream_ws(config).await,
-        other => bail!("ws transport for orderbook supports exchange=hyperliquid, exchange=binance, exchange=aster, or exchange=bybit (got `{other}`)"),
+        "extended" => run_extended_stream_ws(config).await,
+        other => bail!("ws transport for orderbook supports exchange=hyperliquid, exchange=binance, exchange=aster, exchange=bybit, or exchange=extended (got `{other}`)"),
     }
 }
 
@@ -300,8 +309,139 @@ pub(crate) async fn run_ohlcv_stream_ws(config: &Config) -> anyhow::Result<()> {
     match config.exchange.as_str() {
         "binance" | "aster" => run_binance_ohlcv_stream_ws(config).await,
         "bybit" => run_bybit_ohlcv_stream_ws(config).await,
-        other => bail!("ws transport for ohlcv currently supports exchange=binance, exchange=aster, or exchange=bybit (got `{other}`)"),
+        "extended" => run_extended_stream_ws(config).await,
+        other => bail!("ws transport for ohlcv currently supports exchange=binance, exchange=aster, exchange=bybit, or exchange=extended (got `{other}`)"),
     }
+}
+
+async fn run_extended_stream_ws(config: &Config) -> anyhow::Result<()> {
+    let endpoint = match config.mode {
+        Mode::Trades => build_extended_trade_ws_endpoint(config)?,
+        Mode::OrderBook => build_extended_orderbook_ws_endpoint(config)?,
+        Mode::Ohlcv => build_extended_ohlcv_ws_endpoint(config)?,
+    };
+    let market = resolve_extended_ws_symbol(&config.symbol, config.coin.as_deref())
+        .map_err(anyhow::Error::msg)?;
+    let symbol = extended_public_symbol(&config.symbol, &market);
+    let started_at = Instant::now();
+    let mut renderer = match config.mode {
+        Mode::Trades => None,
+        _ => Some(OrderBookRenderer::new()?),
+    };
+    let mut deduper = TradeDeduper::new(TRADE_DEDUP_CAPACITY.max(config.trade_limit * 10));
+    let mut candles = Vec::new();
+    let mut iteration = 0;
+    let run = async {
+        let mut delay = Duration::from_millis(500);
+        loop {
+            let request = extended_ws_request(&endpoint)?;
+            let connection =
+                tokio::time::timeout(Duration::from_secs(10), connect_async(request)).await;
+            if let Ok(Ok((mut stream, _))) = connection {
+                let mut book_state = ExtendedOrderBookState::default();
+                while let Some(message) = stream.next().await {
+                    let message = match message {
+                        Ok(message) => message,
+                        Err(error) => {
+                            eprintln!("Extended websocket read error: {error}; reconnecting");
+                            break;
+                        }
+                    };
+                    match message {
+                        Message::Ping(payload) => {
+                            if stream.send(Message::Pong(payload)).await.is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                        Message::Close(_) => break,
+                        _ => {}
+                    }
+                    let Some(text) = ws_message_text(message)? else {
+                        continue;
+                    };
+                    match config.mode {
+                        Mode::Trades => {
+                            let trades = parse_extended_trades_message(&text);
+                            if trades.is_empty() {
+                                continue;
+                            }
+                            for trade in trades.iter().rev() {
+                                if deduper.insert(trade_key(trade)) {
+                                    println!("{}", format_trade_line(trade));
+                                }
+                            }
+                        }
+                        Mode::OrderBook => {
+                            let book = match parse_extended_orderbook_message(
+                                &mut book_state,
+                                &text,
+                                &symbol,
+                                config.orderbook_levels,
+                            ) {
+                                Ok(Some(book)) => book,
+                                Ok(None) => continue,
+                                Err(error) => {
+                                    eprintln!(
+                                        "Extended orderbook out of sync: {error}; reconnecting"
+                                    );
+                                    break;
+                                }
+                            };
+                            if let Some(renderer) = renderer.as_mut() {
+                                renderer.render(&build_orderbook_frame(
+                                    &book,
+                                    config.orderbook_levels,
+                                    iteration + 1,
+                                    started_at.elapsed(),
+                                ))?;
+                            }
+                        }
+                        Mode::Ohlcv => {
+                            let updates = parse_extended_ohlcv_message(&text);
+                            if updates.is_empty() {
+                                continue;
+                            }
+                            apply_ohlcv_updates(&mut candles, &updates, config.ohlcv_limit);
+                            if let Some(renderer) = renderer.as_mut() {
+                                renderer.render(&build_ohlcv_frame(
+                                    &candles,
+                                    iteration + 1,
+                                    started_at.elapsed(),
+                                    &symbol,
+                                    &config.ohlcv_timeframe,
+                                    config.ohlcv_chart_height,
+                                ))?;
+                            }
+                        }
+                    }
+                    iteration += 1;
+                    delay = Duration::from_millis(500);
+                    if should_stop(started_at, iteration, config) {
+                        return Ok::<_, anyhow::Error>(());
+                    }
+                }
+            } else {
+                eprintln!("failed to connect Extended websocket {endpoint}; reconnecting");
+            }
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(Duration::from_secs(15));
+        }
+    };
+    let deadline = async {
+        match config.duration_secs {
+            Some(seconds) => tokio::time::sleep(Duration::from_secs(seconds)).await,
+            None => std::future::pending::<()>().await,
+        }
+    };
+    let reason = tokio::select! {
+        _ = tokio::signal::ctrl_c() => "received Ctrl+C",
+        _ = deadline => "reached configured stop condition",
+        result = run => { result?; "reached configured stop condition" },
+    };
+    drop(renderer);
+    println!("stopped: {reason}");
+    Ok(())
 }
 
 async fn run_binance_ohlcv_stream_ws(config: &Config) -> anyhow::Result<()> {

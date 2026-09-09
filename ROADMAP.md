@@ -29,18 +29,19 @@ Completed:
   - `GET /healthz`
 - Hyperliquid adapter integrated
 - Binance USDS adapter integrated (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`)
-- Bybit adapter integrated (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`)
 - Websocket trade collector + in-memory trade cache
+- Extended perpetual public market-data adapter: trades, OHLCV, order-book, and market snapshots plus realtime trades, books, and OHLCV
+- Extended canonical trade/book symbols (`BASE/USD:USD`), catalog symbols (`BASE/USD`), and configurable upstream URLs for testnet readiness
+- Extended indicative standard websocket order book support (RFQ real-book stream excluded)
 - `market_stream` modularized and made websocket-only (poll transport removed)
 - `market_stream` websocket parity:
-  - `trades`: Hyperliquid, Binance, Bybit
-  - `orderbook`: Hyperliquid, Binance, Bybit
-  - `ohlcv`: Binance, Bybit
-- Backend client websocket endpoint (`GET /v1/ws`) for realtime market-data subscriptions
+  - `trades`: Hyperliquid, Binance, Bybit, Aster, Extended
+  - `orderbook`: Hyperliquid, Binance, Bybit, Aster, Extended
+  - `ohlcv`: Binance, Bybit, Aster, Extended
 - Realtime fanout architecture with one upstream stream per active topic and many client subscribers:
-  - `trades`: Hyperliquid, Binance, Bybit
-  - `orderbook`: Hyperliquid, Binance, Bybit
-  - `ohlcv`: Binance, Bybit
+  - `trades`: Hyperliquid, Binance, Bybit, Aster, Extended
+  - `orderbook`: Hyperliquid, Binance, Bybit, Aster, Extended
+  - `ohlcv`: Binance, Bybit, Aster, Extended
 - Smoke test scripts (Python + PowerShell)
 - Live ignored integration tests
 
@@ -49,6 +50,7 @@ In progress:
 - Production hardening and public-host readiness
 - Realtime stream hardening (limits, backpressure, visibility)
 - Exchange expansion follow-up (next adapter candidate after Bybit)
+- Extended scope is perpetual public market data only; spot, private trading/account, funding, account streams, and RFQ real-book endpoints remain unsupported.
 
 Not started:
 
@@ -278,6 +280,10 @@ Week 4:
 2026-02-22:
 
 - Extended backend websocket fanout to additional channels: realtime `orderbook` (Hyperliquid/Binance/Bybit) and realtime `ohlcv` (Binance/Bybit).
+
+2026-09-09:
+
+- Completed Extended perpetual public market-data integration with REST/realtime parity; standard websocket order books are explicitly indicative rather than RFQ real books.
 
 ## Weekly Update Template
 

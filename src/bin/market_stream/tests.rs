@@ -1,6 +1,9 @@
 use super::ws_helpers::{
     build_aster_ohlcv_ws_endpoint, build_aster_orderbook_ws_endpoint,
-    build_aster_trade_ws_endpoint, to_aster_ws_interval,
+    build_aster_trade_ws_endpoint, build_extended_ohlcv_ws_endpoint,
+    build_extended_orderbook_ws_endpoint, build_extended_trade_ws_endpoint,
+    parse_extended_ohlcv_message, parse_extended_orderbook_message, parse_extended_trades_message,
+    to_aster_ws_interval,
 };
 use super::{
     apply_bybit_orderbook_event, build_binance_ohlcv_ws_endpoint,
@@ -15,6 +18,63 @@ use super::{
     to_bybit_ws_interval, trade_key, BybitOrderBookEventType, Config, Mode, OhlcvRow,
     OrderBookSnapshot, ParseResult, TradeDeduper, TradeRow,
 };
+
+#[test]
+fn extended_streams_validate_symbols_and_keep_synchronized_depth() {
+    let mut config = parse_run(&[
+        "orderbook",
+        "--exchange",
+        "extended",
+        "--symbol",
+        "BTC/USD:USD",
+        "--levels",
+        "1",
+        "--ws-url",
+        "ws://localhost/v1/",
+    ]);
+    assert_eq!(
+        build_extended_orderbook_ws_endpoint(&config).unwrap(),
+        "ws://localhost/v1/orderbooks/BTC-USD?depth=1"
+    );
+    config.orderbook_levels = 10;
+    assert_eq!(
+        build_extended_orderbook_ws_endpoint(&config).unwrap(),
+        "ws://localhost/v1/orderbooks/BTC-USD"
+    );
+    assert_eq!(
+        build_extended_trade_ws_endpoint(&config).unwrap(),
+        "ws://localhost/v1/publicTrades/BTC-USD"
+    );
+    config.ohlcv_timeframe = "1M".to_string();
+    assert_eq!(
+        build_extended_ohlcv_ws_endpoint(&config).unwrap(),
+        "ws://localhost/v1/candles/BTC-USD/trades?interval=P30D"
+    );
+    config.symbol = "BTC/USDT".to_string();
+    assert!(build_extended_trade_ws_endpoint(&config).is_err());
+    let trades = parse_extended_trades_message(
+        r#"{"data":[{"i":"abc","T":1000,"S":"BUY","p":"2","q":"3"}]}"#,
+    );
+    assert_eq!(trades[0].id.as_deref(), Some("abc"));
+    assert_eq!(trades[0].cost, Some(6.0));
+    let candles = parse_extended_ohlcv_message(
+        r#"{"data":[{"T":1000,"o":"1","h":"2","l":"0.5","c":"1.5"}]}"#,
+    );
+    assert_eq!(candles[0].timestamp(), 1000);
+    assert_eq!(candles[0].volume(), 0.0);
+    let mut state = ferris_market_data_backend::ws_shared::ExtendedOrderBookState::default();
+    let snapshot = r#"{"type":"SNAPSHOT","seq":1,"data":{"m":"BTC-USD","b":[{"p":"100","q":"1"},{"p":"99","q":"2"}],"a":[]}}"#;
+    let book = parse_extended_orderbook_message(&mut state, snapshot, "BTC/USD:USD", 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(book.bids, vec![(100.0, 1.0)]);
+    let delta = r#"{"type":"DELTA","seq":2,"data":{"m":"BTC-USD","b":[{"p":"100","q":"-1"}]}}"#;
+    let book = parse_extended_orderbook_message(&mut state, delta, "BTC/USD:USD", 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(book.bids, vec![(99.0, 2.0)]);
+    assert!(parse_extended_orderbook_message(&mut state, delta, "BTC/USD:USD", 1).is_err());
+}
 
 #[test]
 fn aster_stream_endpoints_and_display_depth() {

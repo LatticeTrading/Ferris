@@ -42,9 +42,12 @@ If you only have an HTTP base URL string, derive WS URL like this:
   - `GET /v1/ws`
 
 Supported realtime channels:
-- `trades`: `hyperliquid`, `binance`, `bybit`, `aster`
-- `orderbook`: `hyperliquid`, `binance`, `bybit`, `aster`
-- `ohlcv`: `binance`, `bybit`, `aster`
+- `trades`: `hyperliquid`, `binance`, `bybit`, `aster`, `extended`
+- `orderbook`: `hyperliquid`, `binance`, `bybit`, `aster`, `extended`
+- `ohlcv`: `binance`, `bybit`, `aster`, `extended`
+- Extended is perpetual public market-data only: four REST snapshot endpoints plus realtime trades, books, and OHLCV. Use `BTC/USD:USD` for trade/book streams; the market catalog returns `BTC/USD`. Both forms resolve to upstream `BTC-USD`.
+- Extended's standard websocket order book is indicative, not the RFQ real book. Spot, private trading/account, funding, and account streams are unsupported.
+- Extended upstream REST and websocket URLs are configurable for testnet deployments; frontend clients always use this backend contract.
 
 ### Fetch Markets (Symbol Catalog)
 
@@ -194,6 +197,16 @@ Include all of these for `subscribe`/`unsubscribe`:
   - all display depths share one synchronized upstream diff stream per market; updates contain requested top N levels and the latest `u` as `nonce`
   - supported OHLCV intervals: `1m`, `3m`, `5m`, `15m`, `30m`, `1h`, `2h`, `4h`, `6h`, `8h`, `12h`, `1d`, `3d`, `1w`, `1M`
   - implementation upstreams are REST `https://fapi.asterdex.com` and websocket `wss://fstream.asterdex.com/ws`; frontend clients use this backend's `/v1/ws`
+- Extended:
+  - accepts `BASE-USD`, `BASE/USD`, and `BASE/USD:USD`; trade/book/realtime output uses `BASE/USD:USD`, while `fetchMarkets` uses `BASE/USD`
+  - `params.coin` optionally overrides the symbol with a base asset or complete Extended pair
+  - `params.timeframe` defaults to `1m`; supported intervals: `1m`, `5m`, `15m`, `30m`, `1h`, `2h`, `4h`, `8h`, `12h`, `1d`, `1w`, `1M`
+  - `params.candleType`: `trades` (default), `mark-prices`, or `index-prices`; missing volume becomes `0.0`
+  - REST candles use top-level `timeframe`; optional `params.endTime`/`params.until` sets an upper millisecond timestamp
+  - order-book `levels`, `depth`, or `limit` clamps to `1..=1000`; `1` uses the one-level stream, otherwise the full stream is synchronized before top N is published
+  - book snapshots replace state; deltas use absolute `c` when present or additive `q`, remove zero quantities, and reconnect on sequence gaps; synchronized `seq` is returned as `nonce`
+  - standard order book is indicative; RFQ real-book endpoints are not supported
+  - spot, private trading/account, funding, and account streams are not supported
 - Bybit:
   - `params.coin` optional shortcut
   - `params.category` optional, default `linear`
@@ -224,6 +237,16 @@ The terminal viewer supports Aster perpetual futures market data:
 ```text
 cargo run --bin market_stream -- orderbook --exchange aster --symbol BTC/USDT:USDT --levels 5 --iterations 1
 ```
+
+### Extended Terminal Examples
+
+```text
+cargo run --bin market_stream -- trades --exchange extended --symbol BTC/USD:USD --iterations 10
+cargo run --bin market_stream -- orderbook --exchange extended --symbol BTC/USD:USD --levels 10 --iterations 10
+cargo run --bin market_stream -- ohlcv --exchange extended --symbol BTC/USD:USD --timeframe 1m --iterations 10
+```
+
+The viewer connects directly upstream and uses trade candles. Backend URLs are configured by `EXTENDED_REST_BASE_URL` and `EXTENDED_WS_URL`; the viewer uses `--ws-url` instead. Public Extended requests need no API key; the adapter and viewer send a `User-Agent` header.
 
 
 Important: use the `topic` returned in `subscribed` ack as your canonical local key when possible.

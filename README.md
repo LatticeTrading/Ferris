@@ -9,7 +9,7 @@ Frontend integration guidance lives in `INTEGRATION_README.md`.
 - unified endpoint shapes (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`, `fetchMarkets`)
 - backend websocket fanout for realtime channels (`GET /v1/ws`)
 - pluggable exchange adapter architecture
-- market-data support for `hyperliquid`, `binance`, `bybit`, and `aster` futures
+- market-data support for `hyperliquid`, `binance`, `bybit`, `aster`, and `extended` perpetuals
 - one upstream websocket stream per active topic with multi-client broadcast
 - background websocket trade collector with in-memory ring buffer for deeper snapshot history
 
@@ -40,15 +40,18 @@ Frontend apps (including Electron and web frontends) often cannot directly use s
 - Realtime endpoint:
   - `GET /v1/ws` (websocket subscribe/unsubscribe for realtime `trades`, `orderbook`, `ohlcv`)
 - Realtime channel support:
-  - `trades`: `hyperliquid`, `binance`, `bybit`, `aster`
-  - `orderbook`: `hyperliquid`, `binance`, `bybit`, `aster`
-  - `ohlcv`: `binance`, `bybit`, `aster`
+  - `trades`: `hyperliquid`, `binance`, `bybit`, `aster`, `extended`
+  - `orderbook`: `hyperliquid`, `binance`, `bybit`, `aster`, `extended`
+  - `ohlcv`: `binance`, `bybit`, `aster`, `extended`
 - exchange supported:
   - `hyperliquid` (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`, `fetchMarkets`)
   - `binance` (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`, `fetchMarkets`)
   - `bybit` (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`, `fetchMarkets`)
   - `aster` futures/perpetual markets (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`, `fetchMarkets`)
-- Aster is futures-only; its canonical market symbols are `BASE/QUOTE` (for example `BTC/USDT`), while request and realtime symbols may use `BASE/QUOTE:QUOTE` (for example `BTC/USDT:USDT`). Aster also accepts the optional `params.coin` shortcut.
+  - `extended` perpetual public market data: all four snapshot endpoints plus realtime trades, order books, and OHLCV
+- Extended accepts `BASE-USD`, `BASE/USD`, and `BASE/USD:USD`; trade/book/realtime responses use `BASE/USD:USD`. The market catalog uses `BASE/USD`, consistent with the shared catalog contract.
+- Extended's standard websocket order book is indicative, not the RFQ real-book stream. Spot, private trading/account, funding, and account streams are not supported.
+- Extended REST and websocket URLs are configurable for testnet deployments.
 - market-data only (no private trading endpoints yet)
 
 ## API
@@ -255,9 +258,11 @@ Server order book update:
 
 ### Realtime OHLCV Stream (WebSocket)
 
-Supported exchanges: `binance`, `bybit`, `aster`.
+Supported exchanges: `binance`, `bybit`, `aster`, `extended`.
 
 Aster supports these futures intervals: `1m`, `3m`, `5m`, `15m`, `30m`, `1h`, `2h`, `4h`, `6h`, `8h`, `12h`, `1d`, `3d`, `1w`, and `1M`.
+
+Extended supports `1m`, `5m`, `15m`, `30m`, `1h`, `2h`, `4h`, `8h`, `12h`, `1d`, `1w`, and `1M`. `params.candleType` accepts `trades` (default), `mark-prices`, or `index-prices`; missing mark/index volume is `0.0`. REST uses the top-level `timeframe` and optionally `params.endTime` or `params.until` (milliseconds).
 
 Hyperliquid realtime OHLCV is not enabled yet on websocket fanout; use `POST /v1/fetchOHLCV` for Hyperliquid candles.
 
@@ -399,6 +404,22 @@ Error shape for this endpoint:
 }
 ```
 
+### Extended Examples
+
+REST candle request (`POST /v1/fetchOHLCV`):
+
+```json
+{"exchange":"extended","symbol":"BTC/USD:USD","timeframe":"1m","limit":100,"params":{"candleType":"mark-prices"}}
+```
+
+Websocket subscription (`GET /v1/ws`):
+
+```json
+{"op":"subscribe","channel":"orderbook","exchange":"extended","symbol":"BTC/USD:USD","params":{"levels":10}}
+```
+
+Extended book depths are clamped to `1..=1000`. One-level subscriptions use `?depth=1`; deeper subscriptions maintain the full indicative stream and return the requested top N. Snapshot/delta synchronization uses contiguous `seq` values (returned as `nonce`); gaps reconnect before further books are published. REST books leave timestamps and nonce null when the upstream omits them.
+
 ## Running locally
 
 ```bash
@@ -416,6 +437,8 @@ Defaults:
 - `HOST` (default: `0.0.0.0`)
 - `PORT` (default: `8787`)
 - `HYPERLIQUID_BASE_URL` (default: `https://api.hyperliquid.xyz`)
+- `EXTENDED_REST_BASE_URL` (default: `https://api.starknet.extended.exchange/api/v1`)
+- `EXTENDED_WS_URL` (default: `wss://api.starknet.extended.exchange/stream.extended.exchange/v1`)
 - `REQUEST_TIMEOUT_MS` (default: `10000`)
 - `TRADE_CACHE_CAPACITY_PER_COIN` (default: `5000`)
 - `TRADE_CACHE_RETENTION_MS` (default: `86400000`)
@@ -464,13 +487,23 @@ Binance real-time OHLCV stream:
 cargo run --bin market_stream -- ohlcv --exchange binance --symbol BTC/USDT:USDT --timeframe 1m
 ```
 
+Extended perpetual streams:
+
+```bash
+cargo run --bin market_stream -- trades --exchange extended --symbol BTC/USD:USD --iterations 10
+cargo run --bin market_stream -- orderbook --exchange extended --symbol BTC/USD:USD --levels 10 --iterations 10
+cargo run --bin market_stream -- ohlcv --exchange extended --symbol BTC/USD:USD --timeframe 1m --iterations 10
+```
+
+The Extended viewer reconnects after disconnects or book sequence gaps. Its candle mode uses trade candles. Override its upstream with `--ws-url`; backend environment variables configure the server, not this direct viewer.
+
 Useful optional flags:
 
 - `--exchange` (default `hyperliquid`)
 - `--symbol` (default `BTC/USDC:USDC`)
 - `--ws-url` (websocket base URL override; default depends on `--exchange`)
 - `--coin` (optional websocket coin override)
-- `--levels` (order book depth to display/request; default `10`, min `10`; Bybit max `10000`, other exchanges max `20`)
+- `--levels` (display depth; default `10`; Hyperliquid `10..=20`, Binance `10..=1000`, Aster/Extended `1..=1000`, Bybit `10..=10000`)
 - `--limit` (trades dedup buffer hint; also OHLCV candle window size, default `25` for trades, `120` for OHLCV)
 - `--timeframe` (OHLCV timeframe, for example `1m`, `5m`, `1h`)
 - `--chart-height` (OHLCV chart rows, default `16`)
@@ -553,6 +586,14 @@ To find who already owns port 8787 on Windows:
 netstat -ano | findstr :8787
 tasklist /FI "PID eq <PID_FROM_NETSTAT>"
 ```
+
+Extended REST smoke workflow:
+
+```bash
+python scripts/smoke_endpoints.py --base-url http://127.0.0.1:8787 --exchange extended --symbol BTC/USD:USD --markets-exchange extended
+```
+
+For Extended live integration tests, set `FERRIS_TEST_EXCHANGE=extended`, `FERRIS_TEST_SYMBOL=BTC/USD:USD`, and `FERRIS_TEST_MARKETS_EXCHANGE=extended` before the command below.
 
 Live integration tests (ignored by default):
 

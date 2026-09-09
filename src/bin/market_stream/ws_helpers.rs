@@ -1,3 +1,4 @@
+use crate::view::{iso8601_millis, OhlcvRow, OrderBookSnapshot, TradeRow};
 use anyhow::{bail, Context};
 use ferris_market_data_backend::{
     binance_orderbook::{
@@ -7,13 +8,15 @@ use ferris_market_data_backend::{
     },
     bybit_full_orderbook::BYBIT_FULL_DEPTH_THRESHOLD,
     ws_shared::{
+        extended_interval,
         infer_hyperliquid_coin_from_symbol as infer_hyperliquid_coin_from_symbol_shared,
         parse_binance_trades as parse_binance_trades_shared,
-        parse_bybit_trades as parse_bybit_trades_shared,
-        parse_hyperliquid_trades as parse_hyperliquid_trades_shared,
+        parse_bybit_trades as parse_bybit_trades_shared, parse_extended_candles,
+        parse_extended_trades, parse_hyperliquid_trades as parse_hyperliquid_trades_shared,
         resolve_aster_ws_symbol as resolve_aster_ws_symbol_shared,
         resolve_binance_ws_symbol as resolve_binance_ws_symbol_shared,
-        resolve_bybit_ws_symbol as resolve_bybit_ws_symbol_shared, WsTrade,
+        resolve_bybit_ws_symbol as resolve_bybit_ws_symbol_shared, resolve_extended_ws_symbol,
+        ExtendedOrderBookState, WsTrade,
     },
 };
 use futures_util::SinkExt;
@@ -22,8 +25,10 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::{
     cli::Config,
-    constants::{DEFAULT_ASTER_WS_URL, DEFAULT_BYBIT_LINEAR_WS_URL, DEFAULT_HYPERLIQUID_WS_URL},
-    view::{iso8601_millis, OhlcvRow, OrderBookSnapshot, TradeRow},
+    constants::{
+        DEFAULT_ASTER_WS_URL, DEFAULT_BYBIT_LINEAR_WS_URL, DEFAULT_EXTENDED_WS_URL,
+        DEFAULT_HYPERLIQUID_WS_URL,
+    },
 };
 
 pub(crate) fn ensure_hyperliquid_ws(config: &Config) -> anyhow::Result<()> {
@@ -42,17 +47,52 @@ pub(crate) fn resolved_ws_base_url(config: &Config) -> String {
     if configured.is_empty() {
         return DEFAULT_HYPERLIQUID_WS_URL.to_string();
     }
-
     if configured != DEFAULT_HYPERLIQUID_WS_URL {
         return configured.to_string();
     }
-
     match config.exchange.as_str() {
         "binance" => BINANCE_FUTURES_WS_BASE_URL.to_string(),
         "aster" => DEFAULT_ASTER_WS_URL.to_string(),
         "bybit" => DEFAULT_BYBIT_LINEAR_WS_URL.to_string(),
+        "extended" => DEFAULT_EXTENDED_WS_URL.to_string(),
         _ => DEFAULT_HYPERLIQUID_WS_URL.to_string(),
     }
+}
+
+fn extended_symbol(config: &Config) -> anyhow::Result<String> {
+    resolve_extended_ws_symbol(&config.symbol, config.coin.as_deref()).map_err(anyhow::Error::msg)
+}
+
+pub(crate) fn build_extended_trade_ws_endpoint(config: &Config) -> anyhow::Result<String> {
+    Ok(format!(
+        "{}/publicTrades/{}",
+        resolved_ws_base_url(config).trim_end_matches('/'),
+        extended_symbol(config)?
+    ))
+}
+pub(crate) fn build_extended_orderbook_ws_endpoint(config: &Config) -> anyhow::Result<String> {
+    let depth = if config.orderbook_levels == 1 {
+        "?depth=1"
+    } else {
+        ""
+    };
+    Ok(format!(
+        "{}/orderbooks/{}{depth}",
+        resolved_ws_base_url(config).trim_end_matches('/'),
+        extended_symbol(config)?
+    ))
+}
+pub(crate) fn build_extended_ohlcv_ws_endpoint(config: &Config) -> anyhow::Result<String> {
+    Ok(format!(
+        "{}/candles/{}/trades?interval={}",
+        resolved_ws_base_url(config).trim_end_matches('/'),
+        extended_symbol(config)?,
+        to_extended_ws_interval(&config.ohlcv_timeframe)?
+    ))
+}
+
+pub(crate) fn to_extended_ws_interval(timeframe: &str) -> anyhow::Result<&'static str> {
+    extended_interval(timeframe).map_err(anyhow::Error::msg)
 }
 
 pub(crate) fn build_binance_trade_ws_endpoint(config: &Config) -> anyhow::Result<String> {
@@ -484,6 +524,37 @@ pub(crate) fn parse_bybit_ohlcv_message(payload: &str) -> Vec<OhlcvRow> {
 
     parsed.sort_by_key(|candle| candle.timestamp());
     parsed
+}
+
+pub(crate) fn parse_extended_trades_message(payload: &str) -> Vec<TradeRow> {
+    parse_extended_trades(payload)
+        .into_iter()
+        .map(ws_trade_to_trade_row)
+        .collect()
+}
+
+pub(crate) fn parse_extended_ohlcv_message(payload: &str) -> Vec<OhlcvRow> {
+    parse_extended_candles(payload)
+        .into_iter()
+        .map(|(t, o, h, l, c, v)| OhlcvRow(t, o, h, l, c, v))
+        .collect()
+}
+
+pub(crate) fn parse_extended_orderbook_message(
+    state: &mut ExtendedOrderBookState,
+    payload: &str,
+    symbol: &str,
+    levels: usize,
+) -> Result<Option<OrderBookSnapshot>, String> {
+    state.apply(payload, symbol, levels).map(|book| {
+        book.map(|book| OrderBookSnapshot {
+            asks: book.asks,
+            bids: book.bids,
+            datetime: book.datetime,
+            timestamp: book.timestamp,
+            symbol: book.symbol,
+        })
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

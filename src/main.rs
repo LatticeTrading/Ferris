@@ -11,6 +11,7 @@ use ferris_market_data_backend::{
         aster::AsterExchange,
         binance::BinanceExchange,
         bybit::BybitExchange,
+        extended::ExtendedExchange,
         hyperliquid::HyperliquidExchange,
         lighterxyz::{LighterExchange, LighterMarketCatalogService},
         registry::ExchangeRegistry,
@@ -29,6 +30,10 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Config::from_env().context("failed to load configuration")?;
 
+    let extended_exchange = Arc::new(ExtendedExchange::new(
+        config.extended_rest_base_url.clone(),
+        config.request_timeout_ms,
+    )?);
     let aster_exchange = Arc::new(AsterExchange::new(config.request_timeout_ms)?);
     let binance_exchange = Arc::new(BinanceExchange::new(config.request_timeout_ms)?);
     let lighter_catalog_service = Arc::new(LighterMarketCatalogService::new(
@@ -37,6 +42,7 @@ async fn main() -> anyhow::Result<()> {
         config.lighter_market_catalog_refresh_ms,
     )?);
     let mut registry = ExchangeRegistry::new();
+    registry.register(extended_exchange.clone());
     registry.register(aster_exchange.clone());
     registry.register(binance_exchange.clone());
     registry.register(Arc::new(BybitExchange::new(config.request_timeout_ms)?));
@@ -55,17 +61,23 @@ async fn main() -> anyhow::Result<()> {
 
     let trades_topic_manager = TradesTopicManager::new(
         config.hyperliquid_base_url.clone(),
+        config.extended_ws_url.clone(),
         config.lighter_ws_url.clone(),
         lighter_catalog_service.clone(),
     );
     let order_book_topic_manager = OrderBookTopicManager::new(
         config.hyperliquid_base_url.clone(),
+        config.extended_ws_url.clone(),
         binance_exchange,
         aster_exchange,
         config.lighter_ws_url.clone(),
         lighter_catalog_service.clone(),
     );
-    let ohlcv_topic_manager = OhlcvTopicManager::new(config.hyperliquid_base_url.clone());
+    let ohlcv_topic_manager = OhlcvTopicManager::new(
+        config.hyperliquid_base_url.clone(),
+        config.extended_ws_url.clone(),
+    );
+
     let state = AppState::new(
         Arc::new(registry),
         trades_topic_manager,

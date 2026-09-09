@@ -21,7 +21,7 @@ Mode-specific options:
     --limit <count>        Dedup buffer sizing hint (default: 25)
 
   orderbook:
-  --levels <count>       Depth levels to display/request (default: 10; Hyperliquid max: 20; Binance/Aster max: 1000; Bybit max: 10000)
+  --levels <count>       Depth levels to display/request (default: 10; Hyperliquid max: 20; Binance/Aster/Extended max: 1000; Bybit max: 10000)
 
   ohlcv:
     --timeframe <value>    Candle timeframe (default: 1m)
@@ -33,6 +33,7 @@ Examples:
   cargo run --bin market_stream -- orderbook --exchange bybit --coin BTC
   cargo run --bin market_stream -- ohlcv --exchange bybit --coin BTC --timeframe 1m
   cargo run --bin market_stream -- ohlcv --exchange binance --symbol BTC/USDT:USDT
+  cargo run --bin market_stream -- orderbook --exchange extended --symbol BTC/USD:USD
 
 Notes:
   market_stream is websocket-only. Poll transport is intentionally removed.
@@ -171,10 +172,14 @@ pub(crate) fn parse_args(args: &[String]) -> Result<ParseResult, String> {
         ferris_market_data_backend::binance_orderbook::BINANCE_MAX_ORDERBOOK_LEVELS
     } else if config.exchange.trim().eq_ignore_ascii_case("aster") {
         MAX_ASTER_ORDERBOOK_LEVELS
+    } else if config.exchange.trim().eq_ignore_ascii_case("extended") {
+        1_000
     } else {
         MAX_HYPERLIQUID_ORDERBOOK_LEVELS
     };
-    let min_levels = if config.exchange.trim().eq_ignore_ascii_case("aster") {
+    let min_levels = if config.exchange.trim().eq_ignore_ascii_case("aster")
+        || config.exchange.trim().eq_ignore_ascii_case("extended")
+    {
         1
     } else {
         MIN_ORDERBOOK_LEVELS
