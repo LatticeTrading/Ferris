@@ -12,20 +12,23 @@ use serde_json::{json, Value};
 use tokio::{
     sync::{
         mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
-        RwLock,
+        Mutex, RwLock,
     },
-    time::sleep,
+    time::{sleep, Instant},
 };
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::{
-    exchanges::traits::{ExchangeError, MarketDataExchange},
+    exchanges::traits::{ExchangeError, MarketDataExchange, MarketStatsSource},
+    market_stats::make_market_id,
     models::{
         CcxtOhlcv, CcxtOrderBook, CcxtTrade, FetchMarketsParams, FetchOhlcvParams,
-        FetchOrderBookParams, FetchTradesParams, UnifiedMarket, UnifiedMarketInfo,
+        FetchOrderBookParams, FetchTradesParams, MarketIdentity, UnifiedMarket, UnifiedMarketInfo,
         UnifiedMarketType,
     },
 };
+
+mod statistics;
 
 const HYPERLIQUID_RECENT_TRADES_UPSTREAM_MAX: usize = 10;
 const DEFAULT_FETCH_TRADES_LIMIT: usize = 100;
@@ -36,6 +39,25 @@ const MAX_FETCH_ORDER_BOOK_LEVELS: usize = 20;
 const INITIAL_RECONNECT_DELAY_MS: u64 = 500;
 const MAX_RECONNECT_DELAY_MS: u64 = 15_000;
 
+#[derive(Clone, Copy)]
+enum InfoKey {
+    Primary,
+    Spot,
+}
+
+struct InfoObservation {
+    result: Result<Arc<Value>, ExchangeError>,
+    received_at: Instant,
+    received_timestamp: u64,
+    next_poll_at: Instant,
+}
+
+#[derive(Default)]
+struct InfoCacheEntry {
+    observation: RwLock<Option<Arc<InfoObservation>>>,
+    acquisition: Mutex<()>,
+}
+
 type HyperliquidWsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -43,6 +65,8 @@ pub struct HyperliquidExchange {
     http_client: reqwest::Client,
     base_url: String,
     catalog: RwLock<Option<MarketCatalog>>,
+    info_cache: [InfoCacheEntry; 2],
+    last_good_spot: RwLock<Option<Arc<Value>>>,
     trade_cache: TradeCache,
     collector: HyperliquidCollectorHandle,
 }
@@ -73,6 +97,8 @@ impl HyperliquidExchange {
             http_client,
             base_url,
             catalog: RwLock::new(None),
+            info_cache: Default::default(),
+            last_good_spot: RwLock::new(None),
             trade_cache,
             collector,
         })
@@ -107,6 +133,57 @@ impl HyperliquidExchange {
         })
     }
 
+    async fn cached_info(&self, key: InfoKey) -> Arc<InfoObservation> {
+        let (entry, request_type, interval) = match key {
+            InfoKey::Primary => (
+                &self.info_cache[0],
+                "metaAndAssetCtxs",
+                Duration::from_secs(30),
+            ),
+            InfoKey::Spot => (&self.info_cache[1], "spotMeta", Duration::from_secs(300)),
+        };
+        {
+            let cached = entry.observation.read().await;
+            if let Some(observation) = cached.as_ref() {
+                if observation.next_poll_at > Instant::now() {
+                    return observation.clone();
+                }
+            }
+        }
+
+        let _acquisition = entry.acquisition.lock().await;
+        {
+            let cached = entry.observation.read().await;
+            if let Some(observation) = cached.as_ref() {
+                if observation.next_poll_at > Instant::now() {
+                    return observation.clone();
+                }
+            }
+        }
+
+        // Only the per-source acquisition gate spans HTTP. Capture each source's
+        // receipt before any other await, including publication and the other key.
+        let result = self.post_info(json!({ "type": request_type })).await;
+        let received_at = Instant::now();
+        let received_timestamp = now_millis();
+        let observation = Arc::new(InfoObservation {
+            result: result.map(Arc::new),
+            received_at,
+            received_timestamp,
+            next_poll_at: received_at + interval,
+        });
+
+        if matches!(key, InfoKey::Spot) {
+            if let Ok(payload) = &observation.result {
+                if statistics::spot_metadata_complete(payload) {
+                    *self.last_good_spot.write().await = Some(payload.clone());
+                }
+            }
+        }
+        *entry.observation.write().await = Some(observation.clone());
+        observation
+    }
+
     async fn get_catalog(&self) -> Result<MarketCatalog, ExchangeError> {
         if let Some(cached) = self.catalog.read().await.clone() {
             return Ok(cached);
@@ -125,9 +202,11 @@ impl HyperliquidExchange {
     async fn build_catalog(&self) -> Result<MarketCatalog, ExchangeError> {
         let mut catalog = MarketCatalog::default();
 
-        let perps = self
-            .post_info(json!({ "type": "metaAndAssetCtxs" }))
-            .await?;
+        let (perps_observation, spot_observation) = tokio::join!(
+            self.cached_info(InfoKey::Primary),
+            self.cached_info(InfoKey::Spot),
+        );
+        let perps = perps_observation.result.as_ref().map_err(Clone::clone)?;
         if let Some(universe) = perps
             .get(0)
             .and_then(|item| item.get("universe"))
@@ -142,7 +221,7 @@ impl HyperliquidExchange {
             }
         }
 
-        let spot_meta = self.post_info(json!({ "type": "spotMeta" })).await?;
+        let spot_meta = spot_observation.result.as_ref().map_err(Clone::clone)?;
         let token_map = parse_token_map(&spot_meta)?;
         let token_aliases = build_token_aliases(&spot_meta);
 
@@ -251,6 +330,10 @@ impl HyperliquidExchange {
 impl MarketDataExchange for HyperliquidExchange {
     fn id(&self) -> &'static str {
         "hyperliquid"
+    }
+
+    fn market_stats_source(&self) -> Option<&dyn MarketStatsSource> {
+        Some(self)
     }
 
     async fn fetch_trades(
@@ -470,117 +553,37 @@ impl MarketDataExchange for HyperliquidExchange {
     ) -> Result<Vec<UnifiedMarket>, ExchangeError> {
         let mut markets = Vec::<UnifiedMarket>::new();
 
-        let perps = self
-            .post_info(json!({ "type": "metaAndAssetCtxs" }))
-            .await?;
+        let (perps_observation, spot_observation) = tokio::join!(
+            self.cached_info(InfoKey::Primary),
+            self.cached_info(InfoKey::Spot),
+        );
+        let perps = perps_observation.result.as_ref().map_err(Clone::clone)?;
+        let spot_meta = spot_observation.result.as_ref().map_err(Clone::clone)?;
+        let settlement = resolve_settlement(&perps, &spot_meta);
         if let Some(universe) = perps
             .get(0)
             .and_then(|item| item.get("universe"))
             .and_then(Value::as_array)
         {
             for item in universe {
-                let Some(base_raw) = item.get("name").and_then(Value::as_str) else {
+                let Ok(market) = map_perp_market(item, &settlement) else {
                     continue;
                 };
-
-                let Ok(base) = sanitize_asset_for_market(base_raw) else {
-                    continue;
-                };
-
-                let active = !item
-                    .get("isDelisted")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                if !params.include_inactive && !active {
-                    continue;
+                if params.include_inactive || market.active {
+                    markets.push(market);
                 }
-
-                markets.push(UnifiedMarket {
-                    exchange: "hyperliquid".to_string(),
-                    symbol: format!("{base}/USDC"),
-                    base,
-                    quote: "USDC".to_string(),
-                    market_type: UnifiedMarketType::Perp,
-                    active,
-                    min_order_size: item
-                        .get("minOrderSize")
-                        .and_then(parse_f64_lossy_for_market)
-                        .or_else(|| item.get("szDecimals").and_then(parse_f64_lossy_for_market)),
-                    tick_size: item.get("tickSize").and_then(parse_f64_lossy_for_market),
-                    contract_size: Some(1.0),
-                    info: UnifiedMarketInfo {
-                        category: None,
-                        raw_symbol: Some(base_raw.to_string()),
-                        exchange_symbol: Some(base_raw.to_string()),
-                    },
-                });
             }
         }
 
-        let spot_meta = self.post_info(json!({ "type": "spotMeta" })).await?;
         if let Ok(token_map) = parse_token_map(&spot_meta) {
             if let Some(universe) = spot_meta.get("universe").and_then(Value::as_array) {
                 for pair in universe {
-                    let Some(token_indexes) = pair.get("tokens").and_then(Value::as_array) else {
+                    let Some(market) = map_spot_market(pair, &token_map) else {
                         continue;
                     };
-                    if token_indexes.len() != 2 {
-                        continue;
+                    if params.include_inactive || market.active {
+                        markets.push(market);
                     }
-
-                    let Some(base_idx) = token_indexes[0].as_u64() else {
-                        continue;
-                    };
-                    let Some(quote_idx) = token_indexes[1].as_u64() else {
-                        continue;
-                    };
-
-                    let Some(base_raw) = token_map.get(&base_idx) else {
-                        continue;
-                    };
-                    let Some(quote_raw) = token_map.get(&quote_idx) else {
-                        continue;
-                    };
-
-                    let Ok(base) = sanitize_asset_for_market(base_raw) else {
-                        continue;
-                    };
-                    let Ok(quote) = sanitize_asset_for_market(quote_raw) else {
-                        continue;
-                    };
-
-                    let active = !pair
-                        .get("isDelisted")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false);
-                    if !params.include_inactive && !active {
-                        continue;
-                    }
-
-                    let raw_symbol = pair
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                        .unwrap_or_else(|| format!("{base}/{quote}"));
-
-                    markets.push(UnifiedMarket {
-                        exchange: "hyperliquid".to_string(),
-                        symbol: format!("{base}/{quote}"),
-                        base,
-                        quote,
-                        market_type: UnifiedMarketType::Spot,
-                        active,
-                        min_order_size: pair
-                            .get("minTradeNtl")
-                            .and_then(parse_f64_lossy_for_market),
-                        tick_size: None,
-                        contract_size: None,
-                        info: UnifiedMarketInfo {
-                            category: None,
-                            raw_symbol: Some(raw_symbol.clone()),
-                            exchange_symbol: Some(raw_symbol),
-                        },
-                    });
                 }
             }
         }
@@ -597,6 +600,129 @@ impl MarketDataExchange for HyperliquidExchange {
         });
 
         Ok(markets)
+    }
+}
+
+fn map_perp_market(
+    item: &Value,
+    settlement: &(Option<String>, Option<String>),
+) -> Result<UnifiedMarket, ExchangeError> {
+    let base_raw = value_str(item, "name")?;
+    let base = sanitize_asset_for_market(base_raw)?;
+    Ok(UnifiedMarket {
+        identity: Some(market_identity(
+            UnifiedMarketType::Perp,
+            base_raw,
+            settlement,
+        )?),
+        exchange: "hyperliquid".to_string(),
+        symbol: format!("{base}/USDC"),
+        base,
+        quote: "USDC".to_string(),
+        market_type: UnifiedMarketType::Perp,
+        active: !item
+            .get("isDelisted")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        min_order_size: item
+            .get("minOrderSize")
+            .and_then(parse_f64_lossy_for_market)
+            .or_else(|| item.get("szDecimals").and_then(parse_f64_lossy_for_market)),
+        tick_size: item.get("tickSize").and_then(parse_f64_lossy_for_market),
+        contract_size: Some(1.0),
+        info: UnifiedMarketInfo {
+            category: None,
+            raw_symbol: Some(base_raw.to_string()),
+            exchange_symbol: Some(base_raw.to_string()),
+        },
+    })
+}
+
+fn map_spot_market(pair: &Value, token_map: &HashMap<u64, String>) -> Option<UnifiedMarket> {
+    let index = pair.get("index")?.as_u64()?;
+    let token_indexes = pair.get("tokens")?.as_array()?;
+    if token_indexes.len() != 2 {
+        return None;
+    }
+    let base_raw = token_map.get(&token_indexes[0].as_u64()?)?;
+    let quote_raw = token_map.get(&token_indexes[1].as_u64()?)?;
+    let base = sanitize_asset_for_market(base_raw).ok()?;
+    let quote = sanitize_asset_for_market(quote_raw).ok()?;
+    let raw_symbol = pair
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{base}/{quote}"));
+
+    Some(UnifiedMarket {
+        identity: Some(
+            market_identity(UnifiedMarketType::Spot, &index.to_string(), &(None, None)).ok()?,
+        ),
+        exchange: "hyperliquid".to_string(),
+        symbol: format!("{base}/{quote}"),
+        base,
+        quote,
+        market_type: UnifiedMarketType::Spot,
+        active: !pair
+            .get("isDelisted")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        min_order_size: pair.get("minTradeNtl").and_then(parse_f64_lossy_for_market),
+        tick_size: None,
+        contract_size: None,
+        info: UnifiedMarketInfo {
+            category: None,
+            raw_symbol: Some(raw_symbol.clone()),
+            exchange_symbol: Some(raw_symbol),
+        },
+    })
+}
+
+fn market_identity(
+    market_type: UnifiedMarketType,
+    native_id: &str,
+    settlement: &(Option<String>, Option<String>),
+) -> Result<MarketIdentity, ExchangeError> {
+    let dex = matches!(market_type, UnifiedMarketType::Perp).then_some("");
+    Ok(MarketIdentity {
+        market_id: make_market_id("hyperliquid", market_type, None, dex, native_id)?,
+        exchange_market_id: native_id.to_string(),
+        category: None,
+        dex: dex.map(str::to_string),
+        contract_type: None,
+        settle: settlement.0.clone(),
+        settlement_asset_id: settlement.1.clone(),
+    })
+}
+
+fn resolve_settlement(perps: &Value, spot: &Value) -> (Option<String>, Option<String>) {
+    let Some(index) = perps
+        .get(0)
+        .and_then(|meta| meta.get("collateralToken"))
+        .and_then(Value::as_u64)
+    else {
+        return (None, None);
+    };
+    let Some(tokens) = spot.get("tokens").and_then(Value::as_array) else {
+        return (None, None);
+    };
+    let mut matches = tokens
+        .iter()
+        .filter(|token| token.get("index").and_then(Value::as_u64) == Some(index));
+    let Some(token) = matches.next() else {
+        return (None, None);
+    };
+    if matches.next().is_some() {
+        return (None, None);
+    }
+    match (
+        token.get("name").and_then(Value::as_str),
+        token.get("tokenId").and_then(Value::as_str),
+    ) {
+        (Some(name), Some(id)) if !name.is_empty() && !id.is_empty() => {
+            (Some(name.to_string()), Some(id.to_string()))
+        }
+        _ => (None, None),
     }
 }
 
@@ -1416,5 +1542,37 @@ mod tests {
         let trades = cache.get_trades("BTC").await;
         assert_eq!(trades.len(), 1);
         assert_eq!(trade_identity(&trades[0]).as_deref(), Some("tid:1"));
+    }
+
+    #[test]
+    fn market_stats_identity_and_settlement_use_native_indexes() {
+        let perps = json!([{"collateralToken": 7}, []]);
+        let spot = json!({"tokens": [
+            {"index": 7, "name": "USDC", "tokenId": "native-usdc"},
+            {"index": 0, "name": "WRONG", "tokenId": "wrong"}
+        ]});
+        let settlement = super::resolve_settlement(&perps, &spot);
+        assert_eq!(
+            settlement,
+            (Some("USDC".into()), Some("native-usdc".into()))
+        );
+        let perp =
+            super::market_identity(crate::models::UnifiedMarketType::Perp, "A-B", &settlement)
+                .unwrap();
+        let other =
+            super::market_identity(crate::models::UnifiedMarketType::Perp, "AB", &settlement)
+                .unwrap();
+        let spot =
+            super::market_identity(crate::models::UnifiedMarketType::Spot, "0", &(None, None))
+                .unwrap();
+        assert_ne!(perp.market_id, other.market_id);
+        assert_eq!(perp.market_id, r#"["hyperliquid","perp",null,"","A-B"]"#);
+        assert_eq!(spot.market_id, r#"["hyperliquid","spot",null,null,"0"]"#);
+        assert!(spot.settle.is_none());
+        let duplicate = json!({"tokens":[
+            {"index":7,"name":"USDC","tokenId":"native-usdc"},
+            {"index":7,"name":"OTHER","tokenId":"other"}
+        ]});
+        assert_eq!(super::resolve_settlement(&perps, &duplicate), (None, None));
     }
 }

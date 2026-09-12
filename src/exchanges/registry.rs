@@ -24,4 +24,10 @@ impl ExchangeRegistry {
             .get(&exchange_id.to_ascii_lowercase())
             .cloned()
     }
+
+    pub fn ids(&self) -> Vec<&str> {
+        let mut ids: Vec<_> = self.exchanges.keys().map(String::as_str).collect();
+        ids.sort_unstable();
+        ids
+    }
 }

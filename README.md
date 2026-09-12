@@ -6,11 +6,11 @@ Planning and delivery tracking lives in `ROADMAP.md`.
 
 Frontend integration guidance lives in `INTEGRATION_README.md`.
 
-- unified endpoint shapes (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`, `fetchMarkets`)
+- unified endpoint shapes (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`, `fetchMarkets`, `fetchMarketStats`)
 - backend websocket fanout for realtime channels (`GET /v1/ws`)
 - pluggable exchange adapter architecture
 - market-data support for `hyperliquid`, `binance`, `bybit`, `aster`, and `extended` perpetuals
-- one upstream websocket stream per active topic with multi-client broadcast
+- shared upstream websocket topics for trades/books/candles; shared 30-second REST polling for Hyperliquid statistics
 - background websocket trade collector with in-memory ring buffer for deeper snapshot history
 
 ## Why this exists
@@ -25,9 +25,9 @@ Frontend apps (including Electron and web frontends) often cannot directly use s
 ## Realtime Architecture
 
 - app client connects once to `GET /v1/ws` and sends `subscribe` / `unsubscribe` commands
-- backend topic manager keys subscriptions by exchange + channel + symbol (+ params)
-- one upstream websocket stream is maintained per active topic
-- multiple client connections subscribed to the same topic receive the same broadcast updates
+- trades/books/candles use exchange + channel + symbol (+ params) topics and shared upstream websocket streams
+- statistics share one exchange/scope acquisition across all-market and selected projections
+- clients receive topic-specific updates; statistics use ordered snapshots and revisioned deltas
 - idle topics are closed, and dropped upstream streams reconnect with backoff
 
 ## Current scope
@@ -37,14 +37,17 @@ Frontend apps (including Electron and web frontends) often cannot directly use s
   - `POST /v1/fetchOHLCV`
   - `POST /v1/fetchOrderBook`
   - `POST /v1/fetchMarkets`
+  - `POST /v1/fetchMarketStats` (Hyperliquid primary perps only; selected spot applicability)
+- Capability discovery: `GET /v1/capabilities` (no upstream acquisition)
 - Realtime endpoint:
-  - `GET /v1/ws` (websocket subscribe/unsubscribe for realtime `trades`, `orderbook`, `ohlcv`)
+  - `GET /v1/ws` (channels `trades`, `orderbook`, `ohlcv`, `marketstats`)
 - Realtime channel support:
   - `trades`: `hyperliquid`, `binance`, `bybit`, `aster`, `extended`
   - `orderbook`: `hyperliquid`, `binance`, `bybit`, `aster`, `extended`
   - `ohlcv`: `binance`, `bybit`, `aster`, `extended`
+  - `marketstats`: `hyperliquid` only, upstream mode `sharedPolling`
 - exchange supported:
-  - `hyperliquid` (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`, `fetchMarkets`)
+  - `hyperliquid` (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`, `fetchMarkets`, `fetchMarketStats`)
   - `binance` (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`, `fetchMarkets`)
   - `bybit` (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`, `fetchMarkets`)
   - `aster` futures/perpetual markets (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`, `fetchMarkets`)
@@ -140,7 +143,7 @@ Response body (CCXT-like `OHLCV[]`):
 
 `GET /v1/ws`
 
-The websocket endpoint supports realtime `trades`, `orderbook`, and `ohlcv` channels. Backend topic fanout is shared, so multiple app clients subscribing to the same topic use one upstream exchange stream.
+The websocket endpoint supports `trades`, `orderbook`, `ohlcv`, and `marketstats`. The first three share upstream exchange streams; statistics use the shared REST acquisition described below, not a native upstream stream.
 
 Subscribe command:
 
@@ -339,6 +342,8 @@ Response body (CCXT-like `OrderBook`):
 
 Snapshot endpoint for exchange symbols/market metadata. Symbols are always returned in canonical `BASE/QUOTE` format (uppercase, no settlement suffix like `:USDT`).
 
+Hyperliquid rows also include `marketId`, `exchangeMarketId`, `category`, `dex`, `contractType`, `settle`, and `settlementAssetId`. Use the opaque catalog-issued `marketId` to select statistics; never derive it from display symbols. Primary perps have `dex: ""`; spot has `dex: null`. Settlement comes from collateral token metadata, independently of display/price quote. Unresolved settlement and nullable identity metadata are null. Deferred adapters omit the identity extension.
+
 Request body:
 
 ```json
@@ -393,6 +398,51 @@ Error shape for this endpoint:
   }
 }
 ```
+
+### Market Statistics and Capabilities
+
+`GET /v1/capabilities` enumerates registered adapters without fetching upstream data. Only Hyperliquid advertises statistics support. Funding history remains unsupported everywhere. Runtime failures do not change capabilities.
+
+`POST /v1/fetchMarketStats`:
+
+```json
+{"exchange":"hyperliquid","fields":["funding","markPrice","indexPrice"],"params":{"dex":""}}
+```
+
+Omitted/null `marketIds` selects all active primary perpetuals. For selected markets, pass an array of exact catalog-issued ID strings (1–100 inputs, case-sensitive; duplicates removed). Explicit selections may include inactive perps or spot. Omitted/null `fields` means `["funding"]`; empty lists are invalid. Only null, `{}`, or `{"dex":""}` params are accepted. REST rejects unknown top-level keys, including `symbol`. Unknown IDs require a complete corresponding catalog; incomplete catalog identity yields 502, not a fabricated 400.
+
+Response: `{timestamp, scope, markets, coverage}`. Scope is `{"exchange":"hyperliquid","params":{"dex":""}}`; rows flatten catalog columns and add only requested `fields`. Coverage contains `expectedMarkets`, `returnedMarkets`, `enumerationComplete`, and `sourceFailures`. Cold all-market upstream failure returns 200 with no rows, null expected count, incomplete enumeration, and explicit failures. Known membership is retained on failure. Registered deferred adapters return 501 / `UNSUPPORTED_FEATURE`; errors use flat `{code,message}`.
+
+Each field is `{state,value,reason,exchangeTimestamp,receivedTimestamp,source}`. States distinguish `available`, `notApplicable`, `unsupported`, `unavailable`, and `stale`; unavailable values are not zero. An example valid funding field (illustrative, not live data):
+
+```json
+{"state":"available","value":{"rate":"-0.0000125","kind":"currentUnclassified","rateIntervalMs":null,"paymentIntervalMs":3600000,"paymentTimestamp":null,"nextPaymentTimestamp":null},"reason":"rate-basis-unverified","exchangeTimestamp":null,"receivedTimestamp":1789171200000,"source":"hyperliquid:primary:metaAndAssetCtxs"}
+```
+
+- Funding preserves the exact signed decimal string, including zero. Positive means longs pay shorts. Its rate-period basis is unverified: do not annualize, divide by eight, infer next payment time, or label it settled/guaranteed.
+- `markPrice`/`indexPrice` are mark/oracle observations with `{amount,baseAsset,quoteAsset}`. Price quote is USDC for exact HYPE/PURR names, otherwise USDT; settlement is independent. Never replace oracle with mid price.
+- Spot funding/last-settled funding are `notApplicable`; inactive perp observations are `unavailable` / `inactive-market`.
+- Perp `volume24h`/`openInterest` are `unsupported` / `units-unverified`. `lastPrice`, perp `lastSettledFunding`, and spot non-funding fields are not implemented.
+- One primary poll every 30 seconds serves all clients; spot metadata caches five minutes. Field receipts change only on upstream observation, not reads. Failures immediately stale retained values; independent 90-second expiry also stales observations, including while a request is pending. Explicit invalid scalars clear values and cannot be resurrected by later failures.
+- HTTP requests renew a 90-second demand lease; WS subscriptions hold persistent reference-counted demand. Idle workers stop. Capabilities disclose these limits and receipt-time freshness.
+
+Statistics socket subscription (no `symbol`; `funding` is not a channel alias):
+
+```json
+{"op":"subscribe","channel":"marketstats","exchange":"hyperliquid","params":{"dex":""},"fields":["funding"]}
+```
+
+Optional `marketIds` uses the same selection contract. Server canonicalizes topic IDs/fields; duplicate topics return `alreadySubscribed`. Maximum 16 distinct statistics subscriptions per socket. Unsubscribe with the same topic and `op: "unsubscribe"`, even after a selected market disappears.
+
+Delivery contract:
+
+1. `subscribed` is queued before data. First data has `type:"marketstats"`, `mode:"snapshot"`, canonical `topic`, new opaque `generation`, `revision:1`, plus flattened snapshot fields.
+2. Deltas have `mode:"delta"`, the same generation/topic, `previousRevision`, incremented `revision`, `timestamp`, `scope`, `updates`, `removedMarketIds`, and current `coverage`.
+3. Replace the whole view on snapshot. Accept a delta only when generation matches and `previousRevision` equals the applied revision; otherwise discard it and resubscribe.
+4. Each update includes catalog identity/display columns. Present field objects replace prior objects atomically (including null value); absent fields are unchanged. New rows and identity/active changes include all requested fields. Remove only IDs in `removedMarketIds`.
+5. Complete source states coalesce before delta construction, at most once per second. Coverage and new receipt timestamps are changes even if rates are unchanged. Slow-client queue failure closes the connection; reconnect/resubscribe starts a new generation/full snapshot. There is no durable replay.
+
+Delivery gates, commands, live observations, and the one-additional-exchange procedure are in [FUNDING_MARKET_STATS_PLAN.md](FUNDING_MARKET_STATS_PLAN.md). No frontend implementation or other exchange funding support is included.
 
 ### Health
 

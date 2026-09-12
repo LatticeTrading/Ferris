@@ -555,6 +555,7 @@ impl LighterMarket {
 
     fn into_unified_market(self) -> UnifiedMarket {
         UnifiedMarket {
+            identity: None,
             exchange: "lighterxyz".to_string(),
             symbol: self.symbol,
             base: self.base,

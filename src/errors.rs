@@ -13,6 +13,8 @@ pub enum ApiError {
     Validation(String),
     #[error("unsupported exchange: {0}")]
     UnsupportedExchange(String),
+    #[error("unsupported feature: {0}")]
+    UnsupportedFeature(String),
     #[error(transparent)]
     Exchange(#[from] ExchangeError),
 }
@@ -32,6 +34,9 @@ impl IntoResponse for ApiError {
                 "UNSUPPORTED_EXCHANGE",
                 format!("exchange `{exchange_id}` is not supported"),
             ),
+            ApiError::UnsupportedFeature(message) => {
+                (StatusCode::NOT_IMPLEMENTED, "UNSUPPORTED_FEATURE", message)
+            }
             ApiError::Exchange(exchange_error) => map_exchange_error(exchange_error),
         };
 
@@ -54,5 +59,31 @@ fn map_exchange_error(error: ExchangeError) -> (StatusCode, &'static str, String
             "INTERNAL_EXCHANGE_ERROR",
             message,
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::to_bytes;
+    use serde_json::{json, Value};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn market_stats_unsupported_feature_uses_flat_error_contract() {
+        let response = ApiError::UnsupportedFeature(
+            "market statistics are not implemented for exchange 'bybit'".to_string(),
+        )
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            json!({
+                "code": "UNSUPPORTED_FEATURE",
+                "message": "market statistics are not implemented for exchange 'bybit'",
+            }),
+        );
     }
 }

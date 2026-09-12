@@ -9,8 +9,8 @@ Primary goal: consume live market data through backend websocket fanout (`GET /v
 - Load market/symbol catalog with `fetchMarkets` at app startup (or periodic refresh).
 - Use snapshot endpoints for initial render (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`).
 - Open one websocket connection to `GET /v1/ws`.
-- Send `subscribe` commands for the channels you need (`trades`, `orderbook`, `ohlcv`).
-- Consume push updates by message type (`trades`, `orderbook`, `ohlcv`).
+- Send `subscribe` commands for the channels you need (`trades`, `orderbook`, `ohlcv`, `marketstats`).
+- Consume push updates by message type; statistics have a distinct snapshot/delta reducer contract below.
 - Reconnect and resubscribe automatically on disconnect.
 - Avoid high-frequency polling for live updates.
 
@@ -38,6 +38,8 @@ If you only have an HTTP base URL string, derive WS URL like this:
   - `POST /v1/fetchTrades`
   - `POST /v1/fetchOHLCV`
   - `POST /v1/fetchOrderBook`
+  - `POST /v1/fetchMarketStats` (Hyperliquid only)
+- Discovery: `GET /v1/capabilities`
 - Realtime endpoint:
   - `GET /v1/ws`
 
@@ -45,6 +47,7 @@ Supported realtime channels:
 - `trades`: `hyperliquid`, `binance`, `bybit`, `aster`, `extended`
 - `orderbook`: `hyperliquid`, `binance`, `bybit`, `aster`, `extended`
 - `ohlcv`: `binance`, `bybit`, `aster`, `extended`
+- `marketstats`: `hyperliquid`, primary DEX only, shared 30-second REST polling
 - Extended is perpetual public market-data only: four REST snapshot endpoints plus realtime trades, books, and OHLCV. Use `BTC/USD:USD` for trade/book streams; the market catalog returns `BTC/USD`. Both forms resolve to upstream `BTC-USD`.
 - Extended's standard websocket order book is indicative, not the RFQ real book. Spot, private trading/account, funding, and account streams are unsupported.
 - Extended upstream REST and websocket URLs are configurable for testnet deployments; frontend clients always use this backend contract.
@@ -164,6 +167,7 @@ Client commands are JSON text frames.
 - `type: "trades"` + `topic` + `data: CcxtTrade[]`
 - `type: "orderbook"` + `topic` + `data: CcxtOrderBook`
 - `type: "ohlcv"` + `topic` + `data: CcxtOhlcv[]`
+- `type: "marketstats"` + `mode: "snapshot" | "delta"` + canonical topic/generation/revision (see [statistics contract](README.md#market-statistics-and-capabilities))
 - `type: "warning"` with `code: "CLIENT_LAGGED"`
 - `type: "pong"`
 - `type: "error"` with codes like:
@@ -172,10 +176,11 @@ Client commands are JSON text frames.
   - `INVALID_TOPIC`
   - `SUBSCRIBE_FAILED`
   - `NOT_SUBSCRIBED`
+  - Statistics also use `UNSUPPORTED_EXCHANGE`, `UNSUPPORTED_FEATURE`, and `SUBSCRIPTION_LIMIT`.
 
 ## Topic Rules
 
-Include all of these for `subscribe`/`unsubscribe`:
+For legacy `trades`/`orderbook`/`ohlcv` topics, include:
 
 - `channel`: `"trades"`, `"orderbook"`, or `"ohlcv"`
 - `exchange`: if omitted, defaults to `"hyperliquid"`
@@ -251,9 +256,21 @@ The viewer connects directly upstream and uses trade candles. Backend URLs are c
 
 Important: use the `topic` returned in `subscribed` ack as your canonical local key when possible.
 
+## Funding Statistics Client Flow
+
+This backend slice ships Hyperliquid only; query capabilities rather than inferring support from exchange registration. Funding history is unsupported. The sibling frontend was not changed.
+
+1. Get `/v1/capabilities`, then `/v1/fetchMarkets` for authoritative `marketId` strings. Display pairs can collide; statistics use opaque IDs, not `symbol`.
+2. Optional REST bootstrap: `POST /v1/fetchMarketStats` with `marketIds` omitted for all active primary perps, or a nonempty array of up to 100 catalog IDs. Default field is funding; empty IDs/fields are errors. Params are null/`{}`/`{"dex":""}` only.
+3. Subscribe with `{"op":"subscribe","channel":"marketstats","exchange":"hyperliquid","fields":["funding"],"params":{"dex":""}}`; add `marketIds` for selected rows. Do not send `symbol`. Maximum 16 distinct statistics topics per connection.
+4. Expect `subscribed` before the initial snapshot. Replace the view and remember `generation`/`revision`. On a delta, verify generation and `previousRevision`; mismatch means discard/resubscribe. Apply full field-object replacements, keep absent fields unchanged, remove `removedMarketIds`, and replace coverage. Do not merge a later-arriving REST bootstrap into an established WS generation.
+5. Statistics coalesce complete states before sparse deltas; new receipt timestamps and coverage changes are observable even with unchanged numbers. On disconnect, reconnect/resubscribe for a new generation/full snapshot; no replay. Unsubscribe by canonical topic on unmount, including after a selected ID disappears.
+
+Treat field states as data, not truthiness: zero funding is available; spot funding is not applicable; unsupported OI/volume are not zero; failed/expired retained observations are stale with original receipts. Valid current funding is `currentUnclassified` / `rate-basis-unverified`, has null rate interval, and an hourly payment interval. Do not annualize or infer next payment timestamps. See [full API, units, coverage, and error semantics](README.md#market-statistics-and-capabilities).
+
 ## Recommended Client Flow
 
-For each market view:
+For each legacy trade/book/candle market view:
 
 1. Call `fetchMarkets` for the selected exchange and cache it (refresh around every 30s if needed).
 2. Use the returned canonical `symbol` (`BASE/QUOTE`) as your UI key.

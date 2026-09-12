@@ -504,6 +504,7 @@ fn map_market_row(
         });
 
     Ok(Some(UnifiedMarket {
+        identity: None,
         exchange: "bybit".to_string(),
         symbol: format!("{base}/{quote}"),
         base,

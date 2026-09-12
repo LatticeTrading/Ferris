@@ -415,6 +415,7 @@ fn map_market(row: &Value, include_inactive: bool) -> Option<UnifiedMarket> {
     let min_order_size = filter_number(row, "LOT_SIZE", "minQty");
     let tick_size = filter_number(row, "PRICE_FILTER", "tickSize");
     Some(UnifiedMarket {
+        identity: None,
         exchange: "aster".to_string(),
         symbol: format!("{base}/{quote}"),
         base,

@@ -404,6 +404,7 @@ fn map_exchange_information_symbol(
     .then_some(1.0);
 
     Ok(Some(UnifiedMarket {
+        identity: None,
         exchange: "binance".to_string(),
         symbol: format!("{base}/{quote}"),
         base,

@@ -1,11 +1,13 @@
 use async_trait::async_trait;
 
+use crate::market_stats::MarketStatsSourceSnapshot;
 use crate::models::{
-    CcxtOhlcv, CcxtOrderBook, CcxtTrade, FetchMarketsParams, FetchOhlcvParams,
-    FetchOrderBookParams, FetchTradesParams, UnifiedMarket,
+    CcxtOhlcv, CcxtOrderBook, CcxtTrade, FetchMarketStatsParams, FetchMarketsParams,
+    FetchOhlcvParams, FetchOrderBookParams, FetchTradesParams, MarketStatsCapabilities,
+    UnifiedMarket,
 };
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum ExchangeError {
     #[error("bad symbol: {0}")]
     BadSymbol(String),
@@ -18,8 +20,22 @@ pub enum ExchangeError {
 }
 
 #[async_trait]
+pub trait MarketStatsSource: Send + Sync {
+    fn capabilities(&self) -> MarketStatsCapabilities;
+
+    async fn fetch_market_stats(
+        &self,
+        params: FetchMarketStatsParams,
+    ) -> Result<MarketStatsSourceSnapshot, ExchangeError>;
+}
+
+#[async_trait]
 pub trait MarketDataExchange: Send + Sync {
     fn id(&self) -> &'static str;
+
+    fn market_stats_source(&self) -> Option<&dyn MarketStatsSource> {
+        None
+    }
 
     async fn fetch_trades(
         &self,

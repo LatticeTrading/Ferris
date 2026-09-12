@@ -91,10 +91,12 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/fetchOHLCV", post(web::fetch_ohlcv))
         .route("/v1/fetchOrderBook", post(web::fetch_order_book))
         .route("/v1/fetchMarkets", post(web::fetch_markets))
+        .route("/v1/fetchMarketStats", post(web::fetch_market_stats))
+        .route("/v1/capabilities", get(web::capabilities))
         .route("/v1/ws", get(web::trades_stream_ws))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
-        .with_state(state);
+        .with_state(state.clone());
 
     let addr: SocketAddr = format!("{}:{}", config.host, config.port)
         .parse()
@@ -118,10 +120,12 @@ async fn main() -> anyhow::Result<()> {
         "server started"
     );
 
-    axum::serve(listener, app)
+    let result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
-        .context("server error")?;
+        .context("server error");
+    state.shutdown_market_stats().await;
+    result?;
 
     Ok(())
 }

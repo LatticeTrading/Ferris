@@ -293,6 +293,7 @@ fn map_market(row: &Value, include_inactive: bool) -> Option<UnifiedMarket> {
         return None;
     }
     Some(UnifiedMarket {
+        identity: None,
         exchange: "extended".to_string(),
         symbol: market.replace('-', "/"),
         base,
