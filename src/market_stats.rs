@@ -389,7 +389,7 @@ async fn run_source(
             }
             if let Some(result) = outcome.take() {
                 let previous = source.latest.borrow().clone();
-                let fresh = merge_outcome(&previous, result);
+                let fresh = merge_outcome(&previous, result, exchange.id());
                 source.latest.send_replace(Arc::new(fresh));
                 source.initialized = true;
             }

@@ -1,37 +1,73 @@
-# Funding market statistics: Hyperliquid-first delivery ledger
+# Funding market statistics: Hyperliquid + Binance + Lighter delivery ledger
 
 ## 1. Active slice and exchange delivery ledger
 
-**Approved execution scope: Hyperliquid only, primary-DEX active perpetuals, using one shared 30-second REST poll.** Deliver exchange-wide and selected-market statistics, truthful capabilities, and snapshot/delta delivery on Ferris's existing WebSocket. Explicitly selected spot funding is not applicable. This is backend work in Ferris; do not modify the sibling Lattice frontend.
+**Approved execution scope: Hyperliquid primary-DEX active perpetuals plus Binance USDⓈ-M active `contractType: PERPETUAL` markets, using one shared 30-second REST poll.** Deliver exchange-wide and selected-market statistics, truthful capabilities, and snapshot/delta delivery on Ferris's existing WebSocket. Explicitly selected inactive Binance perps remain selectable and report implemented fields as unavailable / `inactive-market`; selected spot funding is not applicable. This is backend work in Ferris; do not modify the sibling Lattice frontend.
 
-This active specification supersedes the older research below. Retained sections 2–9 and 11 are historical evidence and deferred design research, not executable tasks or a statement of current implementation. Their venue recipes, broad model proposals, history endpoints, native-stream options, and illustrative wire examples do not expand this slice. The exact active contract below wins wherever retained research differs. In particular, the old Hyperliquid native-stream recommendation is superseded by shared polling, and there is no instruction to deliver all six venues together.
+This active specification supersedes the older research below. Retained sections 2–9 and 11 are historical evidence and deferred design research, not executable tasks or a statement of current implementation. Their venue recipes, broad model proposals, history endpoints, native-stream options, and illustrative wire examples do not expand this slice. The exact active contract below wins wherever retained research differs. The old Hyperliquid native-stream recommendation is superseded by shared polling; Binance likewise uses the shipped Hyperliquid coordinator and wire contract rather than a native upstream statistics stream.
 
 | Complete | Exchange | Approved product scope | Session status |
 | --- | --- | --- | --- |
 | [x] | `hyperliquid` | Primary-DEX active perps; selected spot funding explicitly not applicable | **COMPLETE: deterministic and live checks passed** |
-| [ ] | `binance` | Not yet selected/qualified for implementation | Deferred |
-| [ ] | `bybit` | Not yet selected/qualified for implementation | Deferred |
-| [ ] | `aster` | Not yet selected/qualified for implementation | Deferred |
-| [ ] | `extended` | Not yet selected/qualified for implementation | Deferred |
-| [ ] | `lighterxyz` | Not yet selected/qualified for implementation | Deferred |
+| [x] | `binance` | USDⓈ-M active exact `contractType: PERPETUAL`; selected inactive perps allowed | **COMPLETE: deterministic and live checks passed** |
+| [ ] | `bybit` | Not selected for implementation | Deferred |
+| [ ] | `aster` | Not selected for implementation | Deferred |
+| [ ] | `extended` | Not selected for implementation | Deferred |
+| [x] | `lighterxyz` | Native Lighter perpetual market stats; selected spot funding not applicable | **COMPLETE: focused deterministic and bounded live checks passed** |
 
 Hyperliquid completion gates:
 
 - [x] Catalog IDs and settlement metadata match statistics identities.
 - [x] All-market/selected snapshots share one primary bulk acquisition; field states and freshness are correct.
 - [x] Ferris WS snapshots/deltas, ordering, unsubscribe, coalescing, and recovery pass the specified checks.
-- [x] Capabilities advertise only delivered Hyperliquid support and its unknown rate-basis limitation.
+- [x] Capabilities advertise only delivered Hyperliquid and Binance support, with each venue's rate-basis limitation.
 - [x] Deterministic checks and the live smoke below pass; commands/results and delivered contract recorded below.
 
-**Current ledger status:** Hyperliquid is complete. All five gates passed. The other five exchanges remain deferred; no HIP-3, native upstream statistics streaming, funding history, or frontend implementation was added. Stop here until a later exchange slice is explicitly selected.
+Binance completion gates:
 
-For a later exchange session, explicitly select exactly one unchecked row; read that venue's retained acquisition recipe and current implementation; append a decision-complete active slice using the then-shipped API/coordinator. Keep every other unchecked row deferred. Implement and verify the selected venue end-to-end before checking it off. Do not repeat the initial shared foundation or advertise an unchecked venue merely because an endpoint exists. A venue requiring native acquisition extends the source driver only in its later approved slice, not with unused abstractions now.
+- [x] Catalog IDs, native symbols, contract scope, and settlement metadata match statistics identities.
+- [x] REST and WebSocket projections share source acquisition, field semantics, interval exceptions, and failure boundaries.
+- [x] Capabilities advertise only implemented Binance fields and shared-polling freshness.
+- [x] Focused deterministic tests, full Rust tests, formatting, and live Binance REST smoke pass.
+
+**Current ledger status:** Hyperliquid, Binance, and Lighter are complete for their approved slices. Bybit, Aster, and Extended remain deferred and unsupported for market statistics. Lighter uses native `market_stats` acquisition; no native statistics stream is added for any deferred venue, and no frontend implementation is added.
+
+Bybit, Aster, and Extended remain deferred and unsupported for market statistics. Do not advertise them merely because an endpoint exists. The selected Lighter slice uses the shipped API/coordinator and exact contract below; retained recipes remain historical research.
+
+### Active Lighter contract (selected next slice)
+
+**Decision:** Lighter is the only newly selected exchange. Bybit, Aster, and Extended remain deferred and unsupported for market statistics. The source uses Lighter's native `market_stats` WebSocket acquisition through Ferris's coordinator, with `orderBookDetails` as the authoritative market catalog and statistics identity source. The backend exchange ID is exactly `lighterxyz`.
+
+- **Identity and selection:** Catalog-issued market IDs are numeric opaque native IDs, carried as strings in the unified contract; never derive identity from display symbols. `orderBookDetails` supplies market metadata and the native ID. Omitted `marketIds` enumerates supported active perpetual markets; explicit IDs select catalog-known markets. Unknown, malformed, foreign, or unsupported-product IDs are validation errors. Spot funding is `notApplicable`.
+- **Funding semantics:** `market_stats` current funding is an estimate and is emitted as exact native decimal text in `estimate` with reason `rate-basis-unverified`. Last settled funding is a distinct `settled` observation and must not overwrite the estimate. A settled observation may carry `paymentTimestamp`; current estimates do not. No `nextPaymentTimestamp` is emitted. A configurable funding period is a capability interval, so `paymentIntervalMs` is null.
+- **Prices and limitations:** Mark, index, and last prices are supported when present, preserving exact numeric strings and catalog-qualified base/quote assets. Volume and open interest remain unsupported (`units-unverified` for OI; `adapter-not-implemented` for volume). No premium or volume/OI normalization is performed. Funding history and other unimplemented fields remain unsupported.
+- **Acquisition and freshness:** Ferris coordinator uses `nativeWebSocket` mode and Lighter's native `market_stats` stream, shared by HTTP and WebSocket demand. Poll/freshness policy remains a 30-second coordinator poll and 90-second stale boundary. Baseline timeout and incomplete coverage are explicit source failures.
+
+#### Lighter acceptance and verification gates
+
+- [x] Catalog `orderBookDetails` IDs and metadata join exactly to `market_stats`; numeric opaque IDs cannot collide or be substituted with symbols.
+- [x] Current estimate and last-settled funding remain distinct, with exact strings, correct timestamps, null next-payment timestamp, and configurable-period interval null.
+- [x] Mark/index/last fields, spot `notApplicable`, unsupported units, stale/error states, and explicit clears follow the shared field-state contract.
+- [x] Capabilities advertise Lighter marketstats with `nativeWebSocket`, `pollIntervalMs: 30000`, and `staleAfterMs: 90000`; deferred exchanges remain unsupported.
+- [x] REST and WS share native acquisition through the coordinator; source baseline timeout/incomplete coverage is explicit.
+- [x] Bounded live Lighter smoke covered capabilities, catalog identity, native market stats frames, funding semantics, prices, and timestamp normalization.
+
+### Lighter delivery and verification record
+
+`cargo check --all-targets` passed. `cargo test lighterxyz -- --nocapture` passed with 12 tests. `cargo test market_stats -- --nocapture` passed with 52 tests. `cargo fmt` passed. Live evidence: `orderBookDetails?filter=all` returned HTTP 200 with native numeric market IDs and active/inactive statuses; the bounded `market_stats/all` WebSocket probe received 138 update frames over 30 seconds, including sparse one-market and multi-market updates and timestamped market statistics. No frontend changes were made.
+
+### Active Binance contract (selected slice)
+
+- **Identity/catalog:** Binance market IDs are opaque compact JSON tuples `["binance","perp",null,null,nativeSymbol]`, preserving native Unicode and punctuation exactly. Catalog rows use `category: null`, `dex: null`, exact native `contractType: "PERPETUAL"`, and settlement plus `settlementAssetId` from `marginAsset` (null when unresolved). Duplicate or missing native symbols are structural invalid data.
+- **Selection:** Omitted IDs enumerate all active USDⓈ-M `PERPETUAL` markets. Explicit catalog-issued IDs may select known inactive perps; implemented fields then become `unavailable` / `inactive-market`. Unknown, malformed, foreign, noncanonical, or unsupported-product IDs are validation errors. Params are only null or `{}`; no symbol shortcut.
+- **Fields:** Funding is the exact native decimal string, `currentUnclassified` / `rate-basis-unverified`, with `rateIntervalMs` and payment timestamp null. `paymentIntervalMs` is emitted only for a positive checked `fundingIntervalHours` converted safely to milliseconds; missing, zero, overflow, or invalid intervals yield null without discarding other symbols. `nextPaymentTimestamp` uses only a positive native `nextFundingTime`. Mark and index prices are exact positive decimal strings qualified by catalog `base` and `quote`. Last-settled funding, last price, volume, open interest, and history are unsupported.
+- **Acquisition/freshness:** Reuse the Hyperliquid coordinator and snapshot/delta wire contract with one shared Binance REST acquisition for HTTP and WS demand. Poll every 30 seconds; stale after 90 seconds; cache successful catalog/marks for 30 seconds, funding metadata for 300 seconds, and errors for 30 seconds. Catalog failure retains prior membership as incomplete until authoritative removal; funding/price failure retains stale original values, while explicit scalar clears remain cleared. The backend REST base defaults to `https://fapi.binance.com`, overridden by `BINANCE_BASE_URL`; there is no native Binance statistics WS.
 
 ### Delivery record and verification
 
-Delivered `POST /v1/fetchMarketStats`, `GET /v1/capabilities`, and `marketstats` on the existing `/v1/ws`. Catalog and statistics identities share native opaque IDs and index-resolved settlement. Primary acquisition is shared REST polling every 30 seconds; spot metadata is cached for five minutes. HTTP demand lasts 90 seconds; socket demand is reference-counted. Shutdown and idle cancellation stop workers without late publication. Existing trade/book/OHLCV semantics remain separate.
+Delivered `POST /v1/fetchMarketStats`, `GET /v1/capabilities`, and `marketstats` on the existing `/v1/ws`. Catalog and statistics identities share native opaque IDs. Hyperliquid uses its primary-DEX catalog and Binance uses native USDⓈ-M `exchangeInfo` metadata. Both sources use shared REST polling every 30 seconds; HTTP demand lasts 90 seconds and socket demand is reference-counted. Shutdown and idle cancellation stop workers without late publication. Existing trade/book/OHLCV semantics remain separate.
 
-Funding remains exact-string `currentUnclassified`, with `rateIntervalMs: null`, `paymentIntervalMs: 3600000`, and no inferred payment timestamps. Positive rates mean longs pay shorts. Mark/oracle prices have explicit qualified denominations; volume/OI remain unsupported (`units-unverified`). Selected spot funding is `notApplicable`. Stale observations retain original receipt timestamps; explicit scalar invalidation clears values. Context failures retain authoritative membership without shifting positional assignments. Partial or failed catalogs cannot invent removals or unknown IDs.
+Funding remains exact-string `currentUnclassified`, with `rateIntervalMs: null`; Hyperliquid's payment interval is one hour by contract, while Binance emits only explicit positive checked `fundingIntervalHours` metadata. No inferred payment timestamps are used. Positive rates mean longs pay shorts. Mark/oracle prices have explicit qualified denominations; volume/OI remain unsupported (`units-unverified`). Stale observations retain original receipt timestamps; explicit scalar invalidation clears values. Context failures retain authoritative membership without shifting positional assignments. Partial or failed catalogs cannot invent removals or unknown IDs.
 
 Socket acknowledgements precede initial snapshots; generations and contiguous revisions are per subscription. Complete states coalesce before sparse delta construction, at most once per second. Fields replace atomically, including null clears; coverage-only transitions are delivered. Backpressure forces disconnect/resubscription rather than continuing a gapped revision chain. The consumer contract is documented in README and INTEGRATION_README; Lattice was not modified.
 
@@ -39,13 +75,14 @@ Commands executed from the Ferris repository:
 
 | Command | Result |
 | --- | --- |
-| `cargo check` | Passed; existing unused order-book constants/helper warnings remain. |
-| `cargo test market_stats` | 52 passed: 42 unit tests and 10 actual localhost HTTP/WS/source tests. |
-| `cargo test --test realtime_ws` | 1 passed; existing same-topic trade fanout unchanged. |
-| `cargo test` | 165 passed, 5 pre-existing live tests ignored. |
+| `cargo check --all-targets` | Passed; existing unused order-book constants/helper warnings remain. |
+| `cargo test --test market_stats binance_ -- --nocapture` | Passed; focused Binance source, HTTP, WS, cache-sharing, interval, scalar-clear, stale, catalog-recovery, and cold-catalog scenarios. |
+| `cargo test` | 169 passed, 5 ignored; existing unused order-book constants/helper warnings remain. |
 | `cargo fmt -- --check` | Passed. |
-| Approved temporary `bun -e` live client | Exit 0; console evidence below. No committed client script. |
-| `python scripts/smoke_endpoints.py --base-url http://127.0.0.1:8788 --exchange hyperliquid --markets-exchange hyperliquid` | Passed health, trades, OHLCV, order book, and catalog. |
+| Approved temporary `bun -e` live Binance client | Exit 0; capability, complete 571-market catalog, BTC identity, and funding/mark/index evidence recorded below. No committed client script. |
+| Existing Hyperliquid smoke | Previously passed; no regression observed in the full suite. |
+
+The Binance smoke used the actual binary with `HOST=127.0.0.1`, `PORT=8788`, `TRADE_COLLECTOR_ENABLED=false`, and `BINANCE_BASE_URL=https://fapi.binance.com`. It returned capability state `supported`, `upstreamMode: sharedPolling`, `pollIntervalMs: 30000`, `staleAfterMs: 90000`; complete coverage of 571 active perpetual markets; and BTC/USDT identity `["binance","perp",null,null,"BTCUSDT"]` with funding `0.00005329`, payment interval `28800000`, mark `77274.40000000`, and index `77304.88521739`. These counts and values are live observations, not constants or unit-basis evidence. The smoke process was stopped after collection.
 
 The supervised actual binary used `HOST=127.0.0.1`, `PORT=8788`, `HYPERLIQUID_BASE_URL=https://api.hyperliquid.xyz`, and `TRADE_COLLECTOR_ENABLED=false`; readiness required the server-start log and listening port. It was stopped after smoke collection.
 
@@ -270,7 +307,7 @@ Add focused market_stats_ checks in Hyperliquid/coordinator/web modules and test
 | Freshness without numeric changes | Identical successful rates advance receipt only on new observation, not cache read. Failed poll retains stale value/old receipt; recovery refreshes. Pending acquisition cannot block stale-threshold after 90 seconds. |
 | Ordering/coalescing/removal | All and BTC-only clients see subscribed first, snapshot revision 1 second. Coalesced complete states touching different fields/markets reduce to latest projection with contiguous client revisions. Valid delisting/removal affects only appropriate view; failure never removes. Unsubscribe works after selected ID vanishes. |
 | Bounds/recovery | Empty IDs/fields, 101 IDs, bad/foreign/unknown ID, nonprimary dex, unknown field, conflicting symbol fail without extra source work. Reject 17th distinct topic. Full queue closes rather than gapped chain; resubscribe yields new generation/full snapshot. |
-| Honest support/failure | Capabilities makes no acquisition; only Hyperliquid supports, all registered deferred stats requests return 501. Cold all-market failure explicitly incomplete; selected without proof 502, not invented unknown/notApplicable. Runtime failure leaves capabilities supported. |
+| Honest support/failure | Capabilities makes no acquisition; Hyperliquid and Binance advertise only implemented fields, while all other registered deferred stats requests return 501. Cold all-market failure explicitly incomplete; selected without proof 502, not invented unknown/notApplicable. Runtime failure leaves capabilities supported. |
 
 Keep existing deterministic same-topic trade fanout, book, OHLCV behavior unchanged; update optional catalog construction only where required, not unrelated wording assertions. Integrated commands:
 
@@ -374,7 +411,7 @@ Also run the existing public-route smoke against the same supervised server:
 python scripts/smoke_endpoints.py --base-url http://127.0.0.1:8788 --exchange hyperliquid --markets-exchange hyperliquid
 ```
 
-Stop smoke server after collecting results. Check Hyperliquid only after deterministic scenarios and live REST/WS/public-route smoke pass; otherwise record exact failed gate here and leave it open. If public access is unavailable, finish deterministic mock-backed work and record live failure, not another source/predictions/private data/fabricated rates. No browser, screenshots, frontend, private payment history, multi-exchange live acquisition, or automatic scope expansion.
+Stop smoke servers after collecting results. Check the selected venue only after deterministic scenarios and live REST/WS/public-route smoke pass; otherwise record exact failed gate here and leave it open. If public access is unavailable, finish deterministic mock-backed work and record live failure, not another source/predictions/private data/fabricated rates. No browser, screenshots, frontend, private payment history, multi-exchange live acquisition, or automatic scope expansion.
 
 ### Retained research boundary
 

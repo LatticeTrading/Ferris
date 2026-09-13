@@ -21,19 +21,52 @@ use crate::{
 const PRIMARY_SOURCE: &str = "hyperliquid:primary:metaAndAssetCtxs";
 const SPOT_SOURCE: &str = "hyperliquid:spotMeta";
 const STALE_AFTER: Duration = Duration::from_secs(90);
+fn is_binance(exchange: &str) -> bool {
+    exchange == "binance"
+}
+
+fn is_lighter(exchange: &str) -> bool {
+    exchange == "lighterxyz"
+}
+
+fn catalog_source(exchange: &str, product: UnifiedMarketType) -> &'static str {
+    if is_binance(exchange) {
+        "binance:exchangeInfo"
+    } else if is_lighter(exchange) {
+        "lighterxyz:orderBookDetails"
+    } else {
+        match product {
+            UnifiedMarketType::Perp => PRIMARY_SOURCE,
+            UnifiedMarketType::Spot => SPOT_SOURCE,
+            _ => PRIMARY_SOURCE,
+        }
+    }
+}
+
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
 
 pub fn normalize_topic(request: FetchMarketStatsRequest) -> Result<MarketStatsTopic, ApiError> {
     let exchange = request.exchange.trim().to_ascii_lowercase();
-    match &request.params {
-        Value::Null => {}
-        Value::Object(params)
-            if params.is_empty()
-                || (params.len() == 1 && params.get("dex").and_then(Value::as_str) == Some("")) => {
-        }
+    match (&exchange[..], &request.params) {
+        (_, Value::Null) => {}
+        ("binance", Value::Object(params)) if params.is_empty() => {}
+        ("lighterxyz", Value::Object(params)) if params.is_empty() => {}
+        (_, Value::Object(params))
+            if !is_binance(&exchange)
+                && !is_lighter(&exchange)
+                && (params.is_empty()
+                    || (params.len() == 1
+                        && params.get("dex").and_then(Value::as_str) == Some(""))) => {}
         _ => {
             return Err(ApiError::Validation(
-                "market statistics params must be null, {}, or {\"dex\":\"\"}".to_string(),
+                if is_binance(&exchange) {
+                    "Binance market statistics params must be null or {}"
+                } else if is_lighter(&exchange) {
+                    "Lighter market statistics params must be null or {}"
+                } else {
+                    "market statistics params must be null, {}, or {\"dex\":\"\"}"
+                }
+                .to_string(),
             ));
         }
     }
@@ -63,8 +96,12 @@ pub fn normalize_topic(request: FetchMarketStatsRequest) -> Result<MarketStatsTo
     fields.sort_unstable();
     fields.dedup();
     Ok(MarketStatsTopic {
-        exchange,
-        params: json!({"dex": ""}),
+        exchange: exchange.clone(),
+        params: if is_binance(&exchange) || is_lighter(&exchange) {
+            json!({})
+        } else {
+            json!({"dex": ""})
+        },
         market_ids,
         fields,
     })
@@ -82,10 +119,23 @@ fn market_id_type(id: &str, exchange: &str) -> Result<UnifiedMarketType, ApiErro
     if id_exchange != exchange
         || category.is_some()
         || native_id.is_empty()
-        || !matches!(
-            (product, dex.as_deref()),
-            (UnifiedMarketType::Perp, Some("")) | (UnifiedMarketType::Spot, None)
-        )
+        || (is_lighter(exchange)
+            && ((native_id.len() > 1 && native_id.starts_with('0'))
+                || !native_id.bytes().all(|byte| byte.is_ascii_digit())
+                || native_id.parse::<u64>().is_err()))
+        || !(if is_binance(exchange) {
+            matches!((product, dex.as_deref()), (UnifiedMarketType::Perp, None))
+        } else if is_lighter(exchange) {
+            matches!(
+                (product, dex.as_deref()),
+                (UnifiedMarketType::Perp, None) | (UnifiedMarketType::Spot, None)
+            )
+        } else {
+            matches!(
+                (product, dex.as_deref()),
+                (UnifiedMarketType::Perp, Some("")) | (UnifiedMarketType::Spot, None)
+            )
+        })
     {
         return Err(invalid());
     }
@@ -110,8 +160,14 @@ pub fn validate_selection(
             continue;
         }
         let (complete, source) = match product {
-            UnifiedMarketType::Perp => (snapshot.perp_enumeration_complete, PRIMARY_SOURCE),
-            UnifiedMarketType::Spot => (snapshot.spot_enumeration_complete, SPOT_SOURCE),
+            UnifiedMarketType::Perp => (
+                snapshot.perp_enumeration_complete,
+                catalog_source(&topic.exchange, product),
+            ),
+            UnifiedMarketType::Spot => (
+                snapshot.spot_enumeration_complete,
+                catalog_source(&topic.exchange, product),
+            ),
             _ => unreachable!("market_id_type only accepts supported products"),
         };
         if complete {
@@ -226,6 +282,7 @@ pub fn project_snapshot(
 pub fn merge_outcome(
     previous: &MarketStatsSourceSnapshot,
     outcome: Result<MarketStatsSourceSnapshot, ExchangeError>,
+    exchange: &str,
 ) -> MarketStatsSourceSnapshot {
     let mut next = match outcome {
         Ok(next) => next,
@@ -241,10 +298,11 @@ pub fn merge_outcome(
             next.next_poll_at = Instant::now() + POLL_INTERVAL;
             // The failed source call publishes no secondary catalog proof. Retain known
             // spot rows, but do not declare a missing selection unknown from old metadata.
+            let source = catalog_source(exchange, UnifiedMarketType::Perp);
             next.source_failures
-                .retain(|failure| failure.source != PRIMARY_SOURCE);
+                .retain(|failure| failure.source != source);
             next.source_failures.push(MarketStatsSourceFailure {
-                source: PRIMARY_SOURCE.to_string(),
+                source: source.to_string(),
                 reason: reason.to_string(),
                 message: error.to_string(),
             });
@@ -254,28 +312,63 @@ pub fn merge_outcome(
             return next;
         }
     };
+    if next.received_at.is_none() {
+        next.received_at = previous.received_at;
+    }
+
     let prior_rows: HashMap<&str, &MarketStatsRow> = previous
         .rows
         .iter()
         .filter_map(|row| row_id(row).map(|id| (id, row)))
         .collect();
-    if !next.contexts_valid {
-        for row in &mut next.rows {
-            if row.market.market_type != UnifiedMarketType::Perp || !row.market.active {
+    for row in &mut next.rows {
+        if row.market.market_type != UnifiedMarketType::Perp || !row.market.active {
+            continue;
+        }
+        let prior = row_id(row).and_then(|id| prior_rows.get(id).copied());
+        for (name, field) in &mut row.fields {
+            if !field_implemented_for_exchange(exchange, *name)
+                || field.reason.as_deref() == Some("invalid-upstream-value")
+            {
                 continue;
             }
-            let prior = row_id(row).and_then(|id| prior_rows.get(id).copied());
-            for (name, field) in &mut row.fields {
-                if !implemented(*name) || structural(field) {
-                    continue;
-                }
-                if let Some(old) = prior.and_then(|prior| prior.fields.get(name)) {
-                    if usable(old) || old.reason.as_deref() == Some("invalid-upstream-value") {
-                        *field = old.clone();
-                    }
-                }
-                fail_field(field, "context-mismatch");
+            let field_failure = field.state == MarketStatsFieldState::Unavailable
+                && matches!(
+                    field.reason.as_deref(),
+                    Some(
+                        "upstream-failure"
+                            | "invalid-upstream-data"
+                            | "context-mismatch"
+                            | "missing-upstream-row"
+                    )
+                );
+            if next.contexts_valid && !field_failure {
+                continue;
             }
+            let incoming_reason = if field_failure {
+                field.reason.clone().unwrap()
+            } else {
+                let source = if is_lighter(exchange) {
+                    "lighterxyz:market_stats"
+                } else {
+                    field.source.as_deref().unwrap_or(if is_binance(exchange) {
+                        "binance:premiumIndex"
+                    } else {
+                        PRIMARY_SOURCE
+                    })
+                };
+                next.source_failures
+                    .iter()
+                    .find(|failure| failure.source == source)
+                    .map(|failure| failure.reason.clone())
+                    .unwrap_or_else(|| "context-mismatch".to_string())
+            };
+            if let Some(old) = prior.and_then(|prior| prior.fields.get(name)) {
+                if usable(old) || old.reason.as_deref() == Some("invalid-upstream-value") {
+                    *field = old.clone();
+                }
+            }
+            fail_field(field, &incoming_reason);
         }
     }
 
@@ -300,7 +393,7 @@ pub fn merge_outcome(
             let reason = next
                 .source_failures
                 .iter()
-                .find(|failure| failure.source == PRIMARY_SOURCE)
+                .find(|failure| failure.source == catalog_source(exchange, UnifiedMarketType::Perp))
                 .map(|failure| failure.reason.as_str())
                 .unwrap_or("upstream-failure");
             fail_row(&mut row, reason);
@@ -327,7 +420,8 @@ pub fn expire_snapshot(
         row.market.market_type == UnifiedMarketType::Perp
             && row.market.active
             && row.fields.iter().any(|(name, field)| {
-                implemented(*name) && field.state == MarketStatsFieldState::Available
+                field_implemented_for_row(row, *name)
+                    && field.state == MarketStatsFieldState::Available
             })
     });
     if !has_available {
@@ -339,7 +433,9 @@ pub fn expire_snapshot(
             continue;
         }
         for (name, field) in &mut row.fields {
-            if implemented(*name) && field.state == MarketStatsFieldState::Available {
+            if field_implemented_for_exchange(&row.market.exchange, *name)
+                && field.state == MarketStatsFieldState::Available
+            {
                 fail_field(field, "stale-threshold");
             }
         }
@@ -347,11 +443,28 @@ pub fn expire_snapshot(
     Some(expired)
 }
 
+fn field_implemented_for_exchange(exchange: &str, name: MarketStatsFieldName) -> bool {
+    (is_lighter(exchange)
+        && matches!(
+            name,
+            MarketStatsFieldName::Funding
+                | MarketStatsFieldName::LastSettledFunding
+                | MarketStatsFieldName::LastPrice
+                | MarketStatsFieldName::MarkPrice
+                | MarketStatsFieldName::IndexPrice
+        ))
+        || implemented(name)
+}
+
 fn row_id(row: &MarketStatsRow) -> Option<&str> {
     row.market
         .identity
         .as_ref()
         .map(|identity| identity.market_id.as_str())
+}
+
+fn field_implemented_for_row(row: &MarketStatsRow, name: MarketStatsFieldName) -> bool {
+    field_implemented_for_exchange(&row.market.exchange, name)
 }
 
 fn implemented(name: MarketStatsFieldName) -> bool {
@@ -380,7 +493,7 @@ fn usable(field: &MarketStatsField) -> bool {
 fn fail_row(row: &mut MarketStatsRow, reason: &str) {
     if row.market.market_type == UnifiedMarketType::Perp && row.market.active {
         for (name, field) in &mut row.fields {
-            if implemented(*name) {
+            if field_implemented_for_exchange(&row.market.exchange, *name) {
                 fail_field(field, reason);
             }
         }
@@ -560,7 +673,7 @@ mod tests {
         for row in &mut snapshot.rows {
             if row.market.market_type == UnifiedMarketType::Perp && row.market.active {
                 for (name, field) in &mut row.fields {
-                    if implemented(*name) {
+                    if field_implemented_for_exchange(&row.market.exchange, *name) {
                         field.state = MarketStatsFieldState::Unavailable;
                         field.value = None;
                         field.reason = Some("context-mismatch".to_string());
@@ -679,6 +792,7 @@ mod tests {
         let failed = merge_outcome(
             &cold,
             Err(ExchangeError::UpstreamData("bad metadata".to_string())),
+            "hyperliquid",
         );
         assert!(matches!(
             validate_selection(&topic(Some(vec![btc.clone()])), &failed),
@@ -702,6 +816,7 @@ mod tests {
         let failed = merge_outcome(
             &complete_perps,
             Err(ExchangeError::UpstreamRequest("offline".into())),
+            "hyperliquid",
         );
         validate_selection(
             &topic(Some(vec![id("0", UnifiedMarketType::Spot)])),
@@ -771,6 +886,7 @@ mod tests {
         let failed = merge_outcome(
             &baseline,
             Err(ExchangeError::UpstreamRequest("offline".to_string())),
+            "hyperliquid",
         );
         let field = &failed.rows[0].fields[&MarketStatsFieldName::Funding];
         assert_eq!(field.state, MarketStatsFieldState::Stale);
@@ -789,7 +905,7 @@ mod tests {
             vec![row("BTC", UnifiedMarketType::Perp, true, 20, Some("0"))],
             now + POLL_INTERVAL,
         );
-        let recovered = merge_outcome(&failed, Ok(fresh.clone()));
+        let recovered = merge_outcome(&failed, Ok(fresh.clone()), "hyperliquid");
         assert_eq!(recovered, fresh);
         assert_eq!(
             recovered.rows[0].fields[&MarketStatsFieldName::Funding].received_timestamp,
@@ -808,17 +924,19 @@ mod tests {
             vec![row("BTC", UnifiedMarketType::Perp, true, 20, None)],
             now + POLL_INTERVAL,
         );
-        let cleared = merge_outcome(&baseline, Ok(invalid));
+        let cleared = merge_outcome(&baseline, Ok(invalid), "hyperliquid");
         let mismatched = merge_outcome(
             &cleared,
             Ok(mismatch(source(
                 vec![row("BTC", UnifiedMarketType::Perp, true, 30, Some("1"))],
                 now + POLL_INTERVAL * 2,
             ))),
+            "hyperliquid",
         );
         let failed = merge_outcome(
             &mismatched,
             Err(ExchangeError::UpstreamRequest("offline".to_string())),
+            "hyperliquid",
         );
         let funding = &failed.rows[0].fields[&MarketStatsFieldName::Funding];
         assert_eq!(funding.state, MarketStatsFieldState::Unavailable);
@@ -833,6 +951,7 @@ mod tests {
                 vec![row("BTC", UnifiedMarketType::Perp, true, 40, Some("0"))],
                 now + STALE_AFTER,
             )),
+            "hyperliquid",
         );
         assert_eq!(
             recovered.rows[0].fields[&MarketStatsFieldName::Funding].state,
@@ -862,6 +981,7 @@ mod tests {
                 ],
                 now + POLL_INTERVAL,
             ))),
+            "hyperliquid",
         );
         let view = project_snapshot(&topic(None), &next);
         assert_eq!(view.coverage.expected_markets, Some(2));
@@ -911,7 +1031,7 @@ mod tests {
             reason: "upstream-failure".to_string(),
             message: "offline".to_string(),
         });
-        let retained = merge_outcome(&baseline, Ok(partial));
+        let retained = merge_outcome(&baseline, Ok(partial), "hyperliquid");
         validate_selection(&selected, &retained).unwrap();
         let view = project_snapshot(&selected, &retained);
         assert_eq!(view.markets, project_snapshot(&selected, &baseline).markets);
@@ -919,9 +1039,14 @@ mod tests {
         let failed = merge_outcome(
             &retained,
             Err(ExchangeError::UpstreamData("broken primary".to_string())),
+            "hyperliquid",
         );
         assert_eq!(project_snapshot(&selected, &failed).markets, view.markets);
-        let removed = merge_outcome(&failed, Ok(source(Vec::new(), now + STALE_AFTER)));
+        let removed = merge_outcome(
+            &failed,
+            Ok(source(Vec::new(), now + STALE_AFTER)),
+            "hyperliquid",
+        );
         assert!(project_snapshot(&selected, &removed).markets.is_empty());
         assert!(matches!(
             validate_selection(&selected, &removed),
@@ -956,6 +1081,7 @@ mod tests {
         let failed = merge_outcome(
             &baseline,
             Err(ExchangeError::UpstreamData("bad metadata".to_string())),
+            "hyperliquid",
         );
         assert!(expire_snapshot(&failed, now + STALE_AFTER * 2).is_none());
         assert_eq!(

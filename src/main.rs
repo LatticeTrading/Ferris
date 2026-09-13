@@ -35,7 +35,10 @@ async fn main() -> anyhow::Result<()> {
         config.request_timeout_ms,
     )?);
     let aster_exchange = Arc::new(AsterExchange::new(config.request_timeout_ms)?);
-    let binance_exchange = Arc::new(BinanceExchange::new(config.request_timeout_ms)?);
+    let binance_exchange = Arc::new(BinanceExchange::with_base_url(
+        config.binance_base_url.clone(),
+        config.request_timeout_ms,
+    )?);
     let lighter_catalog_service = Arc::new(LighterMarketCatalogService::new(
         config.request_timeout_ms,
         config.lighter_markets_url.clone(),
@@ -46,11 +49,14 @@ async fn main() -> anyhow::Result<()> {
     registry.register(aster_exchange.clone());
     registry.register(binance_exchange.clone());
     registry.register(Arc::new(BybitExchange::new(config.request_timeout_ms)?));
-    registry.register(Arc::new(LighterExchange::new(
-        config.lighter_rest_base_url.clone(),
-        config.request_timeout_ms,
-        lighter_catalog_service.clone(),
-    )?));
+    registry.register(Arc::new(
+        LighterExchange::new(
+            config.lighter_rest_base_url.clone(),
+            config.request_timeout_ms,
+            lighter_catalog_service.clone(),
+        )?
+        .with_stats_ws_url(config.lighter_ws_url.clone(), config.request_timeout_ms),
+    ));
     registry.register(Arc::new(HyperliquidExchange::new(
         config.hyperliquid_base_url.clone(),
         config.request_timeout_ms,

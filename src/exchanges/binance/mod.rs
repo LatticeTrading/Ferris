@@ -1,3 +1,5 @@
+use std::{collections::HashMap, sync::Arc};
+
 use async_trait::async_trait;
 use binance_sdk::{
     common::{config::ConfigurationRestApi, errors::ConnectorError},
@@ -13,19 +15,25 @@ use binance_sdk::{
 };
 use chrono::{SecondsFormat, Utc};
 use serde_json::Value;
+use tokio::{
+    sync::{Mutex, RwLock},
+    time::Instant,
+};
 
 use crate::{
     binance_orderbook::{
         BinanceDepthLevel, BinanceDepthSnapshot, OrderBookSnapshotProvider,
         BINANCE_MAX_ORDERBOOK_LEVELS,
     },
-    exchanges::traits::{ExchangeError, MarketDataExchange},
+    exchanges::traits::{ExchangeError, MarketDataExchange, MarketStatsSource},
+    market_stats::make_market_id,
     models::{
         CcxtOhlcv, CcxtOrderBook, CcxtTrade, FetchMarketsParams, FetchOhlcvParams,
-        FetchOrderBookParams, FetchTradesParams, UnifiedMarket, UnifiedMarketInfo,
+        FetchOrderBookParams, FetchTradesParams, MarketIdentity, UnifiedMarket, UnifiedMarketInfo,
         UnifiedMarketType,
     },
 };
+mod statistics;
 
 const DEFAULT_FETCH_TRADES_LIMIT: usize = 100;
 const MAX_FETCH_TRADES_LIMIT: usize = 1_000;
@@ -37,19 +45,56 @@ type BinanceRestApiClient = binance_sdk::derivatives_trading_usds_futures::rest_
 
 pub struct BinanceExchange {
     client: BinanceRestApiClient,
+    exchange_info_cache: BinanceCache<Vec<UnifiedMarket>>,
+    mark_price_cache: BinanceCache<HashMap<String, statistics::MarkValues>>,
+    funding_info_cache: BinanceCache<HashMap<String, u64>>,
+}
+
+struct BinanceCache<T> {
+    observation: RwLock<Option<Arc<BinanceObservation<T>>>>,
+    acquisition: Mutex<()>,
+}
+
+struct BinanceObservation<T> {
+    result: Result<Arc<T>, ExchangeError>,
+    received_at: Instant,
+    received_timestamp: u64,
+    next_poll_at: Instant,
+}
+
+impl<T> Default for BinanceCache<T> {
+    fn default() -> Self {
+        Self {
+            observation: RwLock::new(None),
+            acquisition: Mutex::new(()),
+        }
+    }
 }
 
 impl BinanceExchange {
     pub fn new(timeout_ms: u64) -> Result<Self, ExchangeError> {
+        Self::with_base_url("https://fapi.binance.com", timeout_ms)
+    }
+
+    pub fn with_base_url(
+        base_url: impl Into<String>,
+        timeout_ms: u64,
+    ) -> Result<Self, ExchangeError> {
         let configuration = ConfigurationRestApi::builder()
+            .base_path(base_url.into())
             .timeout(timeout_ms)
             .build()
             .map_err(|err| {
                 ExchangeError::Internal(format!("failed to build Binance REST client: {err}"))
             })?;
 
-        let client = DerivativesTradingUsdsFuturesRestApi::production(configuration);
-        Ok(Self { client })
+        let client = DerivativesTradingUsdsFuturesRestApi::from_config(configuration);
+        Ok(Self {
+            client,
+            exchange_info_cache: Default::default(),
+            mark_price_cache: Default::default(),
+            funding_info_cache: Default::default(),
+        })
     }
 }
 
@@ -57,6 +102,10 @@ impl BinanceExchange {
 impl MarketDataExchange for BinanceExchange {
     fn id(&self) -> &'static str {
         "binance"
+    }
+
+    fn market_stats_source(&self) -> Option<&dyn MarketStatsSource> {
+        Some(self)
     }
 
     async fn fetch_trades(
@@ -221,25 +270,13 @@ impl MarketDataExchange for BinanceExchange {
         &self,
         params: FetchMarketsParams,
     ) -> Result<Vec<UnifiedMarket>, ExchangeError> {
-        let response = self
-            .client
-            .exchange_information()
-            .await
-            .map_err(map_anyhow_error)?;
-        let exchange_info = response.data().await.map_err(map_connector_error)?;
-
-        let mut markets = Vec::new();
-        for symbol in exchange_info.symbols.unwrap_or_default() {
-            match map_exchange_information_symbol(symbol, params.include_inactive) {
-                Ok(Some(market)) => markets.push(market),
-                Ok(None) => {}
-                Err(err) => {
-                    tracing::warn!(error = %err, "unable to map Binance market row, skipping");
-                }
-            }
-        }
-
-        Ok(markets)
+        let observation = self.cached_exchange_info().await;
+        let markets = observation.result.as_ref().map_err(Clone::clone)?;
+        Ok(markets
+            .iter()
+            .filter(|market| params.include_inactive || market.active)
+            .cloned()
+            .collect())
     }
 }
 
@@ -366,7 +403,7 @@ fn to_binance_depth_limit(requested: usize) -> usize {
 }
 
 fn map_exchange_information_symbol(
-    raw: ExchangeInformationResponseSymbolsInner,
+    raw: &ExchangeInformationResponseSymbolsInner,
     include_inactive: bool,
 ) -> Result<Option<UnifiedMarket>, ExchangeError> {
     let Some(exchange_symbol) = raw
@@ -388,7 +425,7 @@ fn map_exchange_information_symbol(
         .status
         .as_deref()
         .map(|status| status.eq_ignore_ascii_case("trading"))
-        .unwrap_or(true);
+        .unwrap_or(false);
 
     if !include_inactive && !active {
         return Ok(None);
@@ -402,9 +439,29 @@ fn map_exchange_information_symbol(
         UnifiedMarketType::Perp | UnifiedMarketType::Future | UnifiedMarketType::Option
     )
     .then_some(1.0);
-
+    let identity = if raw.contract_type.as_deref() == Some("PERPETUAL") {
+        Some(MarketIdentity {
+            market_id: make_market_id("binance", market_type, None, None, exchange_symbol)?,
+            exchange_market_id: exchange_symbol.to_string(),
+            category: None,
+            dex: None,
+            contract_type: raw.contract_type.clone(),
+            settle: raw
+                .margin_asset
+                .as_ref()
+                .filter(|asset| !asset.is_empty())
+                .cloned(),
+            settlement_asset_id: raw
+                .margin_asset
+                .as_ref()
+                .filter(|asset| !asset.is_empty())
+                .cloned(),
+        })
+    } else {
+        None
+    };
     Ok(Some(UnifiedMarket {
-        identity: None,
+        identity,
         exchange: "binance".to_string(),
         symbol: format!("{base}/{quote}"),
         base,
@@ -430,13 +487,11 @@ fn resolve_exchange_assets(
     let base = base_asset
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(sanitize_asset)
-        .transpose()?;
+        .map(str::to_string);
     let quote = quote_asset
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(sanitize_asset)
-        .transpose()?;
+        .map(str::to_string);
 
     if let (Some(base), Some(quote)) = (base, quote) {
         return Ok((base, quote));
@@ -973,7 +1028,7 @@ mod tests {
             ..Default::default()
         };
 
-        let mapped = map_exchange_information_symbol(raw, false)
+        let mapped = map_exchange_information_symbol(&raw, false)
             .expect("market should map")
             .expect("market should not be filtered");
 

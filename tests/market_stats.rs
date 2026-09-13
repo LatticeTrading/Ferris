@@ -1,3 +1,8 @@
+#[path = "market_stats/binance.rs"]
+mod binance;
+#[path = "market_stats/lighter.rs"]
+mod lighter;
+
 use std::{
     collections::BTreeMap,
     sync::{
@@ -483,7 +488,7 @@ impl ferris_market_data_backend::binance_orderbook::OrderBookSnapshotProvider fo
 }
 
 async fn backend(
-    source: Arc<HyperliquidExchange>,
+    source: Arc<dyn MarketDataExchange>,
 ) -> (
     String,
     ferris_market_data_backend::web::AppState,
@@ -503,19 +508,26 @@ async fn backend(
         web::{self, AppState},
     };
     let mut registry = ExchangeRegistry::new();
-    registry.register(source);
+    registry.register(source.clone());
     registry.register(Arc::new(AsterExchange::new(1_000).unwrap()));
-    registry.register(Arc::new(BinanceExchange::new(1_000).unwrap()));
+    if source.id() != "binance" {
+        registry.register(Arc::new(BinanceExchange::new(1_000).unwrap()));
+    }
     registry.register(Arc::new(BybitExchange::new(1_000).unwrap()));
     registry.register(Arc::new(
         ExtendedExchange::new("http://127.0.0.1:1".into(), 1_000).unwrap(),
     ));
+    if source.id() != "lighterxyz" {
+        let catalog = Arc::new(
+            LighterMarketCatalogService::new(1_000, "http://127.0.0.1:1".into(), 60_000).unwrap(),
+        );
+        registry.register(Arc::new(
+            LighterExchange::new("http://127.0.0.1:1".into(), 1_000, catalog.clone()).unwrap(),
+        ));
+    }
     let catalog = Arc::new(
         LighterMarketCatalogService::new(1_000, "http://127.0.0.1:1".into(), 60_000).unwrap(),
     );
-    registry.register(Arc::new(
-        LighterExchange::new("http://127.0.0.1:1".into(), 1_000, catalog.clone()).unwrap(),
-    ));
     let state = AppState::new(
         Arc::new(registry),
         TradesTopicManager::new(
@@ -592,10 +604,25 @@ async fn market_stats_http_capabilities_bounds_and_catalog_proof() {
         ]
     );
     for exchange in exchanges {
-        assert_eq!(exchange["fundingRateHistory"]["state"], "unsupported");
-        if exchange["exchange"] == "hyperliquid" {
+        if exchange["exchange"] == "hyperliquid" || exchange["exchange"] == "binance" {
             assert_eq!(exchange["marketStats"]["upstreamMode"], "sharedPolling");
             assert_eq!(exchange["marketStats"]["rateIntervalMs"], Value::Null);
+        } else if exchange["exchange"] == "lighterxyz" {
+            assert_eq!(exchange["marketStats"]["upstreamMode"], "nativeWebSocket");
+            assert_eq!(exchange["marketStats"]["pollIntervalMs"], 30_000);
+            assert_eq!(exchange["marketStats"]["staleAfterMs"], 90_000);
+            assert_eq!(
+                exchange["marketStats"]["fundingKinds"],
+                json!(["estimate", "settled"])
+            );
+            assert_eq!(
+                exchange["marketStats"]["fields"]["perp"]["lastPrice"]["state"],
+                "supported"
+            );
+            assert_eq!(
+                exchange["marketStats"]["fields"]["spot"]["funding"]["state"],
+                "notApplicable"
+            );
         } else {
             assert_eq!(
                 exchange["marketStats"],
@@ -1389,7 +1416,7 @@ async fn market_stats_ws_classifies_errors_and_limits_distinct_connection_topics
     .await;
     ws_error(
         &mut socket,
-        stats_command("subscribe", &json!({"exchange":"binance"})),
+        stats_command("subscribe", &json!({"exchange":"bybit"})),
         "UNSUPPORTED_FEATURE",
     )
     .await;

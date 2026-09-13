@@ -38,7 +38,7 @@ If you only have an HTTP base URL string, derive WS URL like this:
   - `POST /v1/fetchTrades`
   - `POST /v1/fetchOHLCV`
   - `POST /v1/fetchOrderBook`
-  - `POST /v1/fetchMarketStats` (Hyperliquid only)
+- `POST /v1/fetchMarketStats` (Hyperliquid, Binance USDⓈ-M PERPETUAL, and Lighter perpetual marketstats)
 - Discovery: `GET /v1/capabilities`
 - Realtime endpoint:
   - `GET /v1/ws`
@@ -47,7 +47,7 @@ Supported realtime channels:
 - `trades`: `hyperliquid`, `binance`, `bybit`, `aster`, `extended`
 - `orderbook`: `hyperliquid`, `binance`, `bybit`, `aster`, `extended`
 - `ohlcv`: `binance`, `bybit`, `aster`, `extended`
-- `marketstats`: `hyperliquid`, primary DEX only, shared 30-second REST polling
+- `marketstats`: `hyperliquid` and `binance` use shared 30-second REST polling; `lighterxyz` uses native `market_stats` WebSocket (`nativeWebSocket`) through the coordinator. Bybit, Aster, and Extended remain unsupported.
 - Extended is perpetual public market-data only: four REST snapshot endpoints plus realtime trades, books, and OHLCV. Use `BTC/USD:USD` for trade/book streams; the market catalog returns `BTC/USD`. Both forms resolve to upstream `BTC-USD`.
 - Extended's standard websocket order book is indicative, not the RFQ real book. Spot, private trading/account, funding, and account streams are unsupported.
 - Extended upstream REST and websocket URLs are configurable for testnet deployments; frontend clients always use this backend contract.
@@ -136,6 +136,7 @@ Client commands are JSON text frames.
 - `trades`
 - `orderbook`
 - `ohlcv`
+- `marketstats`
 
 ### Unsubscribe
 
@@ -258,15 +259,17 @@ Important: use the `topic` returned in `subscribed` ack as your canonical local 
 
 ## Funding Statistics Client Flow
 
-This backend slice ships Hyperliquid only; query capabilities rather than inferring support from exchange registration. Funding history is unsupported. The sibling frontend was not changed.
+This backend slice ships Hyperliquid, Binance USDⓈ-M perpetual, and selected Lighter perpetual statistics. Query capabilities rather than inferring support from exchange registration. Funding history, volume, open interest, and premium normalization are unsupported until units are qualified; Lighter last-settled funding is distinct from its current estimate. The sibling frontend was not changed.
 
 1. Get `/v1/capabilities`, then `/v1/fetchMarkets` for authoritative `marketId` strings. Display pairs can collide; statistics use opaque IDs, not `symbol`.
-2. Optional REST bootstrap: `POST /v1/fetchMarketStats` with `marketIds` omitted for all active primary perps, or a nonempty array of up to 100 catalog IDs. Default field is funding; empty IDs/fields are errors. Params are null/`{}`/`{"dex":""}` only.
-3. Subscribe with `{"op":"subscribe","channel":"marketstats","exchange":"hyperliquid","fields":["funding"],"params":{"dex":""}}`; add `marketIds` for selected rows. Do not send `symbol`. Maximum 16 distinct statistics topics per connection.
+
+For Lighter, use `exchange: "lighterxyz"` and catalog-issued numeric opaque native market IDs (as strings), joined from `metadata`/`orderBookDetails`; display symbols are not IDs. Current funding is an exact estimate (`currentUnclassified` / `rate-basis-unverified`), while last settled funding is separate and may carry `paymentTimestamp`. Current estimates have no payment or next-payment timestamp. Configurable funding periods leave `paymentIntervalMs` null. Mark, index, and last prices are supported; spot funding is `notApplicable`. Lighter uses native WebSocket acquisition with the shared 30-second coordinator poll and 90-second stale boundary. See the plan for acceptance gates and evidence status.
+2. Optional REST bootstrap: `POST /v1/fetchMarketStats` with `marketIds` omitted for active supported perps, or a nonempty array of up to 100 catalog IDs. Default field is funding; empty IDs/fields are errors. Binance params are null/`{}` only; Hyperliquid also accepts `{"dex":""}`.
+3. Subscribe with `{"op":"subscribe","channel":"marketstats","exchange":"hyperliquid","fields":["funding"],"params":{"dex":""}}`; for Binance use `exchange: "binance"`, exact catalog-issued `marketIds`, and `params: {}` or `null`. Do not send `symbol`. Maximum 16 distinct statistics topics per connection.
 4. Expect `subscribed` before the initial snapshot. Replace the view and remember `generation`/`revision`. On a delta, verify generation and `previousRevision`; mismatch means discard/resubscribe. Apply full field-object replacements, keep absent fields unchanged, remove `removedMarketIds`, and replace coverage. Do not merge a later-arriving REST bootstrap into an established WS generation.
 5. Statistics coalesce complete states before sparse deltas; new receipt timestamps and coverage changes are observable even with unchanged numbers. On disconnect, reconnect/resubscribe for a new generation/full snapshot; no replay. Unsubscribe by canonical topic on unmount, including after a selected ID disappears.
 
-Treat field states as data, not truthiness: zero funding is available; spot funding is not applicable; unsupported OI/volume are not zero; failed/expired retained observations are stale with original receipts. Valid current funding is `currentUnclassified` / `rate-basis-unverified`, has null rate interval, and an hourly payment interval. Do not annualize or infer next payment timestamps. See [full API, units, coverage, and error semantics](README.md#market-statistics-and-capabilities).
+Treat field states as data, not truthiness: zero funding is available; Hyperliquid selected spot funding is not applicable (Binance spot is outside scope); unsupported OI/volume are not zero; failed/expired retained observations are stale with original receipts. Valid current funding is `currentUnclassified` / `rate-basis-unverified`, with null rate interval. Binance payment interval is only emitted from explicit positive `fundingIntervalHours` converted safely to milliseconds, never a default eight hours; funding-info failure clears the interval without discarding a valid current rate. Next payment comes only from positive native `nextFundingTime`. Binance catalog IDs encode `["binance","perp",null,null,nativeSymbol]`; active exact `contractType: "PERPETUAL"` markets are enumerated, while selected inactive perps report `unavailable` / `inactive-market`. Binance defaults to `https://fapi.binance.com`; operators may override with `BINANCE_BASE_URL`.
 
 ## Recommended Client Flow
 

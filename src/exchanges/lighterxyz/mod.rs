@@ -13,20 +13,24 @@ use serde_json::Value;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::{
-    exchanges::traits::{ExchangeError, MarketDataExchange},
+    exchanges::traits::{ExchangeError, MarketDataExchange, MarketStatsSource},
+    market_stats::make_market_id,
     models::{
         CcxtOhlcv, CcxtOrderBook, CcxtTrade, FetchMarketsParams, FetchOhlcvParams,
-        FetchOrderBookParams, FetchTradesParams, UnifiedMarket, UnifiedMarketInfo,
+        FetchOrderBookParams, FetchTradesParams, MarketIdentity, UnifiedMarket, UnifiedMarketInfo,
         UnifiedMarketType,
     },
     ws_shared::{normalize_lighter_timestamp_ms, parse_f64_lossy, parse_u64_lossy},
 };
 
+mod statistics;
+use statistics::NativeMetadata;
+
 pub const DEFAULT_LIGHTER_MARKETS_URL: &str = "https://explorer.elliot.ai/api/markets";
 pub const DEFAULT_LIGHTER_REST_BASE_URL: &str = "https://mainnet.zklighter.elliot.ai";
 pub const DEFAULT_LIGHTER_WS_URL: &str = "wss://mainnet.zklighter.elliot.ai/stream";
 pub const DEFAULT_LIGHTER_MARKET_CATALOG_REFRESH_MS: u64 = 90_000;
-
+pub const DEFAULT_LIGHTER_STATS_WS_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_FETCH_ORDER_BOOK_LIMIT: usize = 100;
 const MAX_FETCH_ORDER_BOOK_LIMIT: usize = 250;
 const DEFAULT_FETCH_TRADES_LIMIT: usize = 100;
@@ -35,11 +39,14 @@ const DEFAULT_FETCH_OHLCV_LIMIT: usize = 200;
 const MAX_FETCH_OHLCV_LIMIT: usize = 500;
 const LIGHTER_HTTP_USER_AGENT: &str =
     "Mozilla/5.0 (compatible; FerrisMarketDataBackend/0.1; +https://ferris.local)";
-
 pub struct LighterExchange {
     http_client: reqwest::Client,
     rest_base_url: String,
     catalog_service: Arc<LighterMarketCatalogService>,
+    native_metadata_cache: Arc<RwLock<Option<(Instant, HashMap<u64, NativeMetadata>)>>>,
+    native_metadata_refresh_lock: Arc<Mutex<()>>,
+    pub(crate) stats_ws_url: String,
+    pub(crate) stats_ws_timeout: Duration,
 }
 
 impl LighterExchange {
@@ -51,12 +58,21 @@ impl LighterExchange {
         let http_client = build_lighter_http_client(timeout_ms).map_err(|err| {
             ExchangeError::Internal(format!("failed to build Lighter REST client: {err}"))
         })?;
-
         Ok(Self {
             http_client,
             rest_base_url: rest_base_url.trim_end_matches('/').to_string(),
             catalog_service,
+            native_metadata_cache: Arc::new(RwLock::new(None)),
+            native_metadata_refresh_lock: Arc::new(Mutex::new(())),
+            stats_ws_url: DEFAULT_LIGHTER_WS_URL.to_string(),
+            stats_ws_timeout: Duration::from_millis(DEFAULT_LIGHTER_STATS_WS_TIMEOUT_MS),
         })
+    }
+
+    pub fn with_stats_ws_url(mut self, url: String, timeout_ms: u64) -> Self {
+        self.stats_ws_url = url;
+        self.stats_ws_timeout = Duration::from_millis(timeout_ms.max(1));
+        self
     }
 
     async fn get_public(
@@ -99,6 +115,10 @@ impl LighterExchange {
 impl MarketDataExchange for LighterExchange {
     fn id(&self) -> &'static str {
         "lighterxyz"
+    }
+
+    fn market_stats_source(&self) -> Option<&dyn MarketStatsSource> {
+        Some(self)
     }
 
     async fn fetch_trades(
@@ -305,16 +325,45 @@ impl MarketDataExchange for LighterExchange {
 
     async fn fetch_markets(
         &self,
-        _params: FetchMarketsParams,
+        params: FetchMarketsParams,
     ) -> Result<Vec<UnifiedMarket>, ExchangeError> {
-        let catalog = self.catalog_service.get_catalog().await?;
-        Ok(catalog
-            .markets
-            .iter()
-            .cloned()
-            .map(|market| market.into_unified_market())
-            .collect())
+        let metadata = self.fetch_native_metadata().await?;
+        let mut markets = Vec::with_capacity(metadata.len());
+        for (market_id, native) in metadata {
+            if !params.include_inactive && !native.active {
+                continue;
+            }
+            markets.push(native_market_to_unified(market_id, &native)?);
+        }
+        markets.sort_unstable_by(|left, right| left.symbol.cmp(&right.symbol));
+        Ok(markets)
     }
+}
+
+fn native_market_to_unified(
+    market_id: u64,
+    native: &crate::exchanges::lighterxyz::statistics::NativeMetadata,
+) -> Result<UnifiedMarket, ExchangeError> {
+    let market =
+        LighterMarket::from_native_parts(market_id, native.symbol.clone(), native.market_type)?;
+    let mut unified = market.into_unified_market();
+    unified.active = native.active;
+    unified.identity = Some(MarketIdentity {
+        market_id: make_market_id(
+            "lighterxyz",
+            native.market_type,
+            None,
+            None,
+            &market_id.to_string(),
+        )?,
+        exchange_market_id: market_id.to_string(),
+        category: None,
+        dex: None,
+        contract_type: None,
+        settle: None,
+        settlement_asset_id: native.settlement_asset_id.clone(),
+    });
+    Ok(unified)
 }
 
 #[derive(Clone)]
@@ -551,6 +600,46 @@ impl LighterMarket {
             quote: "USD".to_string(),
             market_type: UnifiedMarketType::Perp,
         })
+    }
+
+    fn from_native_parts(
+        market_id: u64,
+        raw_symbol: String,
+        market_type: UnifiedMarketType,
+    ) -> Result<Self, ExchangeError> {
+        let raw_symbol = raw_symbol.trim().to_string();
+        if raw_symbol.is_empty() {
+            return Err(ExchangeError::UpstreamData(format!(
+                "lighterxyz market {market_id} missing symbol"
+            )));
+        }
+        match market_type {
+            UnifiedMarketType::Spot => {
+                let (base, quote) = split_spot_symbol(&raw_symbol)?;
+                Ok(Self {
+                    market_id,
+                    symbol: format!("{base}/{quote}"),
+                    raw_symbol,
+                    base,
+                    quote,
+                    market_type,
+                })
+            }
+            UnifiedMarketType::Perp => {
+                let base = sanitize_asset(&raw_symbol)?;
+                Ok(Self {
+                    market_id,
+                    symbol: format!("{base}/USD"),
+                    raw_symbol,
+                    base,
+                    quote: "USD".to_string(),
+                    market_type,
+                })
+            }
+            _ => Err(ExchangeError::UpstreamData(format!(
+                "lighterxyz market {market_id} has unsupported market type"
+            ))),
+        }
     }
 
     fn into_unified_market(self) -> UnifiedMarket {

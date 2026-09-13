@@ -11,6 +11,7 @@ pub struct Config {
     pub lighter_markets_url: String,
     pub lighter_ws_url: String,
     pub lighter_market_catalog_refresh_ms: u64,
+    pub binance_base_url: String,
     pub request_timeout_ms: u64,
     pub trade_cache_capacity_per_coin: usize,
     pub trade_cache_retention_ms: u64,
@@ -79,6 +80,11 @@ impl Config {
                 })?,
                 Err(_) => crate::exchanges::lighterxyz::DEFAULT_LIGHTER_MARKET_CATALOG_REFRESH_MS,
             };
+        let binance_base_url = std::env::var("BINANCE_BASE_URL")
+            .unwrap_or_else(|_| "https://fapi.binance.com".to_string())
+            .trim()
+            .trim_end_matches('/')
+            .to_string();
 
         let request_timeout_ms = match std::env::var("REQUEST_TIMEOUT_MS") {
             Ok(value) => value
@@ -120,6 +126,7 @@ impl Config {
             lighter_markets_url,
             lighter_ws_url,
             lighter_market_catalog_refresh_ms,
+            binance_base_url,
             request_timeout_ms,
             trade_cache_capacity_per_coin,
             trade_cache_retention_ms,
