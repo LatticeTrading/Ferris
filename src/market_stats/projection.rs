@@ -586,14 +586,15 @@ mod tests {
             } else {
                 let value = if name == MarketStatsFieldName::Funding {
                     rate.map(|rate| {
-                        MarketStatsValue::Funding(FundingValue {
-                            rate: rate.to_string(),
-                            kind: FundingKind::CurrentUnclassified,
-                            rate_interval_ms: None,
-                            payment_interval_ms: Some(3_600_000),
-                            payment_timestamp: None,
-                            next_payment_timestamp: None,
-                        })
+                        MarketStatsValue::Funding(FundingValue::new(
+                            rate.to_string(),
+                            crate::models::FundingRateUnit::DecimalFraction,
+                            FundingKind::CurrentUnclassified,
+                            Some(3_600_000),
+                            Some(3_600_000),
+                            None,
+                            None,
+                        ))
                     })
                 } else {
                     Some(MarketStatsValue::Price(PriceValue {
@@ -610,8 +611,6 @@ mod tests {
                     },
                     reason: if value.is_none() {
                         Some("invalid-upstream-value".to_string())
-                    } else if name == MarketStatsFieldName::Funding {
-                        Some("rate-basis-unverified".to_string())
                     } else {
                         None
                     },

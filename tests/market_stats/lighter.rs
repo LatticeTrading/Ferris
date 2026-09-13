@@ -249,7 +249,6 @@ async fn lighter_http_ws_projection_shares_metadata_and_native_acquisition() {
         .find(|r| r["marketId"] == native_id("perp", 86))
         .unwrap();
     assert_eq!(btc["fields"]["funding"]["value"]["rate"], "-0.00100");
-    assert_eq!(btc["fields"]["funding"]["reason"], "rate-basis-unverified");
     assert_eq!(
         btc["fields"]["lastSettledFunding"]["value"]["rate"],
         "0.00050"

@@ -11,8 +11,8 @@ use crate::{
     exchanges::traits::{ExchangeError, MarketStatsSource},
     market_stats::MarketStatsSourceSnapshot,
     models::{
-        CapabilityState, FeatureCapability, FetchMarketStatsParams, FundingKind, FundingValue,
-        MarketStatsAllMarketsCapability, MarketStatsCapabilities, MarketStatsField,
+        CapabilityState, FeatureCapability, FetchMarketStatsParams, FundingKind, FundingRateUnit,
+        FundingValue, MarketStatsAllMarketsCapability, MarketStatsCapabilities, MarketStatsField,
         MarketStatsFieldName, MarketStatsFieldState, MarketStatsRow, MarketStatsScope,
         MarketStatsSelectedMarketsCapability, MarketStatsSourceFailure,
         MarketStatsSupportedCapabilities, MarketStatsValue, MarketStatsWsCapability, PriceValue,
@@ -77,11 +77,11 @@ impl MarketStatsSource for HyperliquidExchange {
                 max_subscriptions_per_connection: 16,
             },
             funding_kinds: vec![FundingKind::CurrentUnclassified],
-            rate_interval_ms: None,
+            rate_interval_ms: Some(3_600_000),
             payment_interval_ms: Some(3_600_000),
             limitations: vec![
                 "primary-dex-only".to_string(),
-                "rate-basis-unverified".to_string(),
+                "rate-unit-decimal-fraction".to_string(),
                 "receipt-time-freshness".to_string(),
             ],
         })
@@ -114,10 +114,9 @@ fn field_support(
         (UnifiedMarketType::Spot, Funding | LastSettledFunding) => {
             (CapabilityState::NotApplicable, Some("non-perpetual-market"))
         }
-        (UnifiedMarketType::Perp, Funding) => {
-            (CapabilityState::Supported, Some("rate-basis-unverified"))
+        (UnifiedMarketType::Perp, Funding | MarkPrice | IndexPrice) => {
+            (CapabilityState::Supported, None)
         }
-        (UnifiedMarketType::Perp, MarkPrice | IndexPrice) => (CapabilityState::Supported, None),
         (UnifiedMarketType::Perp, Volume24h | OpenInterest) => {
             (CapabilityState::Unsupported, Some("units-unverified"))
         }
@@ -449,15 +448,16 @@ fn observed_field(
         return result;
     };
     let value = if field == MarketStatsFieldName::Funding {
-        result.reason = Some("rate-basis-unverified".to_string());
-        MarketStatsValue::Funding(FundingValue {
-            rate: raw.to_string(),
-            kind: FundingKind::CurrentUnclassified,
-            rate_interval_ms: None,
-            payment_interval_ms: Some(3_600_000),
-            payment_timestamp: None,
-            next_payment_timestamp: None,
-        })
+        result.reason = None;
+        MarketStatsValue::Funding(FundingValue::new(
+            raw.to_string(),
+            FundingRateUnit::DecimalFraction,
+            FundingKind::CurrentUnclassified,
+            Some(3_600_000),
+            Some(3_600_000),
+            None,
+            None,
+        ))
     } else {
         if raw.starts_with('-') || !raw.bytes().any(|byte| matches!(byte, b'1'..=b'9')) {
             return result;
@@ -608,14 +608,15 @@ mod tests {
         let btc = row(&snapshot, UnifiedMarketType::Perp, "BTC");
         assert_eq!(
             funding(btc),
-            &FundingValue {
-                rate: "-0.0000125".to_string(),
-                kind: FundingKind::CurrentUnclassified,
-                rate_interval_ms: None,
-                payment_interval_ms: Some(3_600_000),
-                payment_timestamp: None,
-                next_payment_timestamp: None,
-            }
+            &FundingValue::new(
+                "-0.0000125".to_string(),
+                FundingRateUnit::DecimalFraction,
+                FundingKind::CurrentUnclassified,
+                Some(3_600_000),
+                Some(3_600_000),
+                None,
+                None,
+            )
         );
         assert_eq!(
             btc.fields[&MarketStatsFieldName::Funding].state,

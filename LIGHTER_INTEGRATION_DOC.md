@@ -386,7 +386,9 @@ Implemented endpoint:
 - Trades subscribe by numeric `market_index` using `trade/{MARKET_INDEX}`.
 - Order books subscribe by numeric `market_index` using `order_book/{MARKET_INDEX}`, preserve snapshot/update sequencing, and reconnect on continuity failure.
 - Market statistics use native `market_stats` acquisition through Ferris's shared coordinator. The adapter maps both single-market and multi-market update shapes.
-- Native `current_funding_rate` is emitted as the upcoming estimate; native `funding_rate` remains a separate last-settled observation.
+- Native `current_funding_rate` is emitted as an exact percentage-valued upcoming estimate with `rateUnit: percent` and a qualified one-hour rate/payment interval; native `funding_rate` remains a separate last-settled observation and may carry `paymentTimestamp`.
+- Available funding and supported funding capabilities have `reason: null`; obsolete basis warnings have been removed. Runtime failure, stale, inactive, and unsupported reasons remain intact.
+- Exact-linear one-hour, eight-hour, one-day, and annualized-simple percentage equivalents are derived only when the one-hour basis is qualified; they are not additional upstream observations.
 - Native numeric strings are preserved without unverified cross-venue normalization.
 - Catalog identity and statistics identity share the numeric native market ID; display-symbol collisions cannot substitute for IDs.
 
@@ -403,7 +405,7 @@ Implemented endpoint:
 - `cargo test lighterxyz -- --nocapture` passed with 12 tests.
 - `cargo test market_stats -- --nocapture` passed with 52 tests.
 - `cargo fmt` passed.
-- Bounded live checks passed for the market catalog, native `market_stats/all` frames, timestamp normalization, and current-versus-settled funding semantics.
+- Bounded live checks passed for the market catalog, native `market_stats/all` frames, timestamp normalization, and current-versus-settled funding semantics. A later live endpoint attempt observed upstream Lighter `503`/`502` availability and correctly returned an explicit upstream failure rather than inventing rows.
 
 ### Optional follow-up evidence, not blockers
 

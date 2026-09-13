@@ -18,8 +18,8 @@ use crate::{
     exchanges::traits::{ExchangeError, MarketStatsSource},
     market_stats::MarketStatsSourceSnapshot,
     models::{
-        CapabilityState, FeatureCapability, FetchMarketStatsParams, FundingKind, FundingValue,
-        MarketStatsAllMarketsCapability, MarketStatsCapabilities, MarketStatsField,
+        CapabilityState, FeatureCapability, FetchMarketStatsParams, FundingKind, FundingRateUnit,
+        FundingValue, MarketStatsAllMarketsCapability, MarketStatsCapabilities, MarketStatsField,
         MarketStatsFieldName, MarketStatsFieldState, MarketStatsRow, MarketStatsScope,
         MarketStatsSelectedMarketsCapability, MarketStatsSourceFailure,
         MarketStatsSupportedCapabilities, MarketStatsValue, MarketStatsWsCapability, PriceValue,
@@ -85,7 +85,7 @@ impl MarketStatsSource for BinanceExchange {
             payment_interval_ms: None,
             limitations: vec![
                 "usd-m-perpetual-only".to_string(),
-                "rate-basis-unverified".to_string(),
+                "rate-unit-decimal-fraction".to_string(),
                 "funding-info-exceptions-only".to_string(),
                 "receipt-time-freshness".to_string(),
             ],
@@ -463,8 +463,7 @@ fn funding_intervals(
 fn field_support(field: MarketStatsFieldName) -> (CapabilityState, Option<&'static str>) {
     use MarketStatsFieldName::*;
     match field {
-        Funding => (CapabilityState::Supported, Some("rate-basis-unverified")),
-        MarkPrice | IndexPrice => (CapabilityState::Supported, None),
+        Funding | MarkPrice | IndexPrice => (CapabilityState::Supported, None),
         Volume24h | OpenInterest => (CapabilityState::Unsupported, Some("units-unverified")),
         _ => (
             CapabilityState::Unsupported,
@@ -518,24 +517,25 @@ fn observed_field(
         received_timestamp: Some(received_timestamp),
         source: Some(MARK_SOURCE.to_string()),
     };
-    let raw = match name {
+    let Some(raw) = (match name {
         MarketStatsFieldName::Funding => mark.funding.as_deref(),
         MarketStatsFieldName::MarkPrice => mark.mark.as_deref(),
         MarketStatsFieldName::IndexPrice => mark.index.as_deref(),
         _ => unreachable!("only supported fields are observed"),
-    };
-    let Some(raw) = raw.and_then(decimal_string) else {
+    })
+    .and_then(decimal_string) else {
         return field;
     };
     field.value = Some(if name == MarketStatsFieldName::Funding {
-        MarketStatsValue::Funding(FundingValue {
-            rate: raw.to_string(),
-            kind: FundingKind::CurrentUnclassified,
-            rate_interval_ms: None,
-            payment_interval_ms: interval,
-            payment_timestamp: None,
-            next_payment_timestamp: mark.next_funding,
-        })
+        MarketStatsValue::Funding(FundingValue::new(
+            raw.to_string(),
+            FundingRateUnit::DecimalFraction,
+            FundingKind::CurrentUnclassified,
+            interval,
+            interval,
+            None,
+            mark.next_funding,
+        ))
     } else {
         if raw.starts_with('-') || !raw.bytes().any(|byte| matches!(byte, b'1'..=b'9')) {
             return field;

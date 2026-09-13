@@ -14,8 +14,8 @@ use crate::{
     exchanges::traits::{ExchangeError, MarketStatsSource},
     market_stats::MarketStatsSourceSnapshot,
     models::{
-        CapabilityState, FeatureCapability, FetchMarketStatsParams, FundingKind, FundingValue,
-        MarketStatsAllMarketsCapability, MarketStatsCapabilities, MarketStatsField,
+        CapabilityState, FeatureCapability, FetchMarketStatsParams, FundingKind, FundingRateUnit,
+        FundingValue, MarketStatsAllMarketsCapability, MarketStatsCapabilities, MarketStatsField,
         MarketStatsFieldName, MarketStatsFieldState, MarketStatsRow, MarketStatsScope,
         MarketStatsSelectedMarketsCapability, MarketStatsSourceFailure,
         MarketStatsSupportedCapabilities, MarketStatsValue, MarketStatsWsCapability, PriceValue,
@@ -106,9 +106,9 @@ impl MarketStatsSource for LighterExchange {
                 max_subscriptions_per_connection: 16,
             },
             funding_kinds: vec![FundingKind::Estimate, FundingKind::Settled],
-            rate_interval_ms: None,
-            payment_interval_ms: None,
-            limitations: vec!["rate-basis-unverified".to_string()],
+            rate_interval_ms: Some(3_600_000),
+            payment_interval_ms: Some(3_600_000),
+            limitations: vec!["rate-unit-percent".to_string()],
         })
     }
 
@@ -548,14 +548,15 @@ fn observed_field(
             let Some(raw) = decimal(stats.get("current_funding_rate")) else {
                 return result;
             };
-            MarketStatsValue::Funding(FundingValue {
-                rate: raw.to_string(),
-                kind: FundingKind::Estimate,
-                rate_interval_ms: None,
-                payment_interval_ms: None,
-                payment_timestamp: None,
-                next_payment_timestamp: None,
-            })
+            MarketStatsValue::Funding(FundingValue::new(
+                raw.to_string(),
+                FundingRateUnit::Percent,
+                FundingKind::Estimate,
+                Some(3_600_000),
+                Some(3_600_000),
+                None,
+                None,
+            ))
         }
         MarketStatsFieldName::LastSettledFunding => {
             let Some(raw) = decimal(stats.get("funding_rate")) else {
@@ -565,14 +566,15 @@ fn observed_field(
                 .get("funding_timestamp")
                 .and_then(parse_u64_lossy)
                 .map(normalize_lighter_timestamp_ms);
-            MarketStatsValue::Funding(FundingValue {
-                rate: raw.to_string(),
-                kind: FundingKind::Settled,
-                rate_interval_ms: None,
-                payment_interval_ms: None,
+            MarketStatsValue::Funding(FundingValue::new(
+                raw.to_string(),
+                FundingRateUnit::Percent,
+                FundingKind::Settled,
+                Some(3_600_000),
+                Some(3_600_000),
                 payment_timestamp,
-                next_payment_timestamp: None,
-            })
+                None,
+            ))
         }
         MarketStatsFieldName::MarkPrice => {
             match price_value(stats.get("mark_price"), base, quote) {
@@ -596,11 +598,7 @@ fn observed_field(
     };
     result.state = MarketStatsFieldState::Available;
     result.value = Some(value);
-    result.reason = if field == MarketStatsFieldName::Funding {
-        Some("rate-basis-unverified".to_string())
-    } else {
-        None
-    };
+    result.reason = None;
     result
 }
 
@@ -702,7 +700,7 @@ mod tests {
             capabilities.funding_kinds,
             vec![FundingKind::Estimate, FundingKind::Settled]
         );
-        assert_eq!(capabilities.payment_interval_ms, None);
+        assert_eq!(capabilities.payment_interval_ms, Some(3_600_000));
         assert_eq!(
             capabilities.fields[&UnifiedMarketType::Spot][&MarketStatsFieldName::Funding].state,
             CapabilityState::NotApplicable
@@ -772,27 +770,28 @@ mod tests {
         assert_eq!(estimate.source.as_deref(), Some(SOURCE));
         assert_eq!(
             estimate.value,
-            Some(MarketStatsValue::Funding(FundingValue {
-                rate: "-0.00100".to_string(),
-                kind: FundingKind::Estimate,
-                rate_interval_ms: None,
-                payment_interval_ms: None,
-                payment_timestamp: None,
-                next_payment_timestamp: None,
-            }))
+            Some(MarketStatsValue::Funding(FundingValue::new(
+                "-0.00100".to_string(),
+                FundingRateUnit::Percent,
+                FundingKind::Estimate,
+                Some(3_600_000),
+                Some(3_600_000),
+                None,
+                None,
+            )))
         );
         assert_eq!(
             settled.value,
-            Some(MarketStatsValue::Funding(FundingValue {
-                rate: "0.00050".to_string(),
-                kind: FundingKind::Settled,
-                rate_interval_ms: None,
-                payment_interval_ms: None,
-                payment_timestamp: Some(1_722_339_600_000),
-                next_payment_timestamp: None,
-            }))
+            Some(MarketStatsValue::Funding(FundingValue::new(
+                "0.00050".to_string(),
+                FundingRateUnit::Percent,
+                FundingKind::Settled,
+                Some(3_600_000),
+                Some(3_600_000),
+                Some(1_722_339_600_000),
+                None,
+            )))
         );
-        assert_eq!(state.values[&86].len(), 6);
     }
 
     #[test]

@@ -20,7 +20,7 @@ Hyperliquid completion gates:
 - [x] Catalog IDs and settlement metadata match statistics identities.
 - [x] All-market/selected snapshots share one primary bulk acquisition; field states and freshness are correct.
 - [x] Ferris WS snapshots/deltas, ordering, unsubscribe, coalescing, and recovery pass the specified checks.
-- [x] Capabilities advertise only delivered Hyperliquid and Binance support, with each venue's rate-basis limitation.
+- [x] Capabilities advertise delivered funding support, explicit units, and qualified intervals without obsolete basis warnings.
 - [x] Deterministic checks and the live smoke below pass; commands/results and delivered contract recorded below.
 
 Binance completion gates:
@@ -38,17 +38,17 @@ Bybit, Aster, and Extended remain deferred and unsupported for market statistics
 
 **Decision:** Lighter is the only newly selected exchange. Bybit, Aster, and Extended remain deferred and unsupported for market statistics. The source uses Lighter's native `market_stats` WebSocket acquisition through Ferris's coordinator, with `orderBookDetails` as the authoritative market catalog and statistics identity source. The backend exchange ID is exactly `lighterxyz`.
 
-- **Identity and selection:** Catalog-issued market IDs are numeric opaque native IDs, carried as strings in the unified contract; never derive identity from display symbols. `orderBookDetails` supplies market metadata and the native ID. Omitted `marketIds` enumerates supported active perpetual markets; explicit IDs select catalog-known markets. Unknown, malformed, foreign, or unsupported-product IDs are validation errors. Spot funding is `notApplicable`.
-- **Funding semantics:** `market_stats` current funding is an estimate and is emitted as exact native decimal text in `estimate` with reason `rate-basis-unverified`. Last settled funding is a distinct `settled` observation and must not overwrite the estimate. A settled observation may carry `paymentTimestamp`; current estimates do not. No `nextPaymentTimestamp` is emitted. A configurable funding period is a capability interval, so `paymentIntervalMs` is null.
+- **Identity and selection:** Catalog-issued `marketId` values are opaque compact JSON tuple strings, for example `["lighterxyz","perp",null,null,"1"]`; `exchangeMarketId` is the numeric native ID carried as a string. Never derive identity from display symbols. `orderBookDetails` supplies the metadata and native ID. Omitted `marketIds` enumerates supported active perpetual markets; explicit IDs select catalog-known markets. Unknown, malformed, foreign, or unsupported-product IDs are validation errors. Spot funding is `notApplicable`.
+- **Funding semantics:** `market_stats` `current_funding_rate` is an exact native percentage string emitted as an `estimate` with `rateUnit: percent`, qualified one-hour `rateIntervalMs`/`paymentIntervalMs`, and `reason: null` when available. `funding_rate` is a distinct `settled` observation and must not overwrite the estimate; it may carry `paymentTimestamp`. Neither field emits `nextPaymentTimestamp`. Derived `equivalents` are simple-linear percentage display values, not additional observations.
 - **Prices and limitations:** Mark, index, and last prices are supported when present, preserving exact numeric strings and catalog-qualified base/quote assets. Volume and open interest remain unsupported (`units-unverified` for OI; `adapter-not-implemented` for volume). No premium or volume/OI normalization is performed. Funding history and other unimplemented fields remain unsupported.
 - **Acquisition and freshness:** Ferris coordinator uses `nativeWebSocket` mode and Lighter's native `market_stats` stream, shared by HTTP and WebSocket demand. Poll/freshness policy remains a 30-second coordinator poll and 90-second stale boundary. Baseline timeout and incomplete coverage are explicit source failures.
 
 #### Lighter acceptance and verification gates
 
 - [x] Catalog `orderBookDetails` IDs and metadata join exactly to `market_stats`; numeric opaque IDs cannot collide or be substituted with symbols.
-- [x] Current estimate and last-settled funding remain distinct, with exact strings, correct timestamps, null next-payment timestamp, and configurable-period interval null.
+- [x] Current estimate and last-settled funding remain distinct, with exact strings, explicit percent unit and qualified one-hour intervals, correct timestamps, null next-payment timestamp, and derived equivalents.
 - [x] Mark/index/last fields, spot `notApplicable`, unsupported units, stale/error states, and explicit clears follow the shared field-state contract.
-- [x] Capabilities advertise Lighter marketstats with `nativeWebSocket`, `pollIntervalMs: 30000`, and `staleAfterMs: 90000`; deferred exchanges remain unsupported.
+- [x] Capabilities advertise Lighter marketstats with `nativeWebSocket`, `pollIntervalMs: 30000`, `staleAfterMs: 90000`, and qualified one-hour funding intervals; deferred exchanges remain unsupported.
 - [x] REST and WS share native acquisition through the coordinator; source baseline timeout/incomplete coverage is explicit.
 - [x] Bounded live Lighter smoke covered capabilities, catalog identity, native market stats frames, funding semantics, prices, and timestamp normalization.
 
@@ -56,18 +56,20 @@ Bybit, Aster, and Extended remain deferred and unsupported for market statistics
 
 `cargo check --all-targets` passed. `cargo test lighterxyz -- --nocapture` passed with 12 tests. `cargo test market_stats -- --nocapture` passed with 52 tests. `cargo fmt` passed. Live evidence: `orderBookDetails?filter=all` returned HTTP 200 with native numeric market IDs and active/inactive statuses; the bounded `market_stats/all` WebSocket probe received 138 update frames over 30 seconds, including sparse one-market and multi-market updates and timestamped market statistics. No frontend changes were made.
 
+Funding-unit rollout verification: `cargo fmt`, `cargo test` (178 passed, 5 ignored), and the updated debug binary build passed. A temporary actual server returned live Hyperliquid BTC funding with `reason: null`, `rateUnit: decimalFraction`, one-hour rate/payment intervals, and all four percentage equivalents. Funding capability reasons were null for Hyperliquid, Binance, and Lighter. Existing unused order-book constant warnings remain. This verification does not change the earlier Lighter upstream-availability observations.
+
 ### Active Binance contract (selected slice)
 
 - **Identity/catalog:** Binance market IDs are opaque compact JSON tuples `["binance","perp",null,null,nativeSymbol]`, preserving native Unicode and punctuation exactly. Catalog rows use `category: null`, `dex: null`, exact native `contractType: "PERPETUAL"`, and settlement plus `settlementAssetId` from `marginAsset` (null when unresolved). Duplicate or missing native symbols are structural invalid data.
 - **Selection:** Omitted IDs enumerate all active USDⓈ-M `PERPETUAL` markets. Explicit catalog-issued IDs may select known inactive perps; implemented fields then become `unavailable` / `inactive-market`. Unknown, malformed, foreign, noncanonical, or unsupported-product IDs are validation errors. Params are only null or `{}`; no symbol shortcut.
-- **Fields:** Funding is the exact native decimal string, `currentUnclassified` / `rate-basis-unverified`, with `rateIntervalMs` and payment timestamp null. `paymentIntervalMs` is emitted only for a positive checked `fundingIntervalHours` converted safely to milliseconds; missing, zero, overflow, or invalid intervals yield null without discarding other symbols. `nextPaymentTimestamp` uses only a positive native `nextFundingTime`. Mark and index prices are exact positive decimal strings qualified by catalog `base` and `quote`. Last-settled funding, last price, volume, open interest, and history are unsupported.
+- **Fields:** Funding is the exact native decimal-fraction string with `rateUnit: decimalFraction`, `kind: currentUnclassified`, and `reason: null` when available. `rateIntervalMs` and `paymentIntervalMs` use positive checked `fundingIntervalHours` converted safely to milliseconds; missing, zero, overflow, or invalid intervals yield null, with `equivalents: null`, without discarding the rate or other symbols. `paymentTimestamp` is null; `nextPaymentTimestamp` uses only a positive native `nextFundingTime`. Mark and index prices are exact positive decimal strings qualified by catalog `base` and `quote`. Last-settled funding, last price, volume, open interest, and history are unsupported.
 - **Acquisition/freshness:** Reuse the Hyperliquid coordinator and snapshot/delta wire contract with one shared Binance REST acquisition for HTTP and WS demand. Poll every 30 seconds; stale after 90 seconds; cache successful catalog/marks for 30 seconds, funding metadata for 300 seconds, and errors for 30 seconds. Catalog failure retains prior membership as incomplete until authoritative removal; funding/price failure retains stale original values, while explicit scalar clears remain cleared. The backend REST base defaults to `https://fapi.binance.com`, overridden by `BINANCE_BASE_URL`; there is no native Binance statistics WS.
 
 ### Delivery record and verification
 
 Delivered `POST /v1/fetchMarketStats`, `GET /v1/capabilities`, and `marketstats` on the existing `/v1/ws`. Catalog and statistics identities share native opaque IDs. Hyperliquid uses its primary-DEX catalog and Binance uses native USDⓈ-M `exchangeInfo` metadata. Both sources use shared REST polling every 30 seconds; HTTP demand lasts 90 seconds and socket demand is reference-counted. Shutdown and idle cancellation stop workers without late publication. Existing trade/book/OHLCV semantics remain separate.
 
-Funding remains exact-string `currentUnclassified`, with `rateIntervalMs: null`; Hyperliquid's payment interval is one hour by contract, while Binance emits only explicit positive checked `fundingIntervalHours` metadata. No inferred payment timestamps are used. Positive rates mean longs pay shorts. Mark/oracle prices have explicit qualified denominations; volume/OI remain unsupported (`units-unverified`). Stale observations retain original receipt timestamps; explicit scalar invalidation clears values. Context failures retain authoritative membership without shifting positional assignments. Partial or failed catalogs cannot invent removals or unknown IDs.
+Funding preserves exact native strings with explicit units and no obsolete basis warning. Hyperliquid uses `decimalFraction` with one-hour rate/payment intervals; Binance uses `decimalFraction` with explicit positive checked `fundingIntervalHours`; Lighter uses `percent` with one-hour intervals. Qualified intervals produce simple-linear one-hour, eight-hour, one-day, and annualized percentage equivalents. No inferred payment timestamps are used. Positive rates mean longs pay shorts. Mark/oracle prices have qualified denominations; volume/OI remain unsupported. Stale observations retain original receipts; explicit scalar invalidation clears values. Context failures retain authoritative membership without shifting positional assignments. Partial or failed catalogs cannot invent removals or unknown IDs.
 
 Socket acknowledgements precede initial snapshots; generations and contiguous revisions are per subscription. Complete states coalesce before sparse delta construction, at most once per second. Fields replace atomically, including null clears; coverage-only transitions are delivered. Backpressure forces disconnect/resubscription rather than continuing a gapped revision chain. The consumer contract is documented in README and INTEGRATION_README; Lattice was not modified.
 
@@ -109,7 +111,7 @@ Implementation tooling note: a provider rejected a subagent continuation with HT
 - Hyperliquid's `post_info`, `build_catalog`, and `fetch_markets` already use primary `metaAndAssetCtxs` and `spotMeta`. Reuse the HTTP client/helper and existing display mapping. The indefinite legacy `MarketCatalog` and trade/book/OHLCV resolver semantics remain unchanged.
 - `MarketsCache` supplies the double-checked, per-key sharing pattern. Existing WS symbol requirements, acknowledgement races, and broadcast lag warning-and-continue behavior are not safe statistics semantics to copy unchanged.
 - A read-only public capture on 2026-09-11 returned 234 metadata entries/contexts: 178 active perps and 56 delisted. `collateralToken: 0`, resolved by token `index`, was USDC with token ID `0x6d1e7cde53ba9467b783cb7c530ce054`. BTC funding was `-0.0000006156`; ETH was `0.0000125`. These are observations, not fixed counts/fixtures or proof of the rate's hourly basis.
-- [Perpetual contexts][H1] and [spot metadata][H2] establish pairing/collateral lookup. [Funding rules][H5] establish positive-long-pays-short and hourly payments, but not explicitly whether context `funding` is already hourly. Ship the unknown-basis contract; do not infer it from magnitude.
+- [Perpetual contexts][H1] and [spot metadata][H2] establish pairing/collateral lookup. The completed funding-basis verification established the API rate's hourly decimal-fraction basis; emit one-hour rate/payment intervals and no basis warning. Do not infer future venue units from magnitude or payment cadence alone.
 - [Contract specifications](https://hyperliquid.gitbook.io/hyperliquid-docs/trading/contract-specifications.md) distinguish USDC settlement from generally USDT-denominated prices, with exact HYPE/PURR USDC-price exceptions. [Price-index documentation](https://hyperliquid.gitbook.io/hyperliquid-docs/trading/robust-price-indices.md) distinguishes mark/oracle. Volume and OI units remain unqualified here.
 - [Rate limits][H4]: these `/info` requests cost 20 weight against 1,200/minute/IP. A primary poll every 30 seconds costs 40 weight/minute independent of viewers; cache spot metadata for five minutes. No new HTTP client, SDK, or upstream statistics WS is needed.
 
@@ -146,7 +148,7 @@ Coverage is `{expectedMarkets: number|null, returnedMarkets: number, enumeration
 
 `MarketStatsField` has `{state,value,reason,exchangeTimestamp,receivedTimestamp,source}`. Value is null or strongly typed untagged `MarketStatsValue::{Funding(FundingValue), Price(PriceValue)}`; do not add unused OI/volume variants. Reason, timestamps, and source are nullable. States are exactly `available` (valid value including zero funding), `notApplicable` (null/product has no meaning), `unsupported` (null/not implemented or unqualified units), `unavailable` (null/no usable observation or explicit invalid/missing scalar), and `stale` (retained last valid value/original timestamps after failure or expiry).
 
-`FundingValue` is `{rate: String, kind: FundingKind, rateIntervalMs: Option<u64>, paymentIntervalMs: Option<u64>, paymentTimestamp: Option<u64>, nextPaymentTimestamp: Option<u64>}`. Enum wire variants are `estimate`, `settled`, `currentUnclassified`; Hyperliquid emits only `currentUnclassified`. Preserve exact validated decimal funding string, rateIntervalMs null, paymentIntervalMs 3600000, payment timestamps null; valid funding reason is `rate-basis-unverified`. Positive means longs pay shorts. No divide-by-eight, percent conversion, annualization, derived next hour, settled label, or guaranteed estimate.
+`FundingValue` is `{rate: String, rateUnit: FundingRateUnit, kind: FundingKind, rateIntervalMs: Option<u64>, paymentIntervalMs: Option<u64>, paymentTimestamp: Option<u64>, nextPaymentTimestamp: Option<u64>, equivalents: Option<FundingRateEquivalents>}`. Units are `decimalFraction` and `percent`; kinds are `estimate`, `settled`, and `currentUnclassified`. Hyperliquid preserves its hourly decimal-fraction rate, emits `currentUnclassified`, rate/payment intervals of 3600000, null payment timestamps, and `reason: null` when available. Derived percentage strings are `oneHourPercent`, `eightHourPercent`, `oneDayPercent`, and `annualizedPercent` (simple, 365 days). They do not change the native rate or invent additional funding observations.
 
 `PriceValue` is `{amount: String, baseAsset: String, quoteAsset: String}`. Map markPx→markPrice and oraclePx→indexPrice, never midPx. Preserve native base names/scaling. Quote is USDC for exact primary names HYPE/PURR and USDT for other primary crypto perps, independent of display quote/USDC settlement. Implemented observations use source `hyperliquid:primary:metaAndAssetCtxs`, exchangeTimestamp null, and receivedTimestamp from HTTP-body receipt, not cache reads; retain monotonic age separately. Fixed unsupported/not-applicable fields have null source/timestamps.
 
@@ -240,7 +242,7 @@ Only when delivered, Hyperliquid marketStats uses this exact supported detail; f
   "selectedMarkets":{"types":["perp","spot"],"limit":100},
   "fields":{
     "perp":{
-      "funding":{"state":"supported","reason":"rate-basis-unverified"},
+      "funding":{"state":"supported","reason":null},
       "lastSettledFunding":{"state":"unsupported","reason":"adapter-not-implemented"},
       "markPrice":{"state":"supported","reason":null},
       "indexPrice":{"state":"supported","reason":null},
@@ -263,9 +265,9 @@ Only when delivered, Hyperliquid marketStats uses this exact supported detail; f
   "staleAfterMs":90000,
   "ws":{"snapshot":true,"delta":true,"maxSubscriptionsPerConnection":16},
   "fundingKinds":["currentUnclassified"],
-  "rateIntervalMs":null,
+  "rateIntervalMs":3600000,
   "paymentIntervalMs":3600000,
-  "limitations":["primary-dex-only","rate-basis-unverified","receipt-time-freshness"]
+  "limitations":["primary-dex-only","rate-unit-decimal-fraction","receipt-time-freshness"]
 }
 ```
 
@@ -363,10 +365,10 @@ check(all.markets.every(x => x.type === "perp" && x.active && x.dex === ""), "al
 const chosen = await request("/v1/fetchMarketStats", { marketIds: [btc.marketId, spot.marketId], fields: ["funding", "openInterest"] });
 const row = chosen.markets.find(x => x.marketId === btc.marketId);
 check(row?.fields.funding.state === "available", "BTC current funding unavailable");
-check(row.fields.funding.value.kind === "currentUnclassified" && row.fields.funding.value.rateIntervalMs === null, "unqualified funding basis");
+check(row.fields.funding.value.kind === "currentUnclassified" && row.fields.funding.value.rateUnit === "decimalFraction" && row.fields.funding.value.rateIntervalMs === 3600000 && row.fields.funding.reason === null, "incorrect funding unit, interval, or warning");
 check(chosen.markets.find(x => x.marketId === spot.marketId)?.fields.funding.state === "notApplicable", "spot treated as zero funding");
 check(row.fields.openInterest.state === "unsupported", "unqualified OI advertised");
-await request("/v1/fetchMarketStats", { exchange: "binance" }, 501);
+await request("/v1/fetchMarketStats", { exchange: "bybit" }, 501);
 await request("/v1/fetchMarketStats", { marketIds: [] }, 400);
 const topic = { channel: "marketstats", exchange: "hyperliquid", marketIds: [btc.marketId], fields: ["funding"] };
 await new Promise((resolve, reject) => {
@@ -515,7 +517,7 @@ The product feature includes `rest_api`, `websocket_api`, and `websocket_streams
 
 **Scope boundary:** the historical adapter builds the primary-DEX catalog and does not call `perpDexs`. Full HIP-3 support would require `{"type":"perpDexs"}`, metadata per DEX using `dex`, and preserved DEX-qualified coin identities. The DEX list starts with a null primary entry; builder asset identifiers have their own indexed scheme. Existing symbol sanitization and partial `params.dex` handling are not an adequate general HIP-3 identity layer. Keep this deferred extension separate from unrelated trade/book routes. Do not implement an all-DEX stream even with primary filtering in the active slice.
 
-**Funding semantics evidence:** the trading docs describe an eight-hour formula rate and hourly payments at one-eighth of that formula. That does not prove whether API `funding` is formula or already-scaled hourly value. The approved active decision is `currentUnclassified`, rateIntervalMs null, paymentIntervalMs 3600000, reason `rate-basis-unverified`; this explicit limitation is not a blocker requiring speculative conversion. Positive means longs pay shorts. Oracle-based payment amounts are outside scope. A verified rate basis is a later qualification, not permission to divide now.
+**Funding semantics:** the original research distinguished the eight-hour formula from hourly payments. The subsequent completed verification qualified the API `funding` value as an hourly decimal fraction. The active contract now emits `currentUnclassified`, one-hour rate/payment intervals, null reason for available funding, and derived simple-linear percentage equivalents. Preserve the raw rate; do not divide it by eight again. Positive means longs pay shorts. Oracle-based payment amounts remain outside scope.
 
 `predictedFundings` contains cross-venue predictions for primary-DEX coins. Do not substitute it for native contexts or borrow its timing as if it were a native all-market schedule. Initially leave a missing native next-payment timestamp null rather than deriving it from an unqualified local clock.
 
@@ -874,7 +876,7 @@ This table and the touchpoints/scenarios following it are retained research, not
 | --- | --- | --- |
 | Binance current rate/schedule | Confirm `lastFundingRate`/WS `r` forecast/final meaning, current stream routing, and interval coverage for symbols absent from `fundingInfo`. Include separate-message market families in coverage checks. | Do not invent settled meaning or a universal eight-hour period; report the exact limitation. |
 | Bybit interval/unit/category | Confirm current ticker interval behavior, contract filtering, inverse volume/OI assets, and both-side/single-side OI mapping. | Expose only qualified quantity fields; never fill futures' funding blanks with zero. |
-| Hyperliquid future rate-basis/scope extensions | Establish API hourly/formula basis before assigning a verified rate interval; qualify collateral/quantity units and positional coverage before any DEX/native-stream extension. | Active slice already chooses primary-only shared polling, currentUnclassified/null rateIntervalMs, hourly paymentIntervalMs, and null next-payment/exchange timestamps. Do not block it on speculative basis conversion or add native streaming. |
+| Hyperliquid future scope extensions | Qualify collateral/quantity units and positional coverage before any DEX/native-stream extension. The primary API hourly decimal-fraction rate basis is already verified. | Keep primary-only shared polling, `currentUnclassified`, hourly rate/payment intervals, and null next-payment/exchange timestamps. Do not reopen the resolved basis warning or add native streaming. |
 | Aster rate semantics | Establish current versus finalized funding meaning and complete funding-info coverage. Verify V3 production bulk shapes. | Keep unclassified meaning explicit; no guessed OI integration. |
 | Extended rate/time/stream | Verify current hourly rate mapping across execution classes, `nextFundingRate` meaning/unit, history `T` units, and current header/access requirements. Qualify SDK stream behavior separately. | Use documented bulk REST; do not label next recalculation as next payment or claim native WS coverage. |
 | Lighter native scaling/history/OI | Establish decimal-versus-percent for each funding field, timestamp units per endpoint, settlement sign semantics, bulk initialization, native asset identity, and OI denomination. | No raw-number masquerading as normalized funding/OI; retain explicit unqualified capability until evidence is obtained. |

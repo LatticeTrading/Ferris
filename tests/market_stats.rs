@@ -604,13 +604,30 @@ async fn market_stats_http_capabilities_bounds_and_catalog_proof() {
         ]
     );
     for exchange in exchanges {
-        if exchange["exchange"] == "hyperliquid" || exchange["exchange"] == "binance" {
+        if exchange["exchange"] == "hyperliquid" {
+            assert_eq!(exchange["marketStats"]["upstreamMode"], "sharedPolling");
+            assert_eq!(exchange["marketStats"]["rateIntervalMs"], 3_600_000);
+            assert_eq!(exchange["marketStats"]["paymentIntervalMs"], 3_600_000);
+            assert!(exchange["marketStats"]["limitations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "rate-unit-decimal-fraction"));
+        } else if exchange["exchange"] == "binance" {
             assert_eq!(exchange["marketStats"]["upstreamMode"], "sharedPolling");
             assert_eq!(exchange["marketStats"]["rateIntervalMs"], Value::Null);
+            assert_eq!(exchange["marketStats"]["paymentIntervalMs"], Value::Null);
+            assert!(exchange["marketStats"]["limitations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "rate-unit-decimal-fraction"));
         } else if exchange["exchange"] == "lighterxyz" {
             assert_eq!(exchange["marketStats"]["upstreamMode"], "nativeWebSocket");
             assert_eq!(exchange["marketStats"]["pollIntervalMs"], 30_000);
             assert_eq!(exchange["marketStats"]["staleAfterMs"], 90_000);
+            assert_eq!(exchange["marketStats"]["rateIntervalMs"], 3_600_000);
+            assert_eq!(exchange["marketStats"]["paymentIntervalMs"], 3_600_000);
             assert_eq!(
                 exchange["marketStats"]["fundingKinds"],
                 json!(["estimate", "settled"])

@@ -135,7 +135,7 @@ For a selected market, pass catalog-issued IDs:
 }
 ```
 
-Lighter funding `current_funding_rate` is an exact native estimate. `funding_rate` is a separate last-settled observation. Preserve both semantics and do not normalize the rate across exchanges.
+Lighter funding `current_funding_rate` is an exact native percentage estimate with an hourly basis. `funding_rate` is a separate last-settled observation. Preserve both semantics and the native strings; use `rateUnit` and the supplied `equivalents` for comparable percentage displays.
 
 The response contains:
 
@@ -162,13 +162,20 @@ The response contains:
           "state": "available",
           "value": {
             "rate": "0.00004116",
+            "rateUnit": "decimalFraction",
             "kind": "currentUnclassified",
-            "rateIntervalMs": null,
+            "rateIntervalMs": 28800000,
             "paymentIntervalMs": 28800000,
             "paymentTimestamp": null,
-            "nextPaymentTimestamp": 1789228800000
+            "nextPaymentTimestamp": 1789228800000,
+            "equivalents": {
+              "oneHourPercent": "0.0005145",
+              "eightHourPercent": "0.004116",
+              "oneDayPercent": "0.012348",
+              "annualizedPercent": "4.50702"
+            }
           },
-          "reason": "rate-basis-unverified",
+          "reason": null,
           "exchangeTimestamp": 1789201320000,
           "receivedTimestamp": 1789201321014,
           "source": "binance:premiumIndex"
@@ -193,8 +200,15 @@ type FundingRow = {
   quote: string;
   active: boolean;
   rate: string | null;
+  rateUnit: "decimalFraction" | "percent" | null;
   state: string;
   reason: string | null;
+  equivalents: {
+    oneHourPercent: string;
+    eightHourPercent: string;
+    oneDayPercent: string;
+    annualizedPercent: string;
+  } | null;
   paymentIntervalMs: number | null;
   nextPaymentTimestamp: number | null;
   receivedTimestamp: number | null;
@@ -213,8 +227,10 @@ function fundingRow(market: any): FundingRow {
     quote: market.quote,
     active: market.active,
     rate: field?.state === "available" ? value?.rate ?? null : null,
+    rateUnit: field?.state === "available" ? value?.rateUnit ?? null : null,
     state: field?.state ?? "unavailable",
     reason: field?.reason ?? null,
+    equivalents: field?.state === "available" ? value?.equivalents ?? null : null,
     paymentIntervalMs: value?.paymentIntervalMs ?? null,
     nextPaymentTimestamp: value?.nextPaymentTimestamp ?? null,
     receivedTimestamp: field?.receivedTimestamp ?? null,
@@ -224,12 +240,12 @@ function fundingRow(market: any): FundingRow {
 
 Render the rate only when `state === "available"`. Suggested UI treatment:
 
-- `available`: show the rate.
+- `available`: show the rate using the exchange's explicit `rateUnit` and `equivalents`.
 - `stale`: show the last rate with a stale indicator and `receivedTimestamp`.
 - `unavailable`: show `—` and the reason if useful.
 - `unsupported` / `notApplicable`: do not render as zero.
 
-Funding rates are decimal fractions represented as strings. Preserve the string for display and avoid annualizing, multiplying by 100, or assuming a fixed payment schedule. Positive rates mean longs pay shorts. Show `paymentIntervalMs` only when the backend provides it.
+Funding rates include the exact native `rate`, `rateUnit`, and optional simple-linear percentage equivalents. `decimalFraction` values such as Hyperliquid/Binance must be multiplied by 100 for percentage display; `percent` values such as Lighter are already percentage-valued and must not be multiplied by 100. Preserve native strings and do not annualize by assuming a fixed schedule; show `paymentIntervalMs` only when supplied.
 
 ## 5. Refresh strategy
 

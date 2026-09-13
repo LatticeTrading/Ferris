@@ -335,6 +335,22 @@ pub enum MarketStatsValue {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub enum FundingRateUnit {
+    DecimalFraction,
+    Percent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FundingRateEquivalents {
+    pub one_hour_percent: String,
+    pub eight_hour_percent: String,
+    pub one_day_percent: String,
+    pub annualized_percent: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum FundingKind {
     Estimate,
     Settled,
@@ -345,11 +361,66 @@ pub enum FundingKind {
 #[serde(rename_all = "camelCase")]
 pub struct FundingValue {
     pub rate: String,
+    pub rate_unit: FundingRateUnit,
     pub kind: FundingKind,
     pub rate_interval_ms: Option<u64>,
     pub payment_interval_ms: Option<u64>,
     pub payment_timestamp: Option<u64>,
     pub next_payment_timestamp: Option<u64>,
+    pub equivalents: Option<FundingRateEquivalents>,
+}
+
+impl FundingValue {
+    pub fn new(
+        rate: String,
+        rate_unit: FundingRateUnit,
+        kind: FundingKind,
+        rate_interval_ms: Option<u64>,
+        payment_interval_ms: Option<u64>,
+        payment_timestamp: Option<u64>,
+        next_payment_timestamp: Option<u64>,
+    ) -> Self {
+        let equivalents = rate_interval_ms
+            .and_then(|interval_ms| funding_rate_equivalents(&rate, rate_unit, interval_ms));
+        Self {
+            rate,
+            rate_unit,
+            kind,
+            rate_interval_ms,
+            payment_interval_ms,
+            payment_timestamp,
+            next_payment_timestamp,
+            equivalents,
+        }
+    }
+}
+
+fn funding_rate_equivalents(
+    rate: &str,
+    unit: FundingRateUnit,
+    interval_ms: u64,
+) -> Option<FundingRateEquivalents> {
+    use rust_decimal::Decimal;
+    use std::str::FromStr;
+
+    if interval_ms == 0 {
+        return None;
+    }
+    let native = Decimal::from_str(rate).ok()?;
+    let percent = match unit {
+        FundingRateUnit::DecimalFraction => native * Decimal::from(100u64),
+        FundingRateUnit::Percent => native,
+    };
+    let hourly = percent * Decimal::from(3_600_000u64) / Decimal::from(interval_ms);
+    let eight_hour = hourly * Decimal::from(8u64);
+    let daily = hourly * Decimal::from(24u64);
+    let annualized = hourly * Decimal::from(8_760u64);
+    Some(FundingRateEquivalents {
+        one_hour_percent: hourly.to_string(),
+        eight_hour_percent: eight_hour.to_string(),
+        one_day_percent: daily.to_string(),
+        annualized_percent: annualized.to_string(),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -503,15 +574,16 @@ mod tests {
     fn market_stats_field_values_are_untagged_and_preserve_nullability() {
         let mut field = MarketStatsField {
             state: MarketStatsFieldState::Available,
-            value: Some(MarketStatsValue::Funding(FundingValue {
-                rate: "-0.000012500".to_string(),
-                kind: FundingKind::CurrentUnclassified,
-                rate_interval_ms: None,
-                payment_interval_ms: Some(3_600_000),
-                payment_timestamp: None,
-                next_payment_timestamp: None,
-            })),
-            reason: Some("rate-basis-unverified".to_string()),
+            value: Some(MarketStatsValue::Funding(FundingValue::new(
+                "-0.000012500".to_string(),
+                FundingRateUnit::DecimalFraction,
+                FundingKind::CurrentUnclassified,
+                None,
+                Some(3_600_000),
+                None,
+                None,
+            ))),
+            reason: None,
             exchange_timestamp: None,
             received_timestamp: Some(1_000),
             source: Some("hyperliquid:primary:metaAndAssetCtxs".to_string()),
@@ -522,11 +594,11 @@ mod tests {
             json!({
                 "state": "available",
                 "value": {
-                    "rate": "-0.000012500", "kind": "currentUnclassified",
+                    "rate": "-0.000012500", "rateUnit": "decimalFraction", "kind": "currentUnclassified",
                     "rateIntervalMs": null, "paymentIntervalMs": 3600000,
-                    "paymentTimestamp": null, "nextPaymentTimestamp": null,
+                    "paymentTimestamp": null, "nextPaymentTimestamp": null, "equivalents": null,
                 },
-                "reason": "rate-basis-unverified", "exchangeTimestamp": null,
+                "reason": null, "exchangeTimestamp": null,
                 "receivedTimestamp": 1000, "source": "hyperliquid:primary:metaAndAssetCtxs",
             })
         );
@@ -563,6 +635,47 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<MarketStatsValue>(encoded).unwrap(),
             price
+        );
+    }
+
+    #[test]
+    fn funding_equivalents_use_native_unit_and_exact_linear_scaling() {
+        let lighter = FundingValue::new(
+            "-0.0003".to_string(),
+            FundingRateUnit::Percent,
+            FundingKind::Estimate,
+            Some(3_600_000),
+            Some(3_600_000),
+            None,
+            None,
+        );
+        assert_eq!(
+            lighter.equivalents,
+            Some(FundingRateEquivalents {
+                one_hour_percent: "-0.0003".into(),
+                eight_hour_percent: "-0.0024".into(),
+                one_day_percent: "-0.0072".into(),
+                annualized_percent: "-2.6280".into(),
+            })
+        );
+
+        let binance = FundingValue::new(
+            "0.00000261".to_string(),
+            FundingRateUnit::DecimalFraction,
+            FundingKind::CurrentUnclassified,
+            Some(28_800_000),
+            Some(28_800_000),
+            None,
+            None,
+        );
+        assert_eq!(
+            binance.equivalents,
+            Some(FundingRateEquivalents {
+                one_hour_percent: "0.0000326250".into(),
+                eight_hour_percent: "0.0002610000".into(),
+                one_day_percent: "0.0007830000".into(),
+                annualized_percent: "0.2857950000".into(),
+            })
         );
     }
 

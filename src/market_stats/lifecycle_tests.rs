@@ -131,9 +131,9 @@ impl MarketStatsSource for FakeExchange {
                 max_subscriptions_per_connection: 16,
             },
             funding_kinds: vec![FundingKind::CurrentUnclassified],
-            rate_interval_ms: None,
+            rate_interval_ms: Some(3_600_000),
             payment_interval_ms: Some(3_600_000),
-            limitations: vec!["rate-basis-unverified".into()],
+            limitations: vec![],
         })
     }
 
@@ -295,15 +295,16 @@ fn source_rows(receipt: u64) -> Vec<MarketStatsRow> {
                 MarketStatsFieldName::Funding,
                 MarketStatsField {
                     state: MarketStatsFieldState::Available,
-                    value: Some(MarketStatsValue::Funding(FundingValue {
-                        rate: "-0.0000125".into(),
-                        kind: FundingKind::CurrentUnclassified,
-                        rate_interval_ms: None,
-                        payment_interval_ms: Some(3_600_000),
-                        payment_timestamp: None,
-                        next_payment_timestamp: None,
-                    })),
-                    reason: Some("rate-basis-unverified".into()),
+                    value: Some(MarketStatsValue::Funding(FundingValue::new(
+                        "-0.0000125".into(),
+                        crate::models::FundingRateUnit::DecimalFraction,
+                        FundingKind::CurrentUnclassified,
+                        Some(3_600_000),
+                        Some(3_600_000),
+                        None,
+                        None,
+                    ))),
+                    reason: None,
                     exchange_timestamp: None,
                     received_timestamp: Some(receipt),
                     source: Some(SOURCE.into()),
@@ -744,10 +745,6 @@ async fn market_stats_pending_acquisition_publishes_stale_at_90_seconds_before_r
     assert_eq!(
         funding(&recovered).received_timestamp,
         Some(WALL_ORIGIN + 91_000)
-    );
-    assert_eq!(
-        funding(&recovered).reason.as_deref(),
-        Some("rate-basis-unverified")
     );
     ready(coordinator.shutdown()).await;
 }
