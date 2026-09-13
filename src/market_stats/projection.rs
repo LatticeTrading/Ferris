@@ -325,7 +325,10 @@ pub fn merge_outcome(
         if row.market.market_type != UnifiedMarketType::Perp || !row.market.active {
             continue;
         }
-        let prior = row_id(row).and_then(|id| prior_rows.get(id).copied());
+        let row_key = row_id(row).map(str::to_owned);
+        let prior = row_key
+            .as_deref()
+            .and_then(|id| prior_rows.get(id).copied());
         for (name, field) in &mut row.fields {
             if !field_implemented_for_exchange(exchange, *name)
                 || field.reason.as_deref() == Some("invalid-upstream-value")
@@ -342,7 +345,20 @@ pub fn merge_outcome(
                             | "missing-upstream-row"
                     )
                 );
-            if next.contexts_valid && !field_failure {
+            let incoming_receipt = row_key
+                .as_deref()
+                .and_then(|id| next.field_received_at.get(id))
+                .and_then(|fields| fields.get(name))
+                .copied();
+            let prior_receipt = row_key
+                .as_deref()
+                .and_then(|id| previous.field_received_at.get(id))
+                .and_then(|fields| fields.get(name))
+                .copied();
+            let newly_observed = field.state == MarketStatsFieldState::Available
+                && incoming_receipt.is_some()
+                && incoming_receipt > prior_receipt;
+            if (next.contexts_valid && !field_failure) || newly_observed {
                 continue;
             }
             let incoming_reason = if field_failure {
@@ -366,6 +382,19 @@ pub fn merge_outcome(
             if let Some(old) = prior.and_then(|prior| prior.fields.get(name)) {
                 if usable(old) || old.reason.as_deref() == Some("invalid-upstream-value") {
                     *field = old.clone();
+                    if let Some(id) = row_key.as_deref() {
+                        if let Some(receipt) = previous
+                            .field_received_at
+                            .get(id)
+                            .and_then(|fields| fields.get(name))
+                        {
+                            next.field_received_at
+                                .entry(id.to_string())
+                                .or_default()
+                                .entry(*name)
+                                .or_insert(*receipt);
+                        }
+                    }
                 }
             }
             fail_field(field, &incoming_reason);
@@ -389,6 +418,7 @@ pub fn merge_outcome(
         .cloned()
         .collect();
     for mut row in retained {
+        let retained_id = row_id(&row).map(str::to_owned);
         if row.market.market_type == UnifiedMarketType::Perp {
             let reason = next
                 .source_failures
@@ -397,6 +427,13 @@ pub fn merge_outcome(
                 .map(|failure| failure.reason.as_str())
                 .unwrap_or("upstream-failure");
             fail_row(&mut row, reason);
+        }
+        if let Some(id) = retained_id {
+            if let Some(times) = previous.field_received_at.get(&id) {
+                next.field_received_at
+                    .entry(id)
+                    .or_insert_with(|| times.clone());
+            }
         }
         next.rows.push(row);
     }
@@ -412,35 +449,40 @@ pub fn expire_snapshot(
     snapshot: &MarketStatsSourceSnapshot,
     now: Instant,
 ) -> Option<MarketStatsSourceSnapshot> {
-    let received_at = snapshot.received_at?;
-    if now.saturating_duration_since(received_at) < STALE_AFTER {
-        return None;
-    }
-    let has_available = snapshot.rows.iter().any(|row| {
-        row.market.market_type == UnifiedMarketType::Perp
-            && row.market.active
-            && row.fields.iter().any(|(name, field)| {
-                field_implemented_for_row(row, *name)
-                    && field.state == MarketStatsFieldState::Available
-            })
-    });
-    if !has_available {
-        return None;
-    }
-    let mut expired = snapshot.clone();
-    for row in &mut expired.rows {
+    let mut expired: Option<MarketStatsSourceSnapshot> = None;
+    for row in &snapshot.rows {
         if row.market.market_type != UnifiedMarketType::Perp || !row.market.active {
             continue;
         }
-        for (name, field) in &mut row.fields {
+        let id = row_id(row);
+        for (name, field) in &row.fields {
             if field_implemented_for_exchange(&row.market.exchange, *name)
                 && field.state == MarketStatsFieldState::Available
             {
-                fail_field(field, "stale-threshold");
+                let receipt = id
+                    .and_then(|id| snapshot.field_received_at.get(id))
+                    .and_then(|fields| fields.get(name))
+                    .copied()
+                    .or(snapshot.received_at);
+                if receipt.is_some_and(|at| now.saturating_duration_since(at) >= STALE_AFTER) {
+                    if expired.is_none() {
+                        expired = Some(snapshot.clone());
+                    }
+                    let expired = expired.as_mut().unwrap();
+                    if let Some(expired_row) = expired
+                        .rows
+                        .iter_mut()
+                        .find(|candidate| row_id(candidate) == id)
+                    {
+                        if let Some(expired_field) = expired_row.fields.get_mut(name) {
+                            fail_field(expired_field, "stale-threshold");
+                        }
+                    }
+                }
             }
         }
     }
-    Some(expired)
+    expired
 }
 
 fn field_implemented_for_exchange(exchange: &str, name: MarketStatsFieldName) -> bool {
@@ -657,6 +699,7 @@ mod tests {
             spot_enumeration_complete: true,
             contexts_valid: true,
             received_at: Some(received_at),
+            field_received_at: Default::default(),
             next_poll_at: received_at + POLL_INTERVAL,
             source_failures: Vec::new(),
         }

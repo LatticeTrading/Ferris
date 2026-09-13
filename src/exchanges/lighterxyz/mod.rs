@@ -24,8 +24,7 @@ use crate::{
 };
 
 mod statistics;
-use statistics::NativeMetadata;
-
+use statistics::{NativeMetadata, NativeStats};
 pub const DEFAULT_LIGHTER_MARKETS_URL: &str = "https://explorer.elliot.ai/api/markets";
 pub const DEFAULT_LIGHTER_REST_BASE_URL: &str = "https://mainnet.zklighter.elliot.ai";
 pub const DEFAULT_LIGHTER_WS_URL: &str = "wss://mainnet.zklighter.elliot.ai/stream";
@@ -45,6 +44,8 @@ pub struct LighterExchange {
     catalog_service: Arc<LighterMarketCatalogService>,
     native_metadata_cache: Arc<RwLock<Option<(Instant, HashMap<u64, NativeMetadata>)>>>,
     native_metadata_refresh_lock: Arc<Mutex<()>>,
+    native_stats_cache: Arc<RwLock<Option<NativeStats>>>,
+    native_stats_refresh_lock: Arc<Mutex<()>>,
     pub(crate) stats_ws_url: String,
     pub(crate) stats_ws_timeout: Duration,
 }
@@ -64,6 +65,8 @@ impl LighterExchange {
             catalog_service,
             native_metadata_cache: Arc::new(RwLock::new(None)),
             native_metadata_refresh_lock: Arc::new(Mutex::new(())),
+            native_stats_cache: Arc::new(RwLock::new(None)),
+            native_stats_refresh_lock: Arc::new(Mutex::new(())),
             stats_ws_url: DEFAULT_LIGHTER_WS_URL.to_string(),
             stats_ws_timeout: Duration::from_millis(DEFAULT_LIGHTER_STATS_WS_TIMEOUT_MS),
         })

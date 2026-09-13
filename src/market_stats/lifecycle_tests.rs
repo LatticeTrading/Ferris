@@ -172,6 +172,7 @@ impl MarketStatsSource for FakeExchange {
             spot_enumeration_complete: true,
             contexts_valid: true,
             received_at: Some(received_at),
+            field_received_at: Default::default(),
             next_poll_at: received_at + POLL,
             source_failures: Vec::new(),
         })

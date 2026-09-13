@@ -12,7 +12,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use super::LighterExchange;
 use crate::{
     exchanges::traits::{ExchangeError, MarketStatsSource},
-    market_stats::MarketStatsSourceSnapshot,
+    market_stats::{make_market_id, MarketStatsSourceSnapshot},
     models::{
         CapabilityState, FeatureCapability, FetchMarketStatsParams, FundingKind, FundingRateUnit,
         FundingValue, MarketStatsAllMarketsCapability, MarketStatsCapabilities, MarketStatsField,
@@ -50,14 +50,229 @@ pub(crate) struct NativeMetadata {
     pub(crate) settlement_asset_id: Option<String>,
 }
 
-#[derive(Debug, Default)]
-struct NativeStats {
+#[derive(Debug, Clone, Default)]
+pub(crate) struct NativeStats {
     values: HashMap<u64, Map<String, Value>>,
     timestamps: HashMap<u64, u64>,
     field_timestamps: HashMap<u64, HashMap<String, u64>>,
     received_timestamps: HashMap<u64, HashMap<String, u64>>,
+    field_received_at: HashMap<u64, BTreeMap<MarketStatsFieldName, Instant>>,
     received_at: Option<Instant>,
     complete: bool,
+    source_failure: Option<(String, String)>,
+    observed_ids: HashSet<u64>,
+}
+
+impl LighterExchange {
+    async fn fetch_native_stats(
+        &self,
+        active_ids: &HashSet<u64>,
+    ) -> Result<NativeStats, ExchangeError> {
+        let _refresh_guard = self.native_stats_refresh_lock.lock().await;
+        let mut stats = self
+            .native_stats_cache
+            .read()
+            .await
+            .clone()
+            .unwrap_or_default();
+        let had_complete_cache = stats.complete;
+        let (mut socket, _) = match connect_async(&self.stats_ws_url).await {
+            Ok(connection) => connection,
+            Err(error) => {
+                let message = format!("Lighter stats websocket: {error}");
+                stats.source_failure = Some(("upstream-failure".to_string(), message));
+                *self.native_stats_cache.write().await = Some(stats.clone());
+                return Ok(stats);
+            }
+        };
+        if let Err(error) = socket
+            .send(Message::Text(
+                json!({"type": "subscribe", "channel": "market_stats/all"})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+        {
+            let message = format!("Lighter stats subscribe: {error}");
+            stats.source_failure = Some(("upstream-failure".to_string(), message));
+            *self.native_stats_cache.write().await = Some(stats.clone());
+            return Ok(stats);
+        }
+        let deadline = Instant::now() + self.stats_ws_timeout;
+        let mut received_update = false;
+        let mut terminal_failure: Option<(String, String)> = None;
+        while !received_update
+            || !active_ids.iter().all(|id| {
+                stats.values.get(id).is_some_and(|values| {
+                    REQUIRED_NATIVE_FIELDS
+                        .iter()
+                        .all(|field| values.contains_key(*field))
+                })
+            })
+        {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                terminal_failure = Some((
+                    "ws-timeout".to_string(),
+                    format!(
+                        "Lighter stats websocket produced no complete update within {:?}",
+                        self.stats_ws_timeout
+                    ),
+                ));
+                break;
+            }
+            let next = match timeout(remaining, socket.next()).await {
+                Ok(Some(Ok(message))) => message,
+                Ok(Some(Err(error))) => {
+                    terminal_failure = Some((
+                        "upstream-failure".to_string(),
+                        format!("Lighter stats websocket read: {error}"),
+                    ));
+                    break;
+                }
+                Ok(None) => {
+                    terminal_failure = Some((
+                        "upstream-failure".to_string(),
+                        "Lighter stats websocket closed before a complete update".to_string(),
+                    ));
+                    break;
+                }
+                Err(_) => {
+                    terminal_failure = Some((
+                        "ws-timeout".to_string(),
+                        format!(
+                            "Lighter stats websocket produced no complete update within {:?}",
+                            self.stats_ws_timeout
+                        ),
+                    ));
+                    break;
+                }
+            };
+            match next {
+                Message::Ping(payload) => {
+                    if let Err(error) = socket.send(Message::Pong(payload)).await {
+                        let message = format!("Lighter stats websocket pong: {error}");
+                        if !had_complete_cache {
+                            return Err(ExchangeError::UpstreamRequest(message));
+                        }
+                        terminal_failure = Some(("upstream-failure".to_string(), message));
+                        break;
+                    }
+                }
+                Message::Text(text) => {
+                    if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                        if value.get("type").and_then(Value::as_str) == Some("ping") {
+                            if let Err(error) = socket
+                                .send(Message::Text(json!({"type":"pong"}).to_string().into()))
+                                .await
+                            {
+                                let message = format!("Lighter stats websocket pong: {error}");
+                                if !had_complete_cache {
+                                    return Err(ExchangeError::UpstreamRequest(message));
+                                }
+                                terminal_failure = Some(("upstream-failure".to_string(), message));
+                                break;
+                            }
+                        }
+                    }
+                    received_update |= merge_stats_message(&text, active_ids, &mut stats);
+                }
+                Message::Binary(bytes) => {
+                    if let Ok(text) = String::from_utf8(bytes.to_vec()) {
+                        received_update |= merge_stats_message(&text, active_ids, &mut stats);
+                    }
+                }
+                Message::Close(_) => {
+                    terminal_failure = Some((
+                        "upstream-failure".to_string(),
+                        "Lighter stats websocket closed before a complete update".to_string(),
+                    ));
+                    break;
+                }
+                Message::Pong(_) | Message::Frame(_) => {}
+            }
+        }
+        if received_update {
+            stats.source_failure = None;
+        } else if let Some(failure) = terminal_failure {
+            stats.source_failure = Some(failure);
+        }
+        stats.complete = active_ids.iter().all(|id| {
+            stats.values.get(id).is_some_and(|values| {
+                REQUIRED_NATIVE_FIELDS
+                    .iter()
+                    .all(|field| values.contains_key(*field))
+            })
+        });
+        *self.native_stats_cache.write().await = Some(stats.clone());
+        Ok(stats)
+    }
+}
+
+fn merge_stats_message(text: &str, active_ids: &HashSet<u64>, stats: &mut NativeStats) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(text) else {
+        return false;
+    };
+    if value.get("type").and_then(Value::as_str) != Some("update/market_stats") {
+        return false;
+    }
+    let timestamp = value
+        .get("timestamp")
+        .and_then(parse_u64_lossy)
+        .map(normalize_lighter_timestamp_ms);
+    let Some(markets) = value.get("market_stats").and_then(Value::as_object) else {
+        return false;
+    };
+    let mut accepted = false;
+    for (key, raw) in markets {
+        let Some(id) = key
+            .parse::<u64>()
+            .ok()
+            .or_else(|| raw.get("market_id").and_then(parse_u64_lossy))
+        else {
+            continue;
+        };
+        if !active_ids.contains(&id) {
+            continue;
+        }
+        let Some(object) = raw.as_object() else {
+            continue;
+        };
+        let receipt_at = Instant::now();
+        let receipt = wall_millis(receipt_at);
+        let entry = stats.values.entry(id).or_default();
+        let field_times = stats.field_timestamps.entry(id).or_default();
+        let received_times = stats.received_timestamps.entry(id).or_default();
+        let field_receipts = stats.field_received_at.entry(id).or_default();
+        stats.observed_ids.insert(id);
+        for (field, value) in object {
+            entry.insert(field.clone(), value.clone());
+            if let Some(timestamp) = timestamp {
+                field_times.insert(field.clone(), timestamp);
+            }
+            received_times.insert(field.clone(), receipt);
+            if let Some(name) = market_stats_field_name(field) {
+                field_receipts.insert(name, receipt_at);
+            }
+        }
+        if let Some(timestamp) = timestamp {
+            stats.timestamps.insert(id, timestamp);
+        }
+        stats.received_at = Some(receipt_at);
+        accepted = true;
+    }
+    accepted
+}
+
+fn market_stats_field_name(field: &str) -> Option<MarketStatsFieldName> {
+    match field {
+        "current_funding_rate" => Some(MarketStatsFieldName::Funding),
+        "funding_rate" => Some(MarketStatsFieldName::LastSettledFunding),
+        "mark_price" => Some(MarketStatsFieldName::MarkPrice),
+        "index_price" => Some(MarketStatsFieldName::IndexPrice),
+        "last_trade_price" => Some(MarketStatsFieldName::LastPrice),
+        _ => None,
+    }
 }
 
 #[async_trait]
@@ -133,7 +348,13 @@ impl MarketStatsSource for LighterExchange {
         } else {
             self.fetch_native_stats(&active_ids).await?
         };
-        if !native_stats.complete && !active_ids.is_empty() {
+        if let Some((reason, message)) = &native_stats.source_failure {
+            source_failures.push(MarketStatsSourceFailure {
+                source: SOURCE.to_string(),
+                reason: reason.clone(),
+                message: message.clone(),
+            });
+        } else if !native_stats.complete && !active_ids.is_empty() {
             source_failures.push(MarketStatsSourceFailure {
                 source: SOURCE.to_string(),
                 reason: if native_stats.values.is_empty() {
@@ -176,27 +397,30 @@ impl MarketStatsSource for LighterExchange {
                 fields,
             });
         }
-        rows.sort_by(|left, right| {
-            left.market
-                .identity
-                .as_ref()
-                .map(|identity| &identity.market_id)
-                .cmp(
-                    &right
-                        .market
-                        .identity
-                        .as_ref()
-                        .map(|identity| &identity.market_id),
-                )
-        });
-
         Ok(MarketStatsSourceSnapshot {
             rows,
             perp_catalog_known: true,
             perp_enumeration_complete: true,
             spot_enumeration_complete: true,
-            contexts_valid: true,
+            contexts_valid: native_stats.complete && native_stats.source_failure.is_none(),
             received_at: native_stats.received_at,
+            field_received_at: native_stats
+                .field_received_at
+                .iter()
+                .map(|(market_id, fields)| {
+                    (
+                        make_market_id(
+                            "lighterxyz",
+                            UnifiedMarketType::Perp,
+                            None,
+                            None,
+                            &market_id.to_string(),
+                        )
+                        .expect("Lighter native IDs are valid market IDs"),
+                        fields.clone(),
+                    )
+                })
+                .collect(),
             next_poll_at: Instant::now() + Duration::from_secs(30),
             source_failures,
         })
@@ -300,137 +524,6 @@ impl LighterExchange {
         *self.native_metadata_cache.write().await =
             Some((std::time::Instant::now(), result.clone()));
         Ok(result)
-    }
-
-    async fn fetch_native_stats(
-        &self,
-        active_ids: &HashSet<u64>,
-    ) -> Result<NativeStats, ExchangeError> {
-        let (mut socket, _) = connect_async(&self.stats_ws_url).await.map_err(|error| {
-            ExchangeError::UpstreamRequest(format!("Lighter stats websocket: {error}"))
-        })?;
-        socket
-            .send(Message::Text(
-                json!({"type": "subscribe", "channel": "market_stats/all"})
-                    .to_string()
-                    .into(),
-            ))
-            .await
-            .map_err(|error| {
-                ExchangeError::UpstreamRequest(format!("Lighter stats subscribe: {error}"))
-            })?;
-
-        let deadline = Instant::now() + self.stats_ws_timeout;
-        let mut stats = NativeStats::default();
-        while !active_ids.iter().all(|id| {
-            stats.values.get(id).is_some_and(|values| {
-                REQUIRED_NATIVE_FIELDS
-                    .iter()
-                    .all(|field| values.contains_key(*field))
-            })
-        }) {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-            let next = match timeout(remaining, socket.next()).await {
-                Ok(Some(Ok(message))) => message,
-                Ok(Some(Err(error))) => {
-                    if stats.values.is_empty() {
-                        return Err(ExchangeError::UpstreamRequest(format!(
-                            "Lighter stats websocket read: {error}"
-                        )));
-                    }
-                    break;
-                }
-                Ok(None) | Err(_) => break,
-            };
-            match next {
-                Message::Ping(payload) => {
-                    socket.send(Message::Pong(payload)).await.map_err(|error| {
-                        ExchangeError::UpstreamRequest(format!(
-                            "Lighter stats websocket pong: {error}"
-                        ))
-                    })?;
-                }
-                Message::Text(text) => {
-                    if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                        if value.get("type").and_then(Value::as_str) == Some("ping") {
-                            socket
-                                .send(Message::Text(json!({"type":"pong"}).to_string().into()))
-                                .await
-                                .map_err(|error| {
-                                    ExchangeError::UpstreamRequest(format!(
-                                        "Lighter stats websocket pong: {error}"
-                                    ))
-                                })?;
-                        }
-                    }
-                    merge_stats_message(&text, active_ids, &mut stats);
-                }
-                Message::Binary(bytes) => {
-                    if let Ok(text) = String::from_utf8(bytes.to_vec()) {
-                        merge_stats_message(&text, active_ids, &mut stats);
-                    }
-                }
-                Message::Close(_) => break,
-                Message::Pong(_) | Message::Frame(_) => {}
-            }
-        }
-        stats.complete = active_ids.iter().all(|id| {
-            stats.values.get(id).is_some_and(|values| {
-                REQUIRED_NATIVE_FIELDS
-                    .iter()
-                    .all(|field| values.contains_key(*field))
-            })
-        });
-        Ok(stats)
-    }
-}
-
-fn merge_stats_message(text: &str, active_ids: &HashSet<u64>, stats: &mut NativeStats) {
-    let Ok(value) = serde_json::from_str::<Value>(text) else {
-        return;
-    };
-    if value.get("type").and_then(Value::as_str) != Some("update/market_stats") {
-        return;
-    }
-    let timestamp = value
-        .get("timestamp")
-        .and_then(parse_u64_lossy)
-        .map(normalize_lighter_timestamp_ms);
-    let Some(markets) = value.get("market_stats").and_then(Value::as_object) else {
-        return;
-    };
-    for (key, raw) in markets {
-        let Some(id) = key
-            .parse::<u64>()
-            .ok()
-            .or_else(|| raw.get("market_id").and_then(parse_u64_lossy))
-        else {
-            continue;
-        };
-        if !active_ids.contains(&id) {
-            continue;
-        }
-        let Some(object) = raw.as_object() else {
-            continue;
-        };
-        let receipt = wall_millis(Instant::now());
-        let entry = stats.values.entry(id).or_default();
-        let field_times = stats.field_timestamps.entry(id).or_default();
-        let received_times = stats.received_timestamps.entry(id).or_default();
-        for (field, value) in object {
-            entry.insert(field.clone(), value.clone());
-            if let Some(timestamp) = timestamp {
-                field_times.insert(field.clone(), timestamp);
-            }
-            received_times.insert(field.clone(), receipt);
-        }
-        if let Some(timestamp) = timestamp {
-            stats.timestamps.insert(id, timestamp);
-        }
-        stats.received_at.get_or_insert_with(Instant::now);
     }
 }
 
@@ -792,6 +885,61 @@ mod tests {
                 None,
             )))
         );
+    }
+
+    #[test]
+    fn sparse_updates_accumulate_across_baselines() {
+        let active = HashSet::from([86_u64, 99_u64]);
+        let mut state = NativeStats::default();
+        let first = json!({
+            "type": "update/market_stats",
+            "timestamp": 1_722_339_648,
+            "market_stats": {
+                "86": {
+                    "market_id": 86,
+                    "current_funding_rate": "-0.00100",
+                    "funding_rate": "0.00050",
+                    "mark_price": "100.00",
+                    "index_price": "101.00",
+                    "last_trade_price": "100.50"
+                }
+            }
+        });
+        let second = json!({
+            "type": "update/market_stats",
+            "timestamp": 1_722_339_649,
+            "market_stats": {
+                "99": {
+                    "market_id": 99,
+                    "current_funding_rate": "0.00010",
+                    "funding_rate": "0.00020",
+                    "mark_price": "200.00",
+                    "index_price": "201.00",
+                    "last_trade_price": "200.50"
+                }
+            }
+        });
+
+        assert!(merge_stats_message(&first.to_string(), &active, &mut state));
+        assert!(!active.iter().all(|id| {
+            state.values.get(id).is_some_and(|values| {
+                REQUIRED_NATIVE_FIELDS
+                    .iter()
+                    .all(|field| values.contains_key(*field))
+            })
+        }));
+        assert!(merge_stats_message(
+            &second.to_string(),
+            &active,
+            &mut state
+        ));
+        assert!(active.iter().all(|id| {
+            state.values.get(id).is_some_and(|values| {
+                REQUIRED_NATIVE_FIELDS
+                    .iter()
+                    .all(|field| values.contains_key(*field))
+            })
+        }));
     }
 
     #[test]

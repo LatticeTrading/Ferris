@@ -120,6 +120,7 @@ impl MarketStatsSource for BinanceExchange {
             spot_enumeration_complete: true,
             contexts_valid: marks.result.is_ok(),
             received_at: marks.result.is_ok().then_some(marks.received_at),
+            field_received_at: Default::default(),
             next_poll_at: info.next_poll_at.max(marks.next_poll_at),
             source_failures: failures,
         };

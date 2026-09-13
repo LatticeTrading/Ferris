@@ -1,4 +1,10 @@
-use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap},
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+    time::Duration,
+};
 
 use serde_json::Value;
 use tokio::{
@@ -14,8 +20,8 @@ use crate::{
         traits::{ExchangeError, MarketDataExchange},
     },
     models::{
-        FetchMarketStatsParams, FetchMarketStatsRequest, MarketStatsRow, MarketStatsSnapshot,
-        MarketStatsSourceFailure, MarketStatsTopic, UnifiedMarketType,
+        FetchMarketStatsParams, FetchMarketStatsRequest, MarketStatsFieldName, MarketStatsRow,
+        MarketStatsSnapshot, MarketStatsSourceFailure, MarketStatsTopic, UnifiedMarketType,
     },
 };
 
@@ -47,6 +53,7 @@ pub struct MarketStatsSourceSnapshot {
     pub contexts_valid: bool,
     // Primary receipt time for age calculations; wall-clock receipts live on each field.
     pub received_at: Option<Instant>,
+    pub field_received_at: HashMap<String, BTreeMap<MarketStatsFieldName, Instant>>,
     pub next_poll_at: Instant,
     pub source_failures: Vec<MarketStatsSourceFailure>,
 }
@@ -216,6 +223,7 @@ impl MarketStatsCoordinator {
                         spot_enumeration_complete: false,
                         contexts_valid: false,
                         received_at: None,
+                        field_received_at: HashMap::new(),
                         next_poll_at: Instant::now(),
                         source_failures: Vec::new(),
                     };

@@ -321,6 +321,7 @@ mod tests {
             spot_enumeration_complete: true,
             contexts_valid: true,
             received_at: Some(Instant::now()),
+            field_received_at: Default::default(),
             next_poll_at: Instant::now() + Duration::from_secs(30),
             source_failures: Vec::new(),
         }

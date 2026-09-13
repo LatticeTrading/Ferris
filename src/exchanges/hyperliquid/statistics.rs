@@ -229,6 +229,7 @@ fn normalize(
         spot_enumeration_complete,
         contexts_valid: contexts.is_some(),
         received_at: Some(primary.received_at),
+        field_received_at: Default::default(),
         next_poll_at: primary.next_poll_at,
         source_failures,
     })

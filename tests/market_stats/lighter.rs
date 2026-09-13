@@ -14,8 +14,13 @@ use axum::{
     Json, Router,
 };
 use ferris_market_data_backend::{
-    exchanges::lighterxyz::{LighterExchange, LighterMarketCatalogService},
-    models::UnifiedMarketType,
+    exchanges::{
+        lighterxyz::{LighterExchange, LighterMarketCatalogService},
+        traits::MarketStatsSource,
+    },
+    models::{
+        FetchMarketStatsParams, MarketStatsFieldName, MarketStatsFieldState, UnifiedMarketType,
+    },
 };
 use futures_util::StreamExt;
 use serde_json::{json, Value};
@@ -32,6 +37,37 @@ struct LighterMock {
     catalog_count: Arc<AtomicUsize>,
     metadata_count: Arc<AtomicUsize>,
     ws_count: Arc<AtomicUsize>,
+    /// Optional frames consumed in connection order, enabling deterministic
+    /// sparse observations across native acquisitions.
+    ws_frames: Arc<RwLock<Vec<Value>>>,
+    ws_silent: Arc<RwLock<bool>>,
+    ws_close: Arc<RwLock<bool>>,
+    ws_handshake_failure: Arc<RwLock<bool>>,
+}
+
+fn default_stats_update() -> Value {
+    json!({
+        "type":"update/market_stats", "channel":"market_stats:all", "timestamp":1722339649,
+        "market_stats": {
+            "86": {"market_id":86,"current_funding_rate":"-0.00100","funding_rate":"0.00050","funding_timestamp":1722339600,"mark_price":"60000.00","index_price":"59999.50","last_trade_price":"60001.00"},
+            "99": {"market_id":99,"current_funding_rate":"0.00010","funding_rate":"0.00020","funding_timestamp":1722339600,"mark_price":"0.100","index_price":"0.099","last_trade_price":"0.101"}
+        }
+    })
+}
+
+impl LighterMock {
+    async fn push_ws_frame(&self, frame: Value) {
+        self.ws_frames.write().await.push(frame);
+    }
+    async fn set_ws_silent(&self, value: bool) {
+        *self.ws_silent.write().await = value;
+    }
+    async fn set_ws_close(&self, value: bool) {
+        *self.ws_close.write().await = value;
+    }
+    async fn set_ws_handshake_failure(&self, value: bool) {
+        *self.ws_handshake_failure.write().await = value;
+    }
 }
 
 fn catalog_fixture() -> Value {
@@ -79,6 +115,10 @@ async fn stats_ws_handler(
 
 async fn stats_ws(mut socket: WebSocket, mock: LighterMock) {
     mock.ws_count.fetch_add(1, Ordering::SeqCst);
+    if *mock.ws_handshake_failure.read().await {
+        let _ = socket.send(AxumMessage::Close(None)).await;
+        return;
+    }
     let Some(Ok(AxumMessage::Text(command))) = socket.next().await else {
         return;
     };
@@ -93,16 +133,23 @@ async fn stats_ws(mut socket: WebSocket, mock: LighterMock) {
                 .into(),
         ))
         .await;
-    let update = json!({
-        "type":"update/market_stats", "channel":"market_stats:all", "timestamp":1722339649,
-        "market_stats": {
-            "86": {"market_id":86,"current_funding_rate":"-0.00100","funding_rate":"0.00050","funding_timestamp":1722339600,"mark_price":"60000.00","index_price":"59999.50","last_trade_price":"60001.00"},
-            "99": {"market_id":99,"current_funding_rate":"0.00010","funding_rate":"0.00020","funding_timestamp":1722339600,"mark_price":"0.100","index_price":"0.099","last_trade_price":"0.101"}
-        }
-    });
-    let _ = socket
-        .send(AxumMessage::Text(update.to_string().into()))
-        .await;
+    if !*mock.ws_silent.read().await {
+        let frame = {
+            let mut frames = mock.ws_frames.write().await;
+            if frames.is_empty() {
+                default_stats_update()
+            } else {
+                frames.remove(0)
+            }
+        };
+        let _ = socket
+            .send(AxumMessage::Text(frame.to_string().into()))
+            .await;
+    }
+    if *mock.ws_close.read().await {
+        let _ = socket.send(AxumMessage::Close(None)).await;
+        return;
+    }
     while let Some(Ok(message)) = socket.next().await {
         match message {
             AxumMessage::Ping(payload) => {
@@ -127,6 +174,10 @@ async fn native_server() -> (LighterMock, String, oneshot::Sender<()>, JoinHandl
         catalog_count: Arc::new(AtomicUsize::new(0)),
         metadata_count: Arc::new(AtomicUsize::new(0)),
         ws_count: Arc::new(AtomicUsize::new(0)),
+        ws_frames: Arc::new(RwLock::new(Vec::new())),
+        ws_silent: Arc::new(RwLock::new(false)),
+        ws_close: Arc::new(RwLock::new(false)),
+        ws_handshake_failure: Arc::new(RwLock::new(false)),
     };
     let app = Router::new()
         .route("/markets", get(catalog_handler))
@@ -326,5 +377,33 @@ async fn lighter_metadata_failure_rejects_selected_but_complete_unknown_is_valid
     backend_stop.send(()).unwrap();
     stop.send(()).unwrap();
     backend_task.await.unwrap();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn lighter_native_ws_failure_reports_explicit_source_failure() {
+    let (native, base, stop, task) = native_server().await;
+    let catalog = Arc::new(
+        LighterMarketCatalogService::new(2_000, format!("{base}/markets"), 60_000).unwrap(),
+    );
+    let source = LighterExchange::new(base.clone(), 2_000, catalog)
+        .unwrap()
+        .with_stats_ws_url(format!("{base}/stream").replace("http://", "ws://"), 100);
+    *native.ws_silent.write().await = true;
+    native.set_ws_close(true).await;
+    let snapshot = source
+        .fetch_market_stats(FetchMarketStatsParams { params: json!({}) })
+        .await
+        .unwrap();
+    assert!(snapshot
+        .source_failures
+        .iter()
+        .any(|failure| failure.source == "lighterxyz:market_stats"
+            && failure.reason == "upstream-failure"));
+    assert!(!snapshot.contexts_valid);
+    assert!(snapshot.rows.iter().any(|row| {
+        row.fields[&MarketStatsFieldName::Funding].state == MarketStatsFieldState::Unavailable
+    }));
+    stop.send(()).unwrap();
     task.await.unwrap();
 }
