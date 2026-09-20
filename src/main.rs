@@ -48,7 +48,10 @@ async fn main() -> anyhow::Result<()> {
     registry.register(extended_exchange.clone());
     registry.register(aster_exchange.clone());
     registry.register(binance_exchange.clone());
-    registry.register(Arc::new(BybitExchange::new(config.request_timeout_ms)?));
+    registry.register(Arc::new(BybitExchange::with_base_url(
+        config.bybit_base_url.clone(),
+        config.request_timeout_ms,
+    )?));
     registry.register(Arc::new(
         LighterExchange::new(
             config.lighter_rest_base_url.clone(),

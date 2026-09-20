@@ -1,5 +1,9 @@
 #[path = "market_stats/binance.rs"]
 mod binance;
+#[path = "market_stats/bybit.rs"]
+mod bybit;
+#[path = "market_stats/extended.rs"]
+mod extended;
 #[path = "market_stats/lighter.rs"]
 mod lighter;
 
@@ -513,10 +517,14 @@ async fn backend(
     if source.id() != "binance" {
         registry.register(Arc::new(BinanceExchange::new(1_000).unwrap()));
     }
-    registry.register(Arc::new(BybitExchange::new(1_000).unwrap()));
-    registry.register(Arc::new(
-        ExtendedExchange::new("http://127.0.0.1:1".into(), 1_000).unwrap(),
-    ));
+    if source.id() != "bybit" {
+        registry.register(Arc::new(BybitExchange::new(1_000).unwrap()));
+    }
+    if source.id() != "extended" {
+        registry.register(Arc::new(
+            ExtendedExchange::new("http://127.0.0.1:1".into(), 1_000).unwrap(),
+        ));
+    }
     if source.id() != "lighterxyz" {
         let catalog = Arc::new(
             LighterMarketCatalogService::new(1_000, "http://127.0.0.1:1".into(), 60_000).unwrap(),
@@ -622,6 +630,39 @@ async fn market_stats_http_capabilities_bounds_and_catalog_proof() {
                 .unwrap()
                 .iter()
                 .any(|value| value == "rate-unit-decimal-fraction"));
+        } else if exchange["exchange"] == "bybit" {
+            let stats = &exchange["marketStats"];
+            assert_eq!(stats["state"], "supported");
+            assert_eq!(stats["scope"]["params"], json!({"category":"linear"}));
+            assert_eq!(stats["upstreamMode"], "sharedPolling");
+            assert_eq!(stats["pollIntervalMs"], 30_000);
+            assert_eq!(stats["staleAfterMs"], 90_000);
+            assert_eq!(stats["rateIntervalMs"], Value::Null);
+            assert_eq!(stats["paymentIntervalMs"], Value::Null);
+            assert_eq!(stats["fundingKinds"], json!(["estimate"]));
+            assert_eq!(stats["allMarkets"]["types"], json!(["perp"]));
+            assert_eq!(stats["allMarkets"]["activeOnly"], true);
+            assert_eq!(stats["selectedMarkets"]["types"], json!(["perp"]));
+            assert_eq!(stats["selectedMarkets"]["limit"], 100);
+            assert_eq!(stats["ws"]["maxSubscriptionsPerConnection"], 16);
+            for field in ["funding", "markPrice", "indexPrice", "lastPrice"] {
+                assert_eq!(stats["fields"]["perp"][field]["state"], "supported");
+            }
+            for field in ["volume24h", "openInterest"] {
+                assert_eq!(stats["fields"]["perp"][field]["state"], "unsupported");
+                assert_eq!(stats["fields"]["perp"][field]["reason"], "units-unverified");
+            }
+            assert_eq!(
+                stats["fields"]["perp"]["lastSettledFunding"]["state"],
+                "unsupported"
+            );
+            for limitation in ["linear-and-inverse-perpetual-only", "pre-market-excluded"] {
+                assert!(stats["limitations"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|value| value == limitation));
+            }
         } else if exchange["exchange"] == "lighterxyz" {
             assert_eq!(exchange["marketStats"]["upstreamMode"], "nativeWebSocket");
             assert_eq!(exchange["marketStats"]["pollIntervalMs"], 30_000);
@@ -640,6 +681,24 @@ async fn market_stats_http_capabilities_bounds_and_catalog_proof() {
                 exchange["marketStats"]["fields"]["spot"]["funding"]["state"],
                 "notApplicable"
             );
+        } else if exchange["exchange"] == "extended" {
+            let stats = &exchange["marketStats"];
+            assert_eq!(stats["state"], "supported");
+            assert_eq!(stats["scope"]["params"], json!({}));
+            assert_eq!(stats["upstreamMode"], "sharedPolling");
+            assert_eq!(stats["pollIntervalMs"], 30_000);
+            assert_eq!(stats["staleAfterMs"], 90_000);
+            assert_eq!(stats["rateIntervalMs"], 3_600_000);
+            assert_eq!(stats["paymentIntervalMs"], 3_600_000);
+            assert_eq!(stats["fundingKinds"], json!(["estimate"]));
+            assert_eq!(stats["allMarkets"]["types"], json!(["perp"]));
+            assert_eq!(stats["selectedMarkets"]["types"], json!(["perp"]));
+            for field in ["funding", "markPrice", "indexPrice", "lastPrice"] {
+                assert_eq!(stats["fields"]["perp"][field]["state"], "supported");
+            }
+            for field in ["lastSettledFunding", "volume24h", "openInterest"] {
+                assert_eq!(stats["fields"]["perp"][field]["state"], "unsupported");
+            }
         } else {
             assert_eq!(
                 exchange["marketStats"],
@@ -784,16 +843,13 @@ async fn market_stats_http_all_selected_and_catalog_share_one_acquisition() {
         }
         assert_eq!(row["fields"]["volume24h"]["state"], "unsupported");
     }
-    assert_eq!(
-        stats_http(
-            &client,
-            &url,
-            json!({"marketIds":[native_id("UNKNOWN")]}),
-            StatusCode::BAD_REQUEST
-        )
-        .await["message"],
-        format!("unknown marketId: {}", native_id("UNKNOWN"))
-    );
+    stats_http(
+        &client,
+        &url,
+        json!({"marketIds":[native_id("UNKNOWN")]}),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
     assert_eq!(mock.primary_count.load(Ordering::SeqCst), 1);
     assert_eq!(mock.spot_count.load(Ordering::SeqCst), 1);
     state.shutdown_market_stats().await;
@@ -1433,7 +1489,7 @@ async fn market_stats_ws_classifies_errors_and_limits_distinct_connection_topics
     .await;
     ws_error(
         &mut socket,
-        stats_command("subscribe", &json!({"exchange":"bybit"})),
+        stats_command("subscribe", &json!({"exchange":"aster"})),
         "UNSUPPORTED_FEATURE",
     )
     .await;

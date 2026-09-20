@@ -1,6 +1,6 @@
 # Frontend market-statistics quickstart
 
-Backend endpoints currently support market statistics for **Hyperliquid**, **Binance USDⓈ-M perpetuals**, and **Lighter perpetual markets**.
+Backend endpoints currently support market statistics for **Hyperliquid**, **Binance USDⓈ-M perpetuals**, **Bybit linear/inverse perpetuals**, **Extended perpetuals**, and **Lighter perpetual markets**.
 
 Use this flow for a funding-rate widget:
 
@@ -32,9 +32,11 @@ Current supported market-statistics exchanges:
 
 - `hyperliquid`
 - `binance`
+- `bybit`
+- `extended`
 - `lighterxyz`
 
-Hyperliquid and Binance use `sharedPolling` with a 30-second poll interval and a 90-second stale boundary. Lighter uses native `market_stats` WebSocket acquisition through the coordinator, with the same 30-second freshness policy.
+Hyperliquid, Binance, Bybit, and Extended use `sharedPolling` with a 30-second poll interval and a 90-second stale boundary. Bybit acquisition is shared independently per category. Lighter uses native `market_stats` WebSocket acquisition through the coordinator, with the same poll/stale policy.
 
 ## 2. Load the catalog
 
@@ -58,6 +60,22 @@ For Hyperliquid:
 ```json
 {"exchange":"hyperliquid","includeInactive":false,"params":{"dex":""}}
 ```
+
+For Bybit, load each required category separately:
+
+```json
+{"exchange":"bybit","includeInactive":false,"params":{"category":"linear"}}
+```
+
+Use `"inverse"` for inverse perpetuals. Keep catalog-issued `marketId`, `category`, native base/quote assets, and settlement metadata. Statistics identities are present only on perpetual rows; expiry futures, spot, and options are not statistics selections. The catalog's omitted-category default combines families, but statistics default to linear. Never send an inverse ID with a linear request.
+
+For Extended:
+
+```json
+{"exchange":"extended","includeInactive":false,"params":{}}
+```
+
+The catalog returns perpetuals with exact opaque IDs such as `["extended","perp",null,null,"BTC-USD"]`. Preserve native base/collateral assets and `info.isRfq`/`info.isOffHours`; off-hours alone does not mean inactive. Settlement keeps the native collateral denomination (currently `USD`) and opaque collateral ID (currently `0x1`), not an inferred token address. Use `includeInactive: true` when inactive selection is needed.
 
 Use catalog rows for display metadata and authoritative IDs. A Binance catalog row looks like:
 
@@ -84,6 +102,8 @@ Important:
 - `symbol` is for display only.
 - Omitted `marketIds` means all active supported perpetuals.
 - Explicit `marketIds` must be catalog-issued IDs; at most 100 may be sent.
+
+## 3. Fetch market statistics
 
 Request funding, mark price, and index price for each exchange. Lighter's native stream can fill rows progressively as each market update arrives; do not require the entire market list before rendering rows.
 
@@ -112,6 +132,40 @@ Content-Type: application/json
   "params": {"dex": ""}
 }
 ```
+
+### Bybit
+
+```http
+POST /v1/fetchMarketStats
+Content-Type: application/json
+
+{
+  "exchange": "bybit",
+  "fields": ["funding", "markPrice", "indexPrice", "lastPrice"],
+  "params": {"category": "linear"}
+}
+```
+
+Use `{"category":"inverse"}` for inverse contracts; null/empty params canonicalize to linear. For selected markets, add catalog-issued IDs, for example `"marketIds": ["[\"bybit\",\"perp\",\"linear\",null,\"BTCUSDT\"]"]` for a matching linear request. All-market enumeration excludes prelisting/inactive contracts; explicitly selected known inactive perpetuals report `inactive-market`.
+
+Funding uses `kind: estimate` and `rateUnit: decimalFraction`. Preserve native strings and per-market intervals; do not assume eight hours. A valid ticker interval takes precedence over instrument metadata, while explicit invalidity leaves intervals/equivalents null without losing the rate. `nextPaymentTimestamp` is the native upcoming payment time. An estimate becomes stale at that boundary, not settled. Last-settled funding, volume, open interest, and funding history remain unsupported for Bybit.
+
+### Extended
+
+```http
+POST /v1/fetchMarketStats
+Content-Type: application/json
+
+{
+  "exchange": "extended",
+  "fields": ["funding", "markPrice", "indexPrice", "lastPrice"],
+  "params": {}
+}
+```
+
+Only null/empty params are supported. For selected markets, add catalog-issued IDs, for example `"marketIds": ["[\"extended\",\"perp\",null,null,\"BTC-USD\"]"]`. No symbol/coin/category/DEX shortcuts or spot IDs are accepted. Explicit known inactive perpetuals report `inactive-market`.
+
+Funding is an exact `decimalFraction` `estimate` with `rateIntervalMs: 3600000`, `paymentIntervalMs: 3600000`, and simple-linear percentage equivalents. Payment and exchange timestamps are null. Native `nextFundingRate` denotes an update, not a qualified payment time; do not invent a countdown. RFQ and order-book markets use the same funding basis. Last price is the native observation, never a substitute mark/BBO; zero or invalid prices are unavailable. Last-settled funding, volume, open interest, and funding history remain unsupported for Extended.
 
 ### Lighter
 
@@ -245,11 +299,11 @@ Render the rate only when `state === "available"`. Suggested UI treatment:
 - `unavailable`: show `—` and the reason if useful.
 - `unsupported` / `notApplicable`: do not render as zero.
 
-Funding rates include the exact native `rate`, `rateUnit`, and optional simple-linear percentage equivalents. `decimalFraction` values such as Hyperliquid/Binance must be multiplied by 100 for percentage display; `percent` values such as Lighter are already percentage-valued and must not be multiplied by 100. Preserve native strings and do not annualize by assuming a fixed schedule; show `paymentIntervalMs` only when supplied.
+Funding rates include the exact native `rate`, `rateUnit`, and optional simple-linear percentage equivalents. `decimalFraction` values such as Hyperliquid/Binance/Bybit/Extended must be multiplied by 100 for percentage display; `percent` values such as Lighter are already percentage-valued and must not be multiplied by 100. Preserve native strings and do not annualize by assuming a fixed schedule; show `paymentIntervalMs` only when supplied. Missing intervals or derived-arithmetic overflow can leave equivalents null without invalidating the native rate.
 
 ## 5. Refresh strategy
 
-For Hyperliquid and Binance, REST polling every 30 seconds is sufficient. Lighter should use its native WebSocket path when the UI needs rapid progressive updates across many markets.
+For Hyperliquid, Binance, Bybit, and Extended, REST polling every 30 seconds is sufficient. Ferris WebSocket delivery also exposes stale transitions and qualified payment-boundary transitions without client polling. Extended has no qualified next-payment timestamp. Lighter should use Ferris's WebSocket path when the UI needs progressive updates across many markets; clients still never connect directly upstream.
 
 The backend shares upstream acquisition across clients. Do not make one request per symbol.
 
@@ -286,6 +340,34 @@ Subscribe to Hyperliquid:
   "params": {"dex": ""}
 }
 ```
+
+Subscribe to one Bybit category:
+
+```json
+{
+  "op": "subscribe",
+  "channel": "marketstats",
+  "exchange": "bybit",
+  "fields": ["funding", "markPrice", "indexPrice", "lastPrice"],
+  "params": {"category": "linear"}
+}
+```
+
+Add a separate `inverse` topic when needed. REST and WebSocket use the same category/ID validation; use the canonical topic returned in the acknowledgement for unsubscribe.
+
+Subscribe to Extended:
+
+```json
+{
+  "op": "subscribe",
+  "channel": "marketstats",
+  "exchange": "extended",
+  "fields": ["funding", "markPrice", "indexPrice", "lastPrice"],
+  "params": {}
+}
+```
+
+Add `marketIds` for selected catalog rows. All-market and selected topics share the same upstream acquisition; use the acknowledgement's canonical topic to unsubscribe.
 
 Subscribe to Lighter:
 

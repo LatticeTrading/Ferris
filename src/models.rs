@@ -200,6 +200,10 @@ pub struct UnifiedMarketInfo {
     pub raw_symbol: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exchange_symbol: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_rfq: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_off_hours: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -408,13 +412,15 @@ fn funding_rate_equivalents(
     }
     let native = Decimal::from_str(rate).ok()?;
     let percent = match unit {
-        FundingRateUnit::DecimalFraction => native * Decimal::from(100u64),
+        FundingRateUnit::DecimalFraction => native.checked_mul(Decimal::from(100u64))?,
         FundingRateUnit::Percent => native,
     };
-    let hourly = percent * Decimal::from(3_600_000u64) / Decimal::from(interval_ms);
-    let eight_hour = hourly * Decimal::from(8u64);
-    let daily = hourly * Decimal::from(24u64);
-    let annualized = hourly * Decimal::from(8_760u64);
+    let hourly = percent
+        .checked_mul(Decimal::from(3_600_000u64))?
+        .checked_div(Decimal::from(interval_ms))?;
+    let eight_hour = hourly.checked_mul(Decimal::from(8u64))?;
+    let daily = hourly.checked_mul(Decimal::from(24u64))?;
+    let annualized = hourly.checked_mul(Decimal::from(8_760u64))?;
     Some(FundingRateEquivalents {
         one_hour_percent: hourly.to_string(),
         eight_hour_percent: eight_hour.to_string(),
@@ -677,6 +683,22 @@ mod tests {
                 annualized_percent: "0.2857950000".into(),
             })
         );
+    }
+
+    #[test]
+    fn funding_equivalents_overflow_preserves_native_observation() {
+        let rate = "79228162514264337593543950335";
+        let funding = FundingValue::new(
+            rate.to_string(),
+            FundingRateUnit::DecimalFraction,
+            FundingKind::Estimate,
+            Some(3_600_000),
+            Some(3_600_000),
+            None,
+            None,
+        );
+        assert_eq!(funding.rate, rate);
+        assert_eq!(funding.equivalents, None);
     }
 
     #[test]

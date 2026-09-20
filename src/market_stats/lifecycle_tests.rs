@@ -367,6 +367,7 @@ fn source_rows(receipt: u64) -> Vec<MarketStatsRow> {
                         category: None,
                         raw_symbol: Some(native.into()),
                         exchange_symbol: Some(native.into()),
+                        ..Default::default()
                     },
                     identity: Some(MarketIdentity {
                         market_id: market_id(native),

@@ -475,6 +475,7 @@ fn map_exchange_information_symbol(
             category: None,
             raw_symbol: Some(exchange_symbol.to_string()),
             exchange_symbol: Some(exchange_symbol.to_string()),
+            ..Default::default()
         },
     }))
 }

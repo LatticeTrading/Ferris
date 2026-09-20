@@ -29,11 +29,18 @@ fn is_lighter(exchange: &str) -> bool {
     exchange == "lighterxyz"
 }
 
-fn catalog_source(exchange: &str, product: UnifiedMarketType) -> &'static str {
+fn catalog_source(exchange: &str, product: UnifiedMarketType, params: &Value) -> &'static str {
     if is_binance(exchange) {
         "binance:exchangeInfo"
     } else if is_lighter(exchange) {
         "lighterxyz:orderBookDetails"
+    } else if exchange == "bybit" {
+        match params.get("category").and_then(Value::as_str) {
+            Some("inverse") => "bybit:inverse:instruments-info",
+            _ => "bybit:linear:instruments-info",
+        }
+    } else if exchange == "extended" {
+        "extended:info/markets"
     } else {
         match product {
             UnifiedMarketType::Perp => PRIMARY_SOURCE,
@@ -51,9 +58,19 @@ pub fn normalize_topic(request: FetchMarketStatsRequest) -> Result<MarketStatsTo
         (_, Value::Null) => {}
         ("binance", Value::Object(params)) if params.is_empty() => {}
         ("lighterxyz", Value::Object(params)) if params.is_empty() => {}
+        ("extended", Value::Object(params)) if params.is_empty() => {}
+        ("bybit", Value::Object(params))
+            if params.is_empty()
+                || (params.len() == 1
+                    && matches!(
+                        params.get("category").and_then(Value::as_str),
+                        Some("linear" | "inverse")
+                    )) => {}
         (_, Value::Object(params))
             if !is_binance(&exchange)
                 && !is_lighter(&exchange)
+                && exchange != "bybit"
+                && exchange != "extended"
                 && (params.is_empty()
                     || (params.len() == 1
                         && params.get("dex").and_then(Value::as_str) == Some(""))) => {}
@@ -63,6 +80,10 @@ pub fn normalize_topic(request: FetchMarketStatsRequest) -> Result<MarketStatsTo
                     "Binance market statistics params must be null or {}"
                 } else if is_lighter(&exchange) {
                     "Lighter market statistics params must be null or {}"
+                } else if exchange == "bybit" {
+                    "Bybit market statistics params must be null, {}, or {\"category\":\"linear\"|\"inverse\"}"
+                } else if exchange == "extended" {
+                    "Extended market statistics params must be null or {}"
                 } else {
                     "market statistics params must be null, {}, or {\"dex\":\"\"}"
                 }
@@ -70,6 +91,13 @@ pub fn normalize_topic(request: FetchMarketStatsRequest) -> Result<MarketStatsTo
             ));
         }
     }
+    let params = if exchange == "bybit" {
+        json!({"category": request.params.get("category").and_then(Value::as_str).unwrap_or("linear")})
+    } else if is_binance(&exchange) || is_lighter(&exchange) || exchange == "extended" {
+        json!({})
+    } else {
+        json!({"dex": ""})
+    };
 
     let market_ids = match request.market_ids {
         Some(mut ids) => {
@@ -79,7 +107,7 @@ pub fn normalize_topic(request: FetchMarketStatsRequest) -> Result<MarketStatsTo
                 ));
             }
             for id in &ids {
-                market_id_type(id, &exchange)?;
+                market_id_type(id, &exchange, &params)?;
             }
             ids.sort_unstable();
             ids.dedup();
@@ -96,18 +124,14 @@ pub fn normalize_topic(request: FetchMarketStatsRequest) -> Result<MarketStatsTo
     fields.sort_unstable();
     fields.dedup();
     Ok(MarketStatsTopic {
-        exchange: exchange.clone(),
-        params: if is_binance(&exchange) || is_lighter(&exchange) {
-            json!({})
-        } else {
-            json!({"dex": ""})
-        },
+        exchange,
+        params,
         market_ids,
         fields,
     })
 }
 
-fn market_id_type(id: &str, exchange: &str) -> Result<UnifiedMarketType, ApiError> {
+fn market_id_type(id: &str, exchange: &str, params: &Value) -> Result<UnifiedMarketType, ApiError> {
     let invalid = || ApiError::Validation(format!("invalid marketId: {id}"));
     let (id_exchange, product, category, dex, native_id): (
         String,
@@ -117,13 +141,18 @@ fn market_id_type(id: &str, exchange: &str) -> Result<UnifiedMarketType, ApiErro
         String,
     ) = serde_json::from_str(id).map_err(|_| invalid())?;
     if id_exchange != exchange
-        || category.is_some()
+        || if exchange == "bybit" {
+            !matches!(category.as_deref(), Some("linear" | "inverse"))
+                || category.as_deref() != params.get("category").and_then(Value::as_str)
+        } else {
+            category.is_some()
+        }
         || native_id.is_empty()
         || (is_lighter(exchange)
             && ((native_id.len() > 1 && native_id.starts_with('0'))
                 || !native_id.bytes().all(|byte| byte.is_ascii_digit())
                 || native_id.parse::<u64>().is_err()))
-        || !(if is_binance(exchange) {
+        || !(if is_binance(exchange) || matches!(exchange, "bybit" | "extended") {
             matches!((product, dex.as_deref()), (UnifiedMarketType::Perp, None))
         } else if is_lighter(exchange) {
             matches!(
@@ -139,7 +168,13 @@ fn market_id_type(id: &str, exchange: &str) -> Result<UnifiedMarketType, ApiErro
     {
         return Err(invalid());
     }
-    let canonical = make_market_id(&id_exchange, product, None, dex.as_deref(), &native_id)?;
+    let canonical = make_market_id(
+        &id_exchange,
+        product,
+        category.as_deref(),
+        dex.as_deref(),
+        &native_id,
+    )?;
     if canonical != id {
         return Err(invalid());
     }
@@ -155,18 +190,18 @@ pub fn validate_selection(
     };
     let known: HashSet<&str> = snapshot.rows.iter().filter_map(row_id).collect();
     for id in ids {
-        let product = market_id_type(id, &topic.exchange)?;
+        let product = market_id_type(id, &topic.exchange, &topic.params)?;
         if known.contains(id.as_str()) {
             continue;
         }
         let (complete, source) = match product {
             UnifiedMarketType::Perp => (
                 snapshot.perp_enumeration_complete,
-                catalog_source(&topic.exchange, product),
+                catalog_source(&topic.exchange, product, &topic.params),
             ),
             UnifiedMarketType::Spot => (
                 snapshot.spot_enumeration_complete,
-                catalog_source(&topic.exchange, product),
+                catalog_source(&topic.exchange, product, &topic.params),
             ),
             _ => unreachable!("market_id_type only accepts supported products"),
         };
@@ -283,6 +318,7 @@ pub fn merge_outcome(
     previous: &MarketStatsSourceSnapshot,
     outcome: Result<MarketStatsSourceSnapshot, ExchangeError>,
     exchange: &str,
+    params: &Value,
 ) -> MarketStatsSourceSnapshot {
     let mut next = match outcome {
         Ok(next) => next,
@@ -298,7 +334,7 @@ pub fn merge_outcome(
             next.next_poll_at = Instant::now() + POLL_INTERVAL;
             // The failed source call publishes no secondary catalog proof. Retain known
             // spot rows, but do not declare a missing selection unknown from old metadata.
-            let source = catalog_source(exchange, UnifiedMarketType::Perp);
+            let source = catalog_source(exchange, UnifiedMarketType::Perp, params);
             next.source_failures
                 .retain(|failure| failure.source != source);
             next.source_failures.push(MarketStatsSourceFailure {
@@ -423,7 +459,9 @@ pub fn merge_outcome(
             let reason = next
                 .source_failures
                 .iter()
-                .find(|failure| failure.source == catalog_source(exchange, UnifiedMarketType::Perp))
+                .find(|failure| {
+                    failure.source == catalog_source(exchange, UnifiedMarketType::Perp, params)
+                })
                 .map(|failure| failure.reason.as_str())
                 .unwrap_or("upstream-failure");
             fail_row(&mut row, reason);
@@ -464,7 +502,18 @@ pub fn expire_snapshot(
                     .and_then(|fields| fields.get(name))
                     .copied()
                     .or(snapshot.received_at);
-                if receipt.is_some_and(|at| now.saturating_duration_since(at) >= STALE_AFTER) {
+                let reason = if row.market.exchange == "bybit"
+                    && *name == MarketStatsFieldName::Funding
+                    && funding_payment_passed(field, receipt, now)
+                {
+                    Some("funding-payment-passed")
+                } else if receipt.is_some_and(|at| now.saturating_duration_since(at) >= STALE_AFTER)
+                {
+                    Some("stale-threshold")
+                } else {
+                    None
+                };
+                if let Some(reason) = reason {
                     if expired.is_none() {
                         expired = Some(snapshot.clone());
                     }
@@ -475,7 +524,7 @@ pub fn expire_snapshot(
                         .find(|candidate| row_id(candidate) == id)
                     {
                         if let Some(expired_field) = expired_row.fields.get_mut(name) {
-                            fail_field(expired_field, "stale-threshold");
+                            fail_field(expired_field, reason);
                         }
                     }
                 }
@@ -483,6 +532,29 @@ pub fn expire_snapshot(
         }
     }
     expired
+}
+
+fn funding_payment_passed(
+    field: &MarketStatsField,
+    receipt: Option<Instant>,
+    now: Instant,
+) -> bool {
+    let Some(crate::models::MarketStatsValue::Funding(value)) = &field.value else {
+        return false;
+    };
+    if value.kind != crate::models::FundingKind::Estimate {
+        return false;
+    }
+    let (Some(next_payment), Some(observed_at), Some(receipt)) = (
+        value.next_payment_timestamp,
+        field.exchange_timestamp.or(field.received_timestamp),
+        receipt,
+    ) else {
+        return false;
+    };
+    // Follow the source clock using monotonic elapsed time, not the server's wall clock.
+    now.saturating_duration_since(receipt).as_millis()
+        >= u128::from(next_payment.saturating_sub(observed_at))
 }
 
 fn field_implemented_for_exchange(exchange: &str, name: MarketStatsFieldName) -> bool {
@@ -496,6 +568,7 @@ fn field_implemented_for_exchange(exchange: &str, name: MarketStatsFieldName) ->
                 | MarketStatsFieldName::IndexPrice
         ))
         || implemented(name)
+        || (matches!(exchange, "bybit" | "extended") && name == MarketStatsFieldName::LastPrice)
 }
 
 fn row_id(row: &MarketStatsRow) -> Option<&str> {
@@ -503,10 +576,6 @@ fn row_id(row: &MarketStatsRow) -> Option<&str> {
         .identity
         .as_ref()
         .map(|identity| identity.market_id.as_str())
-}
-
-fn field_implemented_for_row(row: &MarketStatsRow, name: MarketStatsFieldName) -> bool {
-    field_implemented_for_exchange(&row.market.exchange, name)
 }
 
 fn implemented(name: MarketStatsFieldName) -> bool {
@@ -835,6 +904,7 @@ mod tests {
             &cold,
             Err(ExchangeError::UpstreamData("bad metadata".to_string())),
             "hyperliquid",
+            &json!({"dex": ""}),
         );
         assert!(matches!(
             validate_selection(&topic(Some(vec![btc.clone()])), &failed),
@@ -859,6 +929,7 @@ mod tests {
             &complete_perps,
             Err(ExchangeError::UpstreamRequest("offline".into())),
             "hyperliquid",
+            &json!({"dex": ""}),
         );
         validate_selection(
             &topic(Some(vec![id("0", UnifiedMarketType::Spot)])),
@@ -929,6 +1000,7 @@ mod tests {
             &baseline,
             Err(ExchangeError::UpstreamRequest("offline".to_string())),
             "hyperliquid",
+            &json!({"dex": ""}),
         );
         let field = &failed.rows[0].fields[&MarketStatsFieldName::Funding];
         assert_eq!(field.state, MarketStatsFieldState::Stale);
@@ -947,7 +1019,12 @@ mod tests {
             vec![row("BTC", UnifiedMarketType::Perp, true, 20, Some("0"))],
             now + POLL_INTERVAL,
         );
-        let recovered = merge_outcome(&failed, Ok(fresh.clone()), "hyperliquid");
+        let recovered = merge_outcome(
+            &failed,
+            Ok(fresh.clone()),
+            "hyperliquid",
+            &json!({"dex": ""}),
+        );
         assert_eq!(recovered, fresh);
         assert_eq!(
             recovered.rows[0].fields[&MarketStatsFieldName::Funding].received_timestamp,
@@ -966,7 +1043,7 @@ mod tests {
             vec![row("BTC", UnifiedMarketType::Perp, true, 20, None)],
             now + POLL_INTERVAL,
         );
-        let cleared = merge_outcome(&baseline, Ok(invalid), "hyperliquid");
+        let cleared = merge_outcome(&baseline, Ok(invalid), "hyperliquid", &json!({"dex": ""}));
         let mismatched = merge_outcome(
             &cleared,
             Ok(mismatch(source(
@@ -974,11 +1051,13 @@ mod tests {
                 now + POLL_INTERVAL * 2,
             ))),
             "hyperliquid",
+            &json!({"dex": ""}),
         );
         let failed = merge_outcome(
             &mismatched,
             Err(ExchangeError::UpstreamRequest("offline".to_string())),
             "hyperliquid",
+            &json!({"dex": ""}),
         );
         let funding = &failed.rows[0].fields[&MarketStatsFieldName::Funding];
         assert_eq!(funding.state, MarketStatsFieldState::Unavailable);
@@ -994,6 +1073,7 @@ mod tests {
                 now + STALE_AFTER,
             )),
             "hyperliquid",
+            &json!({"dex": ""}),
         );
         assert_eq!(
             recovered.rows[0].fields[&MarketStatsFieldName::Funding].state,
@@ -1024,6 +1104,7 @@ mod tests {
                 now + POLL_INTERVAL,
             ))),
             "hyperliquid",
+            &json!({"dex": ""}),
         );
         let view = project_snapshot(&topic(None), &next);
         assert_eq!(view.coverage.expected_markets, Some(2));
@@ -1073,7 +1154,7 @@ mod tests {
             reason: "upstream-failure".to_string(),
             message: "offline".to_string(),
         });
-        let retained = merge_outcome(&baseline, Ok(partial), "hyperliquid");
+        let retained = merge_outcome(&baseline, Ok(partial), "hyperliquid", &json!({"dex": ""}));
         validate_selection(&selected, &retained).unwrap();
         let view = project_snapshot(&selected, &retained);
         assert_eq!(view.markets, project_snapshot(&selected, &baseline).markets);
@@ -1082,12 +1163,14 @@ mod tests {
             &retained,
             Err(ExchangeError::UpstreamData("broken primary".to_string())),
             "hyperliquid",
+            &json!({"dex": ""}),
         );
         assert_eq!(project_snapshot(&selected, &failed).markets, view.markets);
         let removed = merge_outcome(
             &failed,
             Ok(source(Vec::new(), now + STALE_AFTER)),
             "hyperliquid",
+            &json!({"dex": ""}),
         );
         assert!(project_snapshot(&selected, &removed).markets.is_empty());
         assert!(matches!(
@@ -1124,6 +1207,7 @@ mod tests {
             &baseline,
             Err(ExchangeError::UpstreamData("bad metadata".to_string())),
             "hyperliquid",
+            &json!({"dex": ""}),
         );
         assert!(expire_snapshot(&failed, now + STALE_AFTER * 2).is_none());
         assert_eq!(
@@ -1133,5 +1217,70 @@ mod tests {
             Some("invalid-upstream-data")
         );
         assert_eq!(failed.source_failures[0].reason, "invalid-upstream-data");
+    }
+
+    #[test]
+    fn bybit_estimate_expires_at_payment_without_expiring_prices_or_inventing_settlement() {
+        let now = Instant::now();
+        let mut market = row("BTCUSDT", UnifiedMarketType::Perp, true, 5_000, Some("0"));
+        market.market.exchange = "bybit".to_string();
+        let identity = market.market.identity.as_mut().unwrap();
+        identity.category = Some("linear".to_string());
+        identity.dex = None;
+        identity.market_id = make_market_id(
+            "bybit",
+            UnifiedMarketType::Perp,
+            Some("linear"),
+            None,
+            "BTCUSDT",
+        )
+        .unwrap();
+        let funding = market
+            .fields
+            .get_mut(&MarketStatsFieldName::Funding)
+            .unwrap();
+        funding.exchange_timestamp = Some(10_000);
+        let Some(MarketStatsValue::Funding(value)) = &mut funding.value else {
+            panic!("expected funding")
+        };
+        value.kind = FundingKind::Estimate;
+        value.next_payment_timestamp = Some(11_000);
+        let mut baseline = source(vec![market], now);
+        assert!(expire_snapshot(&baseline, now + Duration::from_millis(999)).is_none());
+        let expired = expire_snapshot(&baseline, now + Duration::from_secs(1)).unwrap();
+        let funding = &expired.rows[0].fields[&MarketStatsFieldName::Funding];
+        assert_eq!(funding.state, MarketStatsFieldState::Stale);
+        assert_eq!(funding.reason.as_deref(), Some("funding-payment-passed"));
+        assert_eq!(
+            funding.value,
+            baseline.rows[0].fields[&MarketStatsFieldName::Funding].value
+        );
+        assert_eq!(funding.received_timestamp, Some(5_000));
+        assert_eq!(
+            expired.rows[0].fields[&MarketStatsFieldName::MarkPrice].state,
+            MarketStatsFieldState::Available
+        );
+        assert!(expire_snapshot(&expired, now + Duration::from_secs(2)).is_none());
+
+        let Some(MarketStatsValue::Funding(value)) = &mut baseline.rows[0]
+            .fields
+            .get_mut(&MarketStatsFieldName::Funding)
+            .unwrap()
+            .value
+        else {
+            unreachable!()
+        };
+        value.next_payment_timestamp = Some(50_000);
+        let recovered = merge_outcome(
+            &expired,
+            Ok(baseline),
+            "bybit",
+            &json!({"category": "linear"}),
+        );
+        assert_eq!(
+            recovered.rows[0].fields[&MarketStatsFieldName::Funding].state,
+            MarketStatsFieldState::Available
+        );
+        assert!(expire_snapshot(&recovered, now + Duration::from_secs(2)).is_none());
     }
 }

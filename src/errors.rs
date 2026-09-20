@@ -61,29 +61,3 @@ fn map_exchange_error(error: ExchangeError) -> (StatusCode, &'static str, String
         ),
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use axum::body::to_bytes;
-    use serde_json::{json, Value};
-
-    use super::*;
-
-    #[tokio::test]
-    async fn market_stats_unsupported_feature_uses_flat_error_contract() {
-        let response = ApiError::UnsupportedFeature(
-            "market statistics are not implemented for exchange 'bybit'".to_string(),
-        )
-        .into_response();
-
-        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(
-            serde_json::from_slice::<Value>(&body).unwrap(),
-            json!({
-                "code": "UNSUPPORTED_FEATURE",
-                "message": "market statistics are not implemented for exchange 'bybit'",
-            }),
-        );
-    }
-}

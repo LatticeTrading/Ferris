@@ -634,6 +634,7 @@ fn map_perp_market(
             category: None,
             raw_symbol: Some(base_raw.to_string()),
             exchange_symbol: Some(base_raw.to_string()),
+            ..Default::default()
         },
     })
 }
@@ -674,6 +675,7 @@ fn map_spot_market(pair: &Value, token_map: &HashMap<u64, String>) -> Option<Uni
             category: None,
             raw_symbol: Some(raw_symbol.clone()),
             exchange_symbol: Some(raw_symbol),
+            ..Default::default()
         },
     })
 }

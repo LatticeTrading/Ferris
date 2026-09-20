@@ -429,6 +429,7 @@ fn map_market(row: &Value, include_inactive: bool) -> Option<UnifiedMarket> {
             category: Some("futures".to_string()),
             raw_symbol: Some(symbol.to_string()),
             exchange_symbol: Some(symbol.to_string()),
+            ..Default::default()
         },
     })
 }

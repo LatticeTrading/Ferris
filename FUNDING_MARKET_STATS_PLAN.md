@@ -1,8 +1,8 @@
-# Funding market statistics: Hyperliquid + Binance + Lighter delivery ledger
+# Funding market statistics: Hyperliquid + Binance + Lighter + Bybit + Extended delivery ledger
 
 ## 1. Active slice and exchange delivery ledger
 
-**Approved execution scope: Hyperliquid primary-DEX active perpetuals plus Binance USDⓈ-M active `contractType: PERPETUAL` markets, using one shared 30-second REST poll.** Deliver exchange-wide and selected-market statistics, truthful capabilities, and snapshot/delta delivery on Ferris's existing WebSocket. Explicitly selected inactive Binance perps remain selectable and report implemented fields as unavailable / `inactive-market`; selected spot funding is not applicable. This is backend work in Ferris; do not modify the sibling Lattice frontend.
+**Approved execution scope: Hyperliquid primary-DEX active perpetuals, Binance USDⓈ-M active `PERPETUAL` markets, Lighter native perpetual statistics, Bybit linear/inverse perpetuals, and Extended exact `PERPETUAL` markets.** Hyperliquid, Binance, Bybit, and Extended use shared 30-second REST polling; Lighter uses native `market_stats` WebSocket acquisition through the same coordinator. Deliver exchange-wide and selected-market statistics, truthful capabilities, and snapshot/delta delivery on Ferris's existing WebSocket. Catalog-known inactive Binance/Bybit/Extended perps remain selectable with implemented fields unavailable / `inactive-market`; supported selected spot funding is not applicable. This is backend work in Ferris; do not modify the sibling Lattice frontend.
 
 This active specification supersedes the older research below. Retained sections 2–9 and 11 are historical evidence and deferred design research, not executable tasks or a statement of current implementation. Their venue recipes, broad model proposals, history endpoints, native-stream options, and illustrative wire examples do not expand this slice. The exact active contract below wins wherever retained research differs. The old Hyperliquid native-stream recommendation is superseded by shared polling; Binance likewise uses the shipped Hyperliquid coordinator and wire contract rather than a native upstream statistics stream.
 
@@ -10,9 +10,9 @@ This active specification supersedes the older research below. Retained sections
 | --- | --- | --- | --- |
 | [x] | `hyperliquid` | Primary-DEX active perps; selected spot funding explicitly not applicable | **COMPLETE: deterministic and live checks passed** |
 | [x] | `binance` | USDⓈ-M active exact `contractType: PERPETUAL`; selected inactive perps allowed | **COMPLETE: deterministic and live checks passed** |
-| [ ] | `bybit` | Not selected for implementation | Deferred |
+| [x] | `bybit` | Linear/inverse exact perpetual contracts; active non-prelisting enumeration, selected known inactive perps | **COMPLETE: deterministic and live REST/WS checks passed** |
 | [ ] | `aster` | Not selected for implementation | Deferred |
-| [ ] | `extended` | Not selected for implementation | Deferred |
+| [x] | `extended` | Exact `PERPETUAL`, order-book/RFQ crypto/RWA; active enumeration and selected known inactive perps | **COMPLETE: deterministic and live REST/WS checks passed** |
 | [x] | `lighterxyz` | Native Lighter perpetual market stats; selected spot funding not applicable | **COMPLETE: focused deterministic and bounded live checks passed** |
 
 Hyperliquid completion gates:
@@ -30,13 +30,89 @@ Binance completion gates:
 - [x] Capabilities advertise only implemented Binance fields and shared-polling freshness.
 - [x] Focused deterministic tests, full Rust tests, formatting, and live Binance REST smoke pass.
 
-**Current ledger status:** Hyperliquid, Binance, and Lighter are complete for their approved slices. Bybit, Aster, and Extended remain deferred and unsupported for market statistics. Lighter uses native `market_stats` acquisition; no native statistics stream is added for any deferred venue, and no frontend implementation is added.
+**Current ledger status:** Hyperliquid, Binance, Lighter, Bybit, and Extended are complete for their approved slices. Aster is the only remaining deferred exchange and remains unsupported for market statistics. No frontend implementation or funding-history endpoint is added.
 
-Bybit, Aster, and Extended remain deferred and unsupported for market statistics. Do not advertise them merely because an endpoint exists. The selected Lighter slice uses the shipped API/coordinator and exact contract below; retained recipes remain historical research.
+Aster must remain unsupported until explicitly selected and verified. The exchange contracts below use the shipped API/coordinator; retained research does not expand their scope.
 
-### Active Lighter contract (selected next slice)
+### Active Extended contract (completed selected slice)
 
-**Decision:** Lighter is the only newly selected exchange. Bybit, Aster, and Extended remain deferred and unsupported for market statistics. The source uses Lighter's native `market_stats` WebSocket acquisition through Ferris's coordinator, with `orderBookDetails` as the authoritative market catalog and statistics identity source. The backend exchange ID is exactly `lighterxyz`.
+- **Identity/catalog:** Share the unfiltered `GET /api/v1/info/markets` response [E1] between catalog and statistics consumers. Only exact `type: PERPETUAL` rows receive statistics identities; spot is excluded. Native `name` is the identity, never a display-symbol normalization. IDs are opaque compact JSON strings such as `["extended","perp",null,null,"BTC-USD"]`; `category` and `dex` are null and `contractType` is `PERPETUAL`. Preserve native `assetName`, `collateralAssetName`, `name`, punctuation, Unicode, and `info.isRfq`/`info.isOffHours`. Existing ordinary display-symbol forms remain unchanged. Active enumeration follows the existing catalog rule `active: true` and `status: ACTIVE`; off-hours alone is not inactivity. Known inactive/prelisted/reduce-only perps may be selected explicitly.
+- **Settlement:** Emit the native collateral denomination as `settle` (currently `USD`) and native `l2Config.collateralId` as `settlementAssetId` (currently `0x1`). Missing/invalid identifiers remain null with `settlement-unresolved`; do not relabel `USD` as a guessed token or infer settlement from a display quote. The official SDK treats this name/ID pair as the collateral asset [E6]; this slice does not add an asset-resolution poll or promise a chain token address.
+- **Selection:** Accept only null/`{}`, canonicalized to `{}`; no category/DEX/coin/symbol shortcuts. Omitted IDs enumerate active perpetuals; explicit selections use 1–100 catalog-issued perpetual IDs. Invalid/foreign/noncanonical/product-incompatible IDs fail before acquisition. A missing ID is 400 only with a complete catalog, otherwise 502. Known inactive markets report implemented fields as `unavailable` / `inactive-market`.
+- **Funding:** Preserve native `marketStats.fundingRate` as an exact decimal-fraction string, `rateUnit: decimalFraction`, `kind: estimate`, with qualified one-hour rate/payment intervals and simple-linear percentage equivalents. Current calculated funding is not last-settled funding. `paymentTimestamp`, `nextPaymentTimestamp`, and `exchangeTimestamp` are null. In particular, `nextFundingRate` is documented as the next funding **update**, not an unequivocal payment timestamp, and must not drive payment-boundary expiry.
+- **Prices/limitations:** Support positive native exact mark/index/last price strings, denominated by native base/collateral metadata independently of settlement identifiers. RFQ last price stays native `lastPrice`, never substituted with mark or indicative BBO. Last-settled funding, volume, open interest, and funding history remain unsupported / `adapter-not-implemented`; no new quantity models, per-market stats/history calls, or native Extended funding WebSocket are added.
+- **Acquisition/freshness:** Reuse the configured Extended client and mandatory `User-Agent`; public market reads were verified without an API key. One shared bulk acquisition and 30-second success/failure cache serves REST/catalog/Ferris WS all-market and selected demand. The existing 30-second polling / 90-second stale policy supersedes the historical 15-second proposal. Cache deadlines and fields use actual HTTP/JSON receipt time, not consumer reads. No locks guarding cache readers are held across network awaits. Empty/malformed/duplicate catalogs retain earlier normalized membership as incomplete, never authoritative deletion. A valid catalog with missing/nonobject `marketStats` retains earlier values stale for only that row; a present object with missing/invalid scalars explicitly clears only those fields. Later failures cannot resurrect cleared values. Complete valid catalogs alone remove identities. Base URL remains `EXTENDED_REST_BASE_URL`, defaulting to `https://api.starknet.extended.exchange/api/v1`.
+- **Capabilities/wire:** Advertise only delivered perpetual funding/mark/index/last fields, `sharedPolling`, `pollIntervalMs: 30000`, `staleAfterMs: 90000`, estimate semantics, and one-hour intervals. Keep the existing ordered acknowledgement/snapshot, contiguous generation/revision deltas, coalescing, unsubscribe, and demand-lease behavior unchanged.
+
+#### Extended qualification evidence
+
+[E1] defines current funding calculated every minute and history as one-hour applied rates; [E2] documents hourly payments across order-book/RFQ crypto/RWA execution classes. The official production application parses `marketStats.fundingRate` directly as a decimal [E7], passes it unchanged to a conversion whose default source interval is `1H` [E8], and formats it as a decimal-fraction percentage [E9]. Its common market table uses that same path for every perpetual class [E10], rather than dividing RFQ rates or multiplying percentages differently. These establish the unit/interval independently of observed magnitudes.
+
+A bounded unauthenticated capture returned 400 catalog rows spanning order-book/RFQ crypto/RWA, inactive/prelisted markets, and three spot rows. Four public history probes for BTC-USD, XAU-USD, AIA-USD, and SHOP-USD returned one-hour applied decimal rates with 13-digit millisecond `T` timestamps. Current/history rates respectively matched `0.000013`, `0.000004`, `0.000013`, and `0.000014` in that capture; those values and counts are observations, not fixtures or unit evidence. Native `nextFundingRate` was a 13-digit timestamp, but its documented update meaning is deliberately not promoted into a payment schedule. Native collateral metadata returned `USD`/`0x1`; the API's narrative USDC description is not a reason to overwrite those native identifiers.
+
+A second bounded capture across the 06:00 UTC boundary returned applied record `T: 1789884000772` for all four classes with the same pre-boundary decimal estimates; native next-update timestamps advanced from `1789884000000` to `1789887600000`. This corroborates the documented hourly basis without changing the decision to leave payment timestamps null. The complete payload contained 326 active and 71 other perpetuals plus three spot rows. Seven active RFQ markets had native `lastPrice: "0"`; those must expose an invalid last-price field, not substitute their valid mark price.
+
+#### Extended acceptance gates
+
+- [x] Catalog/statistics native identity, RFQ/off-hours metadata, settlement identifiers, product filtering, inactive selection, and strict scope agree.
+- [x] Exact hourly funding and price values, null payment/exchange timestamps, invalid scalar clears, missing-stat retention, and unsupported fields follow the shared contract.
+- [x] Concurrent catalog/REST/WS consumers share acquisition; failures, incomplete catalogs, stale expiry during in-flight work, recovery, and authoritative removals preserve receipts and membership correctly.
+- [x] Actual-server REST and ordered WS snapshot/delta/unsubscribe smoke pass, alongside legacy Extended snapshot endpoints and full Rust validation.
+
+#### Extended delivery and verification record
+
+`cargo fmt --all`, `cargo test --all-targets` (195 passed, 5 ignored), and `cargo build --bin ferris-market-data-backend` passed. `cargo clippy --all-targets` completed with warnings elsewhere in the tree; no Extended-specific warning was emitted. Six deterministic Extended integration scenarios cover native identity/display collisions, scope and scalar boundaries, receipt-based failure caching, concurrent catalog/REST/WS acquisition, row-local retention and clears, recovery/removals, and 90-second expiry during pending HTTP work. The paused-time recovery scenario advances through the existing one-second WS coalescing interval before expecting the next delta.
+
+The temporary actual server used `HOST=127.0.0.1`, `PORT=8788`, `TRADE_COLLECTOR_ENABLED=false`, and `REQUEST_TIMEOUT_MS=15000`, separate from staging. The bounded live client exercised capabilities, active/all catalog agreement, native collateral and execution metadata, selected/inactive/invalid requests, exact funding/price semantics, ordered WS acknowledgement/snapshot, contiguous delta revisions, next-poll receipts, REST convergence, and unsubscribe. It produced:
+
+```text
+PASS Extended REST: 326 active / 397 catalog perps; RFQ=279, offHours=68; BTC rate=0.000013, intervalMs=3600000, settle=USD, collateralId=0x1
+PASS Extended WS: ordered ack/snapshot, contiguous deltas (all=2, selected=2), next-poll receipts, all/selected REST convergence, unsubscribe
+PASS Extended capabilities, native identity/metadata, hourly funding units, null payment timestamps, exact prices, inactive and invalid selection
+```
+
+`python3 scripts/smoke_endpoints.py --base-url http://127.0.0.1:8788 --exchange extended --markets-exchange extended --symbol BTC/USD:USD --timeout 25 --wait-seconds 0` also passed health, trades (5 rows), OHLCV (3 rows), order book, and the active catalog (326 rows). Counts/rates are observations, not constants or unit-basis evidence. The temporary server exited cleanly and its throwaway client was removed; staging was not restarted. No frontend files were changed.
+
+[E6]: https://raw.githubusercontent.com/x10xchange/python_sdk/starknet/x10/models/market.py
+[E7]: https://app.extended.exchange/assets/x10-BnOpKqva.js
+[E8]: https://app.extended.exchange/assets/calc-funding-rate-for-interval-CG0IlIhY.js
+[E9]: https://app.extended.exchange/assets/use-format-percent-8HZX4Kf6.js
+[E10]: https://app.extended.exchange/assets/markets-table-CawXihaE.js
+
+### Active Bybit contract (completed selected slice)
+
+- **Identity/catalog:** Use V5 `instruments-info` [Y3] with complete cursor pagination independently for `linear` and `inverse`. Only exact `LinearPerpetual`/`InversePerpetual` contracts receive statistics identities. Active enumeration requires `status: Trading` and `isPreListing: false`; known inactive/prelisting perpetuals may be explicitly selected but their implemented fields are `unavailable` / `inactive-market`. Expiry futures, spot, and options are excluded from statistics. Preserve native symbols, punctuation, Unicode, and catalog `baseCoin`/`quoteCoin`; display symbols are not identities. IDs are opaque compact JSON strings such as `["bybit","perp","linear",null,"BTCUSDT"]` and `["bybit","perp","inverse",null,"BTCUSD"]`. Settlement and `settlementAssetId` come only from `settleCoin`; unresolved settlement stays null with a source failure.
+- **Selection:** Statistics accept only null/`{}` (canonicalized to `{"category":"linear"}`), `{"category":"linear"}`, or `{"category":"inverse"}`. One category per request/subscription; IDs must match it. No symbol/coin shortcuts. Omitted IDs select all supported active perps; explicit selections use 1–100 catalog-issued IDs. Bad scope/IDs are rejected before acquisition. A catalog-confirmed unknown ID is 400; an unresolved ID during catalog failure is 502, not an invented unknown market. `fetchMarkets` retains its broader legacy default of combining linear, inverse, and spot; specify a category to match statistics.
+- **Funding:** V5 bulk ticker `fundingRate` [Y1] is an exact decimal-fraction string, `kind: estimate`, `rateUnit: decimalFraction`, and `reason: null` when available. Bybit describes it as changing until the upcoming funding time [Y4]. A present valid ticker `fundingIntervalHour` takes precedence over instrument `fundingInterval` minutes. Convert positive integers with checked arithmetic; an absent ticker interval may use instrument minutes, but an explicitly invalid ticker interval yields null intervals/equivalents without losing the rate. A valid conflict uses the ticker interval and reports `funding-interval-mismatch`. Do not assume eight hours or publish a venue-wide interval. `nextPaymentTimestamp` uses only positive native `nextFundingTime`; `paymentTimestamp` is null.
+- **Funding boundaries:** Crossing the advertised payment time makes the retained estimate `stale` / `funding-payment-passed` using the source clock plus monotonic elapsed time. Preserve the estimate and receipts; do not invent settlement or expire sibling prices at that boundary. A fresh upcoming estimate restores availability. Derived one-hour/eight-hour/day/annualized percentages are simple-linear display equivalents. Checked decimal overflow leaves equivalents null while preserving the exact valid native rate.
+- **Prices/limitations:** Mark, index, and last prices preserve positive native decimal strings and catalog-qualified base/quote denominations, independent of settlement. Present invalid scalars clear only their own field. Bybit last-settled funding and history remain unsupported; volume and open interest remain unsupported / `units-unverified`. No per-market history/OI calls or native Bybit statistics WebSocket are added.
+- **Acquisition/freshness:** One category-scoped coordinator source serves REST and Ferris WS all-market/selected projections. Bulk `tickers` and paginated `instruments-info` have independent shared acquisition gates and 30-second success/failure caches; catalog reads share the instrument cache. Each body keeps its own receipt and deadline. Stale threshold is 90 seconds, independent of in-flight acquisition. Malformed/incomplete catalogs retain membership as incomplete; malformed ticker batches or missing ticker rows retain earlier values stale with original receipts. Explicit scalar clears cannot be resurrected by a later failure. Backend REST base is `https://api.bybit.com`, overridable with `BYBIT_BASE_URL`.
+- **Capabilities/wire:** `bybit` advertises perpetual all-market/selected support, funding/mark/index/last fields, `sharedPolling`, `pollIntervalMs: 30000`, `staleAfterMs: 90000`, estimate semantics, and null venue-wide intervals. The existing ordered snapshot/delta, generation/revision, unsubscribe, demand-lease, and coalescing contracts are unchanged.
+
+#### Bybit acceptance and verification record
+
+- [x] Category-qualified native IDs, settlement, display collisions/Unicode, pagination, product filtering, and inactive selection.
+- [x] Exact funding/price scalars, dynamic interval precedence and overflow, native timestamps, payment-boundary expiry, and unsupported fields.
+- [x] Concurrent REST/catalog/WS sharing, category isolation, ordered acknowledgements and deltas, reducer convergence, unsubscribe, and authoritative removals.
+- [x] Corrupt/partial catalog and ticker retention, cold versus unknown selection, recovery, explicit clears, and independent body receipts.
+- [x] Full Rust suite and actual-server live REST/WS smoke; legacy Bybit snapshot endpoints also pass.
+
+`cargo check --all-targets`, `cargo test` (189 passed, 5 ignored), `cargo build --bin ferris-market-data-backend`, and `cargo fmt` passed. Eight deterministic Bybit integration scenarios use localhost programmable upstreams, counters, barriers, and paused time. The shared funding overflow reproduction failed before the checked-arithmetic fix and passed afterward. Existing unrelated unused order-book/helper warnings remain.
+
+The temporary actual server used `HOST=127.0.0.1`, `PORT=8788`, and `TRADE_COLLECTOR_ENABLED=false`, separate from staging. The bounded live client checked capabilities, complete category catalogs, selected/all shared observations, funding units/intervals, price denominations, invalid scope, ordered WS acknowledgement/snapshot, contiguous delta revisions, next-poll receipts, REST convergence, and unsubscribe. It produced:
+
+```text
+PASS Bybit linear: 839 active perpetuals; BTC rate=0.00000694, intervalMs=28800000, mark=81343.03, settle=USDT
+PASS Bybit inverse: 22 active perpetuals; BTC rate=0.00005154, intervalMs=28800000, mark=81321.07, settle=BTC
+PASS Bybit WS: ordered ack/snapshot, contiguous delta revision 2, next-poll receipt, REST convergence, unsubscribe
+PASS Bybit capabilities, category isolation, REST snapshots, funding semantics, and live WS delivery
+```
+
+The existing `scripts/smoke_endpoints.py --base-url http://127.0.0.1:8788 --exchange bybit --symbol BTC/USDT --markets-exchange bybit --timeout 20` also passed health, trades (5 rows), OHLCV (3 rows), order book, and the combined catalog (1,443 rows). Counts/rates are live observations, not constants or unit-basis evidence. The smoke server was stopped and its throwaway client removed; staging was not restarted. No frontend files were changed.
+
+### Active Lighter contract (completed slice)
+
+**Delivered decision:** Lighter uses native `market_stats` WebSocket acquisition through Ferris's coordinator, with `orderBookDetails` as the authoritative market catalog and statistics identity source. The backend exchange ID is exactly `lighterxyz`. Its contract is unchanged by the later Bybit integration.
 
 - **Identity and selection:** Catalog-issued `marketId` values are opaque compact JSON tuple strings, for example `["lighterxyz","perp",null,null,"1"]`; `exchangeMarketId` is the numeric native ID carried as a string. Never derive identity from display symbols. `orderBookDetails` supplies the metadata and native ID. Omitted `marketIds` enumerates supported active perpetual markets; explicit IDs select catalog-known markets. Unknown, malformed, foreign, or unsupported-product IDs are validation errors. Spot funding is `notApplicable`.
 - **Funding semantics:** `market_stats` `current_funding_rate` is an exact native percentage string emitted as an `estimate` with `rateUnit: percent`, qualified one-hour `rateIntervalMs`/`paymentIntervalMs`, and `reason: null` when available. `funding_rate` is a distinct `settled` observation and must not overwrite the estimate; it may carry `paymentTimestamp`. Neither field emits `nextPaymentTimestamp`. Derived `equivalents` are simple-linear percentage display values, not additional observations.
@@ -115,7 +191,9 @@ Implementation tooling note: a provider rejected a subagent continuation with HT
 - [Contract specifications](https://hyperliquid.gitbook.io/hyperliquid-docs/trading/contract-specifications.md) distinguish USDC settlement from generally USDT-denominated prices, with exact HYPE/PURR USDC-price exceptions. [Price-index documentation](https://hyperliquid.gitbook.io/hyperliquid-docs/trading/robust-price-indices.md) distinguishes mark/oracle. Volume and OI units remain unqualified here.
 - [Rate limits][H4]: these `/info` requests cost 20 weight against 1,200/minute/IP. A primary poll every 30 seconds costs 40 weight/minute independent of viewers; cache spot metadata for five minutes. No new HTTP client, SDK, or upstream statistics WS is needed.
 
-### Active implementation sequence
+### Original Hyperliquid implementation sequence (completed reference)
+
+The steps below record the original shared-contract implementation. They are not a new work queue and do not override the delivered exchange-specific contracts above.
 
 Execute active steps 1–5 in order as one integrated Hyperliquid delivery. Steps 2 and 3 depend on step 1; exposure depends on both. Add boundary checks alongside changes, then run integrated validation once the tree builds. Before exported-model/trait changes, use LSP references if available; none was configured at planning time. Otherwise use scoped constructor/reference searches. `ApiError` response mapping is in `src/errors.rs`; WS parser/ack callers are in `src/web.rs` and its local tests. The optional source accessor leaves all six existing adapters' required methods unchanged.
 
@@ -226,10 +304,10 @@ Add `market_stats: MarketStatsCoordinator` to `AppState`, constructed with excha
 
 Add `fetch_market_stats(State(state): State<AppState>, payload: Result<Json<FetchMarketStatsRequest>, JsonRejection>) -> Result<Json<MarketStatsSnapshot>, ApiError>` and `capabilities(State(state): State<AppState>) -> Json<CapabilitiesResponse>`. Register `POST /v1/fetchMarketStats` and `GET /v1/capabilities` with existing Axum style. Map JSON rejection to ApiError::Validation; HTTP and WS use the same validation/projection. Add sorted `ExchangeRegistry::ids(&self) -> Vec<&str>`; capabilities reflect actual registration, not a second venue list, and make no upstream requests.
 
-CapabilitiesResponse is `{"exchanges":[...]}` sorted by exchange ID; each entry has `{exchange,marketStats,fundingRateHistory}`. Every adapter with no source accessor reports this unsupported shape (example Bybit):
+CapabilitiesResponse is `{"exchanges":[...]}` sorted by exchange ID; each entry has `{exchange,marketStats,fundingRateHistory}`. Every adapter with no source accessor reports this unsupported shape (example Extended):
 
 ```json
-{"exchange":"bybit","marketStats":{"state":"unsupported","reason":"adapter-not-implemented"},"fundingRateHistory":{"state":"unsupported","reason":"adapter-not-implemented"}}
+{"exchange":"extended","marketStats":{"state":"unsupported","reason":"adapter-not-implemented"},"fundingRateHistory":{"state":"unsupported","reason":"adapter-not-implemented"}}
 ```
 
 Only when delivered, Hyperliquid marketStats uses this exact supported detail; fundingRateHistory stays the same unsupported record. Runtime failures do not rewrite structural capabilities:
@@ -862,20 +940,20 @@ The easy delivery is a bounded detail/chart query. Persistent backfills, exchang
 
 ### Active delivery order and later-session procedure
 
-1. Execute only section 1's Hyperliquid steps 1–5: identity/transport contract; shared primary acquisition/normalization; coordinator/lifecycle; REST/capabilities; safe Ferris WS projections. Shared models are not permission to implement another adapter.
-2. Run the active deterministic and live acceptance checks, recording actual commands/results and delivered behavior in this ledger. Leave failed/unrun gates unchecked. Do not claim native streaming, verified hourly rate basis, volume/OI support, history, HIP-3, frontend completion, or any deferred exchange.
-3. Mark Hyperliquid complete only after all five ledger gates pass, then stop. Do not automatically begin a second venue.
+1. Start from section 1's delivery ledger. Hyperliquid, Binance, Lighter, and Bybit are complete; do not rerun the original shared foundation. Shared models are not permission to implement another adapter.
+2. Run the selected slice's deterministic and live acceptance checks, recording actual commands/results and delivered behavior in this ledger. Leave failed/unrun gates unchecked; do not claim unverified fields, native streaming, history, HIP-3, frontend completion, or any deferred exchange.
+3. Mark the selected venue complete only after its acceptance gates pass, then stop. Do not automatically begin another venue.
 4. A later session explicitly selects exactly one unchecked exchange, reads that venue's evidence/current implementation, and appends its own decision-complete active slice using the shipped shared API/coordinator. Keep every other unchecked venue deferred; extend source driving only if that selected source actually requires it.
 5. Implement and verify that one venue end-to-end before checking it off. Do not rerun the initial shared foundation, enable all six together, or introduce frontend/history as implicit follow-on steps.
 
 ### Deferred evidence before enabling additional normalized fields
 
-This table and the touchpoints/scenarios following it are retained research, not another execution order. The approved Hyperliquid unknown-basis behavior does not wait for a verified rate interval; its concrete acceptance is section 1.
+This table and the touchpoints/scenarios following it are retained research, not another execution order. Delivered funding units, intervals, and scope are specified in section 1; qualify only the still-deferred extensions.
 
 | Gate | Required evidence | Safe outcome until resolved |
 | --- | --- | --- |
 | Binance current rate/schedule | Confirm `lastFundingRate`/WS `r` forecast/final meaning, current stream routing, and interval coverage for symbols absent from `fundingInfo`. Include separate-message market families in coverage checks. | Do not invent settled meaning or a universal eight-hour period; report the exact limitation. |
-| Bybit interval/unit/category | Confirm current ticker interval behavior, contract filtering, inverse volume/OI assets, and both-side/single-side OI mapping. | Expose only qualified quantity fields; never fill futures' funding blanks with zero. |
+| Bybit quantity extensions | Linear/inverse perpetual funding intervals, units, and contract filtering are delivered. Before adding quantities, qualify inverse volume/OI assets and both-side/single-side OI mapping. | Keep volume/OI unsupported until qualified; never fill futures' funding blanks with zero. |
 | Hyperliquid future scope extensions | Qualify collateral/quantity units and positional coverage before any DEX/native-stream extension. The primary API hourly decimal-fraction rate basis is already verified. | Keep primary-only shared polling, `currentUnclassified`, hourly rate/payment intervals, and null next-payment/exchange timestamps. Do not reopen the resolved basis warning or add native streaming. |
 | Aster rate semantics | Establish current versus finalized funding meaning and complete funding-info coverage. Verify V3 production bulk shapes. | Keep unclassified meaning explicit; no guessed OI integration. |
 | Extended rate/time/stream | Verify current hourly rate mapping across execution classes, `nextFundingRate` meaning/unit, history `T` units, and current header/access requirements. Qualify SDK stream behavior separately. | Use documented bulk REST; do not label next recalculation as next payment or claim native WS coverage. |

@@ -661,6 +661,7 @@ impl LighterMarket {
                 category: None,
                 raw_symbol: Some(self.raw_symbol),
                 exchange_symbol: Some(self.market_id.to_string()),
+                ..Default::default()
             },
         }
     }
