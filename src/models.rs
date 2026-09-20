@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -25,6 +27,22 @@ impl FetchMarketsRequest {
             include_inactive: self.include_inactive,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FetchMarketStatsRequest {
+    #[serde(default = "default_exchange")]
+    pub exchange: String,
+    pub market_ids: Option<Vec<String>>,
+    pub fields: Option<Vec<MarketStatsFieldName>>,
+    #[serde(default)]
+    pub params: Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct FetchMarketStatsParams {
+    pub params: Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -164,7 +182,7 @@ pub struct HealthResponse {
     pub status: &'static str,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum UnifiedMarketType {
     Spot,
@@ -173,7 +191,7 @@ pub enum UnifiedMarketType {
     Option,
 }
 
-#[derive(Debug, Clone, Serialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct UnifiedMarketInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -182,9 +200,13 @@ pub struct UnifiedMarketInfo {
     pub raw_symbol: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exchange_symbol: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_rfq: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_off_hours: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UnifiedMarket {
     pub exchange: String,
@@ -201,6 +223,8 @@ pub struct UnifiedMarket {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub contract_size: Option<f64>,
     pub info: UnifiedMarketInfo,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<MarketIdentity>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -211,6 +235,496 @@ pub struct FetchMarketsResponse {
     pub timestamp: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketIdentity {
+    pub market_id: String,
+    pub exchange_market_id: String,
+    pub category: Option<String>,
+    pub dex: Option<String>,
+    pub contract_type: Option<String>,
+    pub settle: Option<String>,
+    pub settlement_asset_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MarketStatsFieldName {
+    Funding,
+    IndexPrice,
+    LastPrice,
+    LastSettledFunding,
+    MarkPrice,
+    OpenInterest,
+    Volume24h,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketStatsScope {
+    pub exchange: String,
+    pub params: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketStatsTopic {
+    pub exchange: String,
+    pub params: Value,
+    pub market_ids: Option<Vec<String>>,
+    pub fields: Vec<MarketStatsFieldName>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketStatsSnapshot {
+    pub timestamp: u64,
+    pub scope: MarketStatsScope,
+    pub markets: Vec<MarketStatsRow>,
+    pub coverage: MarketStatsCoverage,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketStatsRow {
+    #[serde(flatten)]
+    pub market: UnifiedMarket,
+    pub fields: BTreeMap<MarketStatsFieldName, MarketStatsField>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketStatsCoverage {
+    pub expected_markets: Option<usize>,
+    pub returned_markets: usize,
+    pub enumeration_complete: bool,
+    pub source_failures: Vec<MarketStatsSourceFailure>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketStatsSourceFailure {
+    pub source: String,
+    pub reason: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MarketStatsFieldState {
+    Available,
+    NotApplicable,
+    Unsupported,
+    Unavailable,
+    Stale,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketStatsField {
+    pub state: MarketStatsFieldState,
+    pub value: Option<MarketStatsValue>,
+    pub reason: Option<String>,
+    pub exchange_timestamp: Option<u64>,
+    pub received_timestamp: Option<u64>,
+    pub source: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MarketStatsValue {
+    Funding(FundingValue),
+    Price(PriceValue),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FundingRateUnit {
+    DecimalFraction,
+    Percent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FundingRateEquivalents {
+    pub one_hour_percent: String,
+    pub eight_hour_percent: String,
+    pub one_day_percent: String,
+    pub annualized_percent: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FundingKind {
+    Estimate,
+    Settled,
+    CurrentUnclassified,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FundingValue {
+    pub rate: String,
+    pub rate_unit: FundingRateUnit,
+    pub kind: FundingKind,
+    pub rate_interval_ms: Option<u64>,
+    pub payment_interval_ms: Option<u64>,
+    pub payment_timestamp: Option<u64>,
+    pub next_payment_timestamp: Option<u64>,
+    pub equivalents: Option<FundingRateEquivalents>,
+}
+
+impl FundingValue {
+    pub fn new(
+        rate: String,
+        rate_unit: FundingRateUnit,
+        kind: FundingKind,
+        rate_interval_ms: Option<u64>,
+        payment_interval_ms: Option<u64>,
+        payment_timestamp: Option<u64>,
+        next_payment_timestamp: Option<u64>,
+    ) -> Self {
+        let equivalents = rate_interval_ms
+            .and_then(|interval_ms| funding_rate_equivalents(&rate, rate_unit, interval_ms));
+        Self {
+            rate,
+            rate_unit,
+            kind,
+            rate_interval_ms,
+            payment_interval_ms,
+            payment_timestamp,
+            next_payment_timestamp,
+            equivalents,
+        }
+    }
+}
+
+fn funding_rate_equivalents(
+    rate: &str,
+    unit: FundingRateUnit,
+    interval_ms: u64,
+) -> Option<FundingRateEquivalents> {
+    use rust_decimal::Decimal;
+    use std::str::FromStr;
+
+    if interval_ms == 0 {
+        return None;
+    }
+    let native = Decimal::from_str(rate).ok()?;
+    let percent = match unit {
+        FundingRateUnit::DecimalFraction => native.checked_mul(Decimal::from(100u64))?,
+        FundingRateUnit::Percent => native,
+    };
+    let hourly = percent
+        .checked_mul(Decimal::from(3_600_000u64))?
+        .checked_div(Decimal::from(interval_ms))?;
+    let eight_hour = hourly.checked_mul(Decimal::from(8u64))?;
+    let daily = hourly.checked_mul(Decimal::from(24u64))?;
+    let annualized = hourly.checked_mul(Decimal::from(8_760u64))?;
+    Some(FundingRateEquivalents {
+        one_hour_percent: hourly.to_string(),
+        eight_hour_percent: eight_hour.to_string(),
+        one_day_percent: daily.to_string(),
+        annualized_percent: annualized.to_string(),
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PriceValue {
+    pub amount: String,
+    pub base_asset: String,
+    pub quote_asset: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CapabilitiesResponse {
+    pub exchanges: Vec<ExchangeCapabilities>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExchangeCapabilities {
+    pub exchange: String,
+    pub market_stats: MarketStatsCapabilities,
+    pub funding_rate_history: FeatureCapability,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CapabilityState {
+    Supported,
+    Unsupported,
+    NotApplicable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FeatureCapability {
+    pub state: CapabilityState,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+pub enum MarketStatsCapabilities {
+    Supported(MarketStatsSupportedCapabilities),
+    Unsupported { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketStatsSupportedCapabilities {
+    pub scope: MarketStatsScope,
+    pub all_markets: MarketStatsAllMarketsCapability,
+    pub selected_markets: MarketStatsSelectedMarketsCapability,
+    pub fields: BTreeMap<UnifiedMarketType, BTreeMap<MarketStatsFieldName, FeatureCapability>>,
+    pub upstream_mode: String,
+    pub poll_interval_ms: u64,
+    pub stale_after_ms: u64,
+    pub ws: MarketStatsWsCapability,
+    pub funding_kinds: Vec<FundingKind>,
+    pub rate_interval_ms: Option<u64>,
+    pub payment_interval_ms: Option<u64>,
+    pub limitations: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketStatsAllMarketsCapability {
+    pub types: Vec<UnifiedMarketType>,
+    pub active_only: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketStatsSelectedMarketsCapability {
+    pub types: Vec<UnifiedMarketType>,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketStatsWsCapability {
+    pub snapshot: bool,
+    pub delta: bool,
+    pub max_subscriptions_per_connection: usize,
+}
+
 fn default_exchange() -> String {
     "hyperliquid".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn market_stats_identity_is_flattened_with_explicit_nulls() {
+        let mut market = UnifiedMarket {
+            exchange: "hyperliquid".to_string(),
+            symbol: "BTC/USDC".to_string(),
+            base: "BTC".to_string(),
+            quote: "USDC".to_string(),
+            market_type: UnifiedMarketType::Perp,
+            active: true,
+            min_order_size: None,
+            tick_size: None,
+            contract_size: None,
+            info: UnifiedMarketInfo::default(),
+            identity: Some(MarketIdentity {
+                market_id: r#"["hyperliquid","perp",null,"","BTC"]"#.to_string(),
+                exchange_market_id: "BTC".to_string(),
+                category: None,
+                dex: Some(String::new()),
+                contract_type: None,
+                settle: None,
+                settlement_asset_id: None,
+            }),
+        };
+        let encoded = serde_json::to_value(&market).unwrap();
+        assert_eq!(
+            encoded,
+            json!({
+                "exchange": "hyperliquid", "symbol": "BTC/USDC", "base": "BTC",
+                "quote": "USDC", "type": "perp", "active": true, "info": {},
+                "marketId": "[\"hyperliquid\",\"perp\",null,\"\",\"BTC\"]",
+                "exchangeMarketId": "BTC", "category": null, "dex": "",
+                "contractType": null, "settle": null, "settlementAssetId": null,
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<UnifiedMarket>(encoded).unwrap(),
+            market
+        );
+
+        market.identity = None;
+        let encoded = serde_json::to_value(&market).unwrap();
+        assert_eq!(
+            encoded,
+            json!({
+                "exchange": "hyperliquid", "symbol": "BTC/USDC", "base": "BTC",
+                "quote": "USDC", "type": "perp", "active": true, "info": {},
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<UnifiedMarket>(encoded).unwrap(),
+            market
+        );
+    }
+
+    #[test]
+    fn market_stats_field_values_are_untagged_and_preserve_nullability() {
+        let mut field = MarketStatsField {
+            state: MarketStatsFieldState::Available,
+            value: Some(MarketStatsValue::Funding(FundingValue::new(
+                "-0.000012500".to_string(),
+                FundingRateUnit::DecimalFraction,
+                FundingKind::CurrentUnclassified,
+                None,
+                Some(3_600_000),
+                None,
+                None,
+            ))),
+            reason: None,
+            exchange_timestamp: None,
+            received_timestamp: Some(1_000),
+            source: Some("hyperliquid:primary:metaAndAssetCtxs".to_string()),
+        };
+        let encoded = serde_json::to_value(&field).unwrap();
+        assert_eq!(
+            encoded,
+            json!({
+                "state": "available",
+                "value": {
+                    "rate": "-0.000012500", "rateUnit": "decimalFraction", "kind": "currentUnclassified",
+                    "rateIntervalMs": null, "paymentIntervalMs": 3600000,
+                    "paymentTimestamp": null, "nextPaymentTimestamp": null, "equivalents": null,
+                },
+                "reason": null, "exchangeTimestamp": null,
+                "receivedTimestamp": 1000, "source": "hyperliquid:primary:metaAndAssetCtxs",
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<MarketStatsField>(encoded).unwrap(),
+            field
+        );
+
+        field.state = MarketStatsFieldState::Unavailable;
+        field.value = None;
+        field.reason = None;
+        field.received_timestamp = None;
+        field.source = None;
+        assert_eq!(
+            serde_json::to_value(&field).unwrap(),
+            json!({
+                "state": "unavailable", "value": null, "reason": null,
+                "exchangeTimestamp": null, "receivedTimestamp": null, "source": null,
+            })
+        );
+
+        let price = MarketStatsValue::Price(PriceValue {
+            amount: "65000.00".to_string(),
+            base_asset: "BTC".to_string(),
+            quote_asset: "USDT".to_string(),
+        });
+        let encoded = serde_json::to_value(&price).unwrap();
+        assert_eq!(
+            encoded,
+            json!({
+                "amount": "65000.00", "baseAsset": "BTC", "quoteAsset": "USDT",
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<MarketStatsValue>(encoded).unwrap(),
+            price
+        );
+    }
+
+    #[test]
+    fn funding_equivalents_use_native_unit_and_exact_linear_scaling() {
+        let lighter = FundingValue::new(
+            "-0.0003".to_string(),
+            FundingRateUnit::Percent,
+            FundingKind::Estimate,
+            Some(3_600_000),
+            Some(3_600_000),
+            None,
+            None,
+        );
+        assert_eq!(
+            lighter.equivalents,
+            Some(FundingRateEquivalents {
+                one_hour_percent: "-0.0003".into(),
+                eight_hour_percent: "-0.0024".into(),
+                one_day_percent: "-0.0072".into(),
+                annualized_percent: "-2.6280".into(),
+            })
+        );
+
+        let binance = FundingValue::new(
+            "0.00000261".to_string(),
+            FundingRateUnit::DecimalFraction,
+            FundingKind::CurrentUnclassified,
+            Some(28_800_000),
+            Some(28_800_000),
+            None,
+            None,
+        );
+        assert_eq!(
+            binance.equivalents,
+            Some(FundingRateEquivalents {
+                one_hour_percent: "0.0000326250".into(),
+                eight_hour_percent: "0.0002610000".into(),
+                one_day_percent: "0.0007830000".into(),
+                annualized_percent: "0.2857950000".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn funding_equivalents_overflow_preserves_native_observation() {
+        let rate = "79228162514264337593543950335";
+        let funding = FundingValue::new(
+            rate.to_string(),
+            FundingRateUnit::DecimalFraction,
+            FundingKind::Estimate,
+            Some(3_600_000),
+            Some(3_600_000),
+            None,
+            None,
+        );
+        assert_eq!(funding.rate, rate);
+        assert_eq!(funding.equivalents, None);
+    }
+
+    #[test]
+    fn market_stats_request_rejects_mistaken_symbol_and_unknown_fields() {
+        let omitted: FetchMarketStatsRequest = serde_json::from_value(json!({})).unwrap();
+        let nullable: FetchMarketStatsRequest = serde_json::from_value(json!({
+            "marketIds": null, "fields": null, "params": null,
+        }))
+        .unwrap();
+        assert_eq!(omitted, nullable);
+        assert_eq!(nullable.exchange, "hyperliquid");
+        assert_eq!(nullable.market_ids, None);
+        assert_eq!(nullable.fields, None);
+
+        for invalid in [
+            json!({"symbol": "BTC/USDC"}),
+            json!({"unexpected": true}),
+            json!({"fields": ["fundng"]}),
+            json!({"fields": "funding"}),
+            json!({"marketIds": "BTC"}),
+            json!({"marketIds": [1]}),
+        ] {
+            assert!(
+                serde_json::from_value::<FetchMarketStatsRequest>(invalid.clone()).is_err(),
+                "accepted invalid request: {invalid}",
+            );
+        }
+    }
 }

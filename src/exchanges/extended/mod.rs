@@ -1,3 +1,5 @@
+mod statistics;
+
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -5,10 +7,11 @@ use chrono::{SecondsFormat, Utc};
 use serde_json::Value;
 
 use crate::{
-    exchanges::traits::{ExchangeError, MarketDataExchange},
+    exchanges::traits::{ExchangeError, MarketDataExchange, MarketStatsSource},
+    market_stats::make_market_id,
     models::{
         CcxtOhlcv, CcxtOrderBook, CcxtTrade, FetchMarketsParams, FetchOhlcvParams,
-        FetchOrderBookParams, FetchTradesParams, UnifiedMarket, UnifiedMarketInfo,
+        FetchOrderBookParams, FetchTradesParams, MarketIdentity, UnifiedMarket, UnifiedMarketInfo,
         UnifiedMarketType,
     },
     ws_shared::{
@@ -23,6 +26,7 @@ pub const DEFAULT_EXTENDED_REST_BASE_URL: &str = "https://api.starknet.extended.
 pub struct ExtendedExchange {
     http_client: reqwest::Client,
     rest_base_url: String,
+    statistics_cache: statistics::ExtendedCache,
 }
 
 impl ExtendedExchange {
@@ -37,10 +41,15 @@ impl ExtendedExchange {
         Ok(Self {
             http_client,
             rest_base_url: rest_base_url.trim_end_matches('/').to_string(),
+            statistics_cache: Default::default(),
         })
     }
 
-    async fn get(&self, path: &str, query: &[(&str, String)]) -> Result<Value, ExchangeError> {
+    async fn get_response(
+        &self,
+        path: &str,
+        query: &[(&str, String)],
+    ) -> Result<Value, ExchangeError> {
         let response = self
             .http_client
             .get(format!("{}{path}", self.rest_base_url))
@@ -59,8 +68,12 @@ impl ExtendedExchange {
                 body.chars().take(240).collect::<String>()
             )));
         }
-        let value: Value = serde_json::from_str(&body)
-            .map_err(|err| ExchangeError::UpstreamData(format!("Extended {path}: {err}")))?;
+        serde_json::from_str(&body)
+            .map_err(|err| ExchangeError::UpstreamData(format!("Extended {path}: {err}")))
+    }
+
+    async fn get(&self, path: &str, query: &[(&str, String)]) -> Result<Value, ExchangeError> {
+        let mut value = self.get_response(path, query).await?;
         if value
             .get("status")
             .and_then(Value::as_str)
@@ -72,8 +85,8 @@ impl ExtendedExchange {
             )));
         }
         value
-            .get("data")
-            .cloned()
+            .get_mut("data")
+            .map(Value::take)
             .ok_or_else(|| ExchangeError::UpstreamData(format!("Extended {path} missing data")))
     }
 }
@@ -82,6 +95,10 @@ impl ExtendedExchange {
 impl MarketDataExchange for ExtendedExchange {
     fn id(&self) -> &'static str {
         "extended"
+    }
+
+    fn market_stats_source(&self) -> Option<&dyn MarketStatsSource> {
+        Some(self)
     }
 
     async fn fetch_trades(
@@ -178,10 +195,13 @@ impl MarketDataExchange for ExtendedExchange {
         &self,
         params: FetchMarketsParams,
     ) -> Result<Vec<UnifiedMarket>, ExchangeError> {
-        let data = self.get("/info/markets", &[]).await?;
-        Ok(rows(&data)?
+        let observation = self.cached_markets().await;
+        let snapshot = observation.result.as_ref().map_err(Clone::clone)?;
+        Ok(snapshot
+            .rows
             .iter()
-            .filter_map(|row| map_market(row, params.include_inactive))
+            .filter(|row| params.include_inactive || row.market.active)
+            .map(|row| row.market.clone())
             .collect())
     }
 }
@@ -276,27 +296,45 @@ fn map_levels(value: &Value) -> Result<Vec<(f64, f64)>, ExchangeError> {
         .collect()
 }
 
-fn map_market(row: &Value, include_inactive: bool) -> Option<UnifiedMarket> {
-    if row.get("type").and_then(Value::as_str) != Some("PERPETUAL") {
-        return None;
+fn map_market(row: &Value, include_inactive: bool) -> Result<Option<UnifiedMarket>, ExchangeError> {
+    let raw = statistics::required_string(row, "name")?;
+    match statistics::required_string(row, "type")? {
+        "SPOT" => return Ok(None),
+        "PERPETUAL" => {}
+        _ => return Err(statistics::invalid_data("unsupported market type")),
     }
-    let raw = row.get("name")?.as_str()?;
-    let market = resolve_extended_ws_symbol(raw, None).ok()?;
-    let base = row.get("assetName")?.as_str()?.to_ascii_uppercase();
-    let quote = row
-        .get("collateralAssetName")?
-        .as_str()?
-        .to_ascii_uppercase();
-    let active = row.get("active").and_then(Value::as_bool) == Some(true)
-        && row.get("status").and_then(Value::as_str) == Some("ACTIVE");
+    let base = statistics::required_string(row, "assetName")?;
+    let quote = statistics::required_string(row, "collateralAssetName")?;
+    let status = statistics::required_string(row, "status")?;
+    let active = row
+        .get("active")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| statistics::invalid_data(format!("market {raw} has invalid active")))?
+        && status == "ACTIVE";
     if !include_inactive && !active {
-        return None;
+        return Ok(None);
     }
-    Some(UnifiedMarket {
+    let settlement_asset_id = row
+        .pointer("/l2Config/collateralId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.trim() == *value)
+        .map(str::to_string);
+    // Display pairs come from catalog assets; native names are opaque identities.
+    let symbol = format!("{base}/{quote}");
+    Ok(Some(UnifiedMarket {
+        identity: Some(MarketIdentity {
+            market_id: make_market_id("extended", UnifiedMarketType::Perp, None, None, raw)?,
+            exchange_market_id: raw.to_string(),
+            category: None,
+            dex: None,
+            contract_type: Some("PERPETUAL".to_string()),
+            settle: Some(quote.to_string()),
+            settlement_asset_id,
+        }),
         exchange: "extended".to_string(),
-        symbol: market.replace('-', "/"),
-        base,
-        quote,
+        symbol,
+        base: base.to_string(),
+        quote: quote.to_string(),
         market_type: UnifiedMarketType::Perp,
         active,
         min_order_size: row
@@ -311,9 +349,11 @@ fn map_market(row: &Value, include_inactive: bool) -> Option<UnifiedMarket> {
         info: UnifiedMarketInfo {
             category: Some("perpetual".to_string()),
             raw_symbol: Some(raw.to_string()),
-            exchange_symbol: Some(market),
+            exchange_symbol: Some(raw.to_string()),
+            is_rfq: row.get("isRfq").and_then(Value::as_bool),
+            is_off_hours: row.get("isOffHours").and_then(Value::as_bool),
         },
-    })
+    }))
 }
 
 fn iso8601_millis(timestamp: u64) -> Option<String> {
@@ -355,21 +395,21 @@ mod tests {
     #[test]
     fn extended_filters_perpetual_and_inactive_markets() {
         let mut row = json!({"name":"BTC-USD","assetName":"BTC","collateralAssetName":"USD","type":"PERPETUAL","active":true,"status":"ACTIVE","tradingConfig":{"minOrderSize":"0.001","minPriceChange":"0.1"}});
-        let market = map_market(&row, false).unwrap();
+        let market = map_market(&row, false).unwrap().unwrap();
         assert_eq!(market.symbol, "BTC/USD");
         assert_eq!(market.min_order_size, Some(0.001));
         assert_eq!(market.tick_size, Some(0.1));
         assert!(matches!(market.market_type, UnifiedMarketType::Perp));
         assert_eq!(market.info.category.as_deref(), Some("perpetual"));
         row["active"] = json!(false);
-        assert!(map_market(&row, false).is_none());
-        assert!(!map_market(&row, true).unwrap().active);
+        assert!(map_market(&row, false).unwrap().is_none());
+        assert!(!map_market(&row, true).unwrap().unwrap().active);
         row["active"] = json!(true);
         row["status"] = json!("DISABLED");
-        assert!(map_market(&row, false).is_none());
-        assert!(!map_market(&row, true).unwrap().active);
+        assert!(map_market(&row, false).unwrap().is_none());
+        assert!(!map_market(&row, true).unwrap().unwrap().active);
         row["type"] = json!("SPOT");
-        assert!(map_market(&row, true).is_none());
+        assert!(map_market(&row, true).unwrap().is_none());
     }
 
     #[tokio::test]

@@ -13,6 +13,8 @@ pub enum ApiError {
     Validation(String),
     #[error("unsupported exchange: {0}")]
     UnsupportedExchange(String),
+    #[error("unsupported feature: {0}")]
+    UnsupportedFeature(String),
     #[error(transparent)]
     Exchange(#[from] ExchangeError),
 }
@@ -32,6 +34,9 @@ impl IntoResponse for ApiError {
                 "UNSUPPORTED_EXCHANGE",
                 format!("exchange `{exchange_id}` is not supported"),
             ),
+            ApiError::UnsupportedFeature(message) => {
+                (StatusCode::NOT_IMPLEMENTED, "UNSUPPORTED_FEATURE", message)
+            }
             ApiError::Exchange(exchange_error) => map_exchange_error(exchange_error),
         };
 

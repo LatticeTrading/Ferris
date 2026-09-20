@@ -34,8 +34,14 @@ async fn main() -> anyhow::Result<()> {
         config.extended_rest_base_url.clone(),
         config.request_timeout_ms,
     )?);
-    let aster_exchange = Arc::new(AsterExchange::new(config.request_timeout_ms)?);
-    let binance_exchange = Arc::new(BinanceExchange::new(config.request_timeout_ms)?);
+    let aster_exchange = Arc::new(AsterExchange::with_base_url(
+        config.aster_base_url.clone(),
+        config.request_timeout_ms,
+    )?);
+    let binance_exchange = Arc::new(BinanceExchange::with_base_url(
+        config.binance_base_url.clone(),
+        config.request_timeout_ms,
+    )?);
     let lighter_catalog_service = Arc::new(LighterMarketCatalogService::new(
         config.request_timeout_ms,
         config.lighter_markets_url.clone(),
@@ -45,12 +51,18 @@ async fn main() -> anyhow::Result<()> {
     registry.register(extended_exchange.clone());
     registry.register(aster_exchange.clone());
     registry.register(binance_exchange.clone());
-    registry.register(Arc::new(BybitExchange::new(config.request_timeout_ms)?));
-    registry.register(Arc::new(LighterExchange::new(
-        config.lighter_rest_base_url.clone(),
+    registry.register(Arc::new(BybitExchange::with_base_url(
+        config.bybit_base_url.clone(),
         config.request_timeout_ms,
-        lighter_catalog_service.clone(),
     )?));
+    registry.register(Arc::new(
+        LighterExchange::new(
+            config.lighter_rest_base_url.clone(),
+            config.request_timeout_ms,
+            lighter_catalog_service.clone(),
+        )?
+        .with_stats_ws_url(config.lighter_ws_url.clone(), config.request_timeout_ms),
+    ));
     registry.register(Arc::new(HyperliquidExchange::new(
         config.hyperliquid_base_url.clone(),
         config.request_timeout_ms,
@@ -91,10 +103,12 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/fetchOHLCV", post(web::fetch_ohlcv))
         .route("/v1/fetchOrderBook", post(web::fetch_order_book))
         .route("/v1/fetchMarkets", post(web::fetch_markets))
+        .route("/v1/fetchMarketStats", post(web::fetch_market_stats))
+        .route("/v1/capabilities", get(web::capabilities))
         .route("/v1/ws", get(web::trades_stream_ws))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
-        .with_state(state);
+        .with_state(state.clone());
 
     let addr: SocketAddr = format!("{}:{}", config.host, config.port)
         .parse()
@@ -118,10 +132,12 @@ async fn main() -> anyhow::Result<()> {
         "server started"
     );
 
-    axum::serve(listener, app)
+    let result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
-        .context("server error")?;
+        .context("server error");
+    state.shutdown_market_stats().await;
+    result?;
 
     Ok(())
 }

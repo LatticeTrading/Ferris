@@ -2,7 +2,7 @@
 
 This document tracks what is done, what is next, and what to watch as this backend grows.
 
-Last updated: 2026-02-22
+Last updated: 2026-09-20
 
 ## How To Use This Doc
 
@@ -33,6 +33,9 @@ Completed:
 - Extended perpetual public market-data adapter: trades, OHLCV, order-book, and market snapshots plus realtime trades, books, and OHLCV
 - Extended canonical trade/book symbols (`BASE/USD:USD`), catalog symbols (`BASE/USD`), and configurable upstream URLs for testnet readiness
 - Extended indicative standard websocket order book support (RFQ real-book stream excluded)
+- Extended funding and mark/index/last statistics: shared bulk polling, all-market/selected REST and Ferris WS delivery, exact hourly estimates, and native catalog identities
+- Aster V3 perpetual funding and mark/index statistics: shared bulk polling, all-market/selected REST and Ferris WS delivery, exact estimate rates with per-market intervals, and native catalog/settlement identities
+- Funding market-statistics delivery ledger complete for the six approved venue slices: Hyperliquid, Binance, Lighter, Bybit, Extended, and Aster
 - `market_stream` modularized and made websocket-only (poll transport removed)
 - `market_stream` websocket parity:
   - `trades`: Hyperliquid, Binance, Bybit, Aster, Extended
@@ -49,14 +52,13 @@ In progress:
 
 - Production hardening and public-host readiness
 - Realtime stream hardening (limits, backpressure, visibility)
-- Exchange expansion follow-up (next adapter candidate after Bybit)
-- Extended scope is perpetual public market data only; spot, private trading/account, funding, account streams, and RFQ real-book endpoints remain unsupported.
+- Extended scope is perpetual public market data only; spot, private trading/account, funding history, account streams, and RFQ real-book endpoints remain unsupported.
 
 Not started:
 
 - Persistent/shared cache (Redis or similar)
 - Public deployment automation
-- Additional backend websocket fanout channels beyond current scope (for example funding/liquidations/ticker)
+- Additional backend websocket fanout channels beyond current scope (for example liquidations/ticker)
 
 ## Milestones
 
@@ -284,6 +286,11 @@ Week 4:
 2026-09-09:
 
 - Completed Extended perpetual public market-data integration with REST/realtime parity; standard websocket order books are explicitly indicative rather than RFQ real books.
+
+2026-09-20:
+
+- Completed Extended perpetual funding/mark/index/last statistics through the shared 30-second coordinator and existing REST/WS contract. Current funding is an exact hourly decimal-fraction estimate; native `nextFundingRate` is not exposed as a payment timestamp. Catalog and statistics share opaque native identities and collateral/RFQ/off-hours metadata. Deterministic and live REST/WS checks passed; full delivery evidence is in `FUNDING_MARKET_STATS_PLAN.md`.
+- Completed Aster V3 perpetual funding/mark/index statistics with shared 30-second receipt-based acquisition, native identities and settlement, dynamic per-market funding intervals, payment-boundary expiry, and existing REST/WS snapshot/delta delivery. Eight Aster scenarios and the full Rust suite passed (203 tests, 5 ignored); live checks covered 581 active perpetuals, 1h/4h/8h intervals, quote variants, Unicode, ordered deltas, and legacy endpoints. All six approved venue slices in `FUNDING_MARKET_STATS_PLAN.md` are now complete; the separate verification server was stopped without restarting staging.
 
 ## Weekly Update Template
 

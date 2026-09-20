@@ -8,13 +8,15 @@ use serde_json::Value;
 
 use crate::{
     bybit_full_orderbook::{BybitFullSnapshot, BYBIT_FULL_DEPTH_THRESHOLD, BYBIT_MAX_FULL_DEPTH},
-    exchanges::traits::{ExchangeError, MarketDataExchange},
+    exchanges::traits::{ExchangeError, MarketDataExchange, MarketStatsSource},
     models::{
         CcxtOhlcv, CcxtOrderBook, CcxtTrade, FetchMarketsParams, FetchOhlcvParams,
         FetchOrderBookParams, FetchTradesParams, UnifiedMarket, UnifiedMarketInfo,
         UnifiedMarketType,
     },
 };
+
+mod statistics;
 
 const DEFAULT_BYBIT_BASE_URL: &str = "https://api.bybit.com";
 
@@ -31,10 +33,15 @@ const DEFAULT_FETCH_MARKETS_LIMIT: usize = 1_000;
 pub struct BybitExchange {
     http_client: reqwest::Client,
     base_url: String,
+    statistics_cache: [statistics::BybitCategoryCache; 2],
 }
 
 impl BybitExchange {
     pub fn new(timeout_ms: u64) -> Result<Self, ExchangeError> {
+        Self::with_base_url(DEFAULT_BYBIT_BASE_URL.to_string(), timeout_ms)
+    }
+
+    pub fn with_base_url(base_url: String, timeout_ms: u64) -> Result<Self, ExchangeError> {
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_millis(timeout_ms))
             .build()
@@ -44,7 +51,8 @@ impl BybitExchange {
 
         Ok(Self {
             http_client,
-            base_url: DEFAULT_BYBIT_BASE_URL.to_string(),
+            base_url: base_url.trim_end_matches('/').to_string(),
+            statistics_cache: Default::default(),
         })
     }
 
@@ -53,44 +61,67 @@ impl BybitExchange {
         endpoint_path: &str,
         query: &[(&str, String)],
     ) -> Result<Value, ExchangeError> {
+        self.get_public_market_response(endpoint_path, query)
+            .await
+            .result
+    }
+
+    async fn get_public_market_response(
+        &self,
+        endpoint_path: &str,
+        query: &[(&str, String)],
+    ) -> statistics::BybitResponse {
         let endpoint = format!("{}{}", self.base_url, endpoint_path);
-
-        let response = self
-            .http_client
-            .get(&endpoint)
-            .query(query)
-            .send()
-            .await
-            .map_err(|err| ExchangeError::UpstreamRequest(err.to_string()))?;
-
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .map_err(|err| ExchangeError::UpstreamRequest(err.to_string()))?;
-
-        if status != StatusCode::OK {
-            return Err(ExchangeError::UpstreamRequest(format!(
-                "bybit status={status} body={} query={:?}",
-                truncate(&body, 240),
-                query,
-            )));
+        let response = async {
+            let response = self
+                .http_client
+                .get(&endpoint)
+                .query(query)
+                .send()
+                .await
+                .map_err(|err| ExchangeError::UpstreamRequest(err.to_string()))?;
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .map_err(|err| ExchangeError::UpstreamRequest(err.to_string()))?;
+            Ok::<_, ExchangeError>((status, body))
         }
-
-        let envelope: BybitEnvelope = serde_json::from_str(&body).map_err(|err| {
-            ExchangeError::UpstreamData(format!(
-                "failed to parse Bybit response: {err}; body={}",
-                truncate(&body, 240)
-            ))
-        })?;
-
-        if envelope.ret_code != 0 {
-            return Err(map_bybit_api_error(envelope.ret_code, &envelope.ret_msg));
+        .await;
+        // Capture the body receipt before decoding or waiting on any other endpoint.
+        let receipt = statistics::BybitReceipt::now();
+        let mut exchange_timestamp = None;
+        let result = response.and_then(|(status, body)| {
+            if status != StatusCode::OK {
+                return Err(ExchangeError::UpstreamRequest(format!(
+                    "bybit status={status} body={} query={:?}",
+                    truncate(&body, 240),
+                    query,
+                )));
+            }
+            let envelope: BybitEnvelope = serde_json::from_str(&body).map_err(|err| {
+                ExchangeError::UpstreamData(format!(
+                    "failed to parse Bybit response: {err}; body={}",
+                    truncate(&body, 240)
+                ))
+            })?;
+            if envelope.ret_code != 0 {
+                return Err(map_bybit_api_error(envelope.ret_code, &envelope.ret_msg));
+            }
+            exchange_timestamp = envelope
+                .time
+                .as_ref()
+                .and_then(Value::as_u64)
+                .filter(|time| *time > 0);
+            envelope.result.ok_or_else(|| {
+                ExchangeError::UpstreamData("Bybit response missing `result`".to_string())
+            })
+        });
+        statistics::BybitResponse {
+            result,
+            receipt,
+            exchange_timestamp,
         }
-
-        envelope.result.ok_or_else(|| {
-            ExchangeError::UpstreamData("Bybit response missing `result`".to_string())
-        })
     }
 }
 
@@ -98,6 +129,10 @@ impl BybitExchange {
 impl MarketDataExchange for BybitExchange {
     fn id(&self) -> &'static str {
         "bybit"
+    }
+
+    fn market_stats_source(&self) -> Option<&dyn MarketStatsSource> {
+        Some(self)
     }
 
     async fn fetch_trades(
@@ -280,13 +315,25 @@ impl MarketDataExchange for BybitExchange {
         let mut markets = Vec::new();
 
         for category in categories {
+            if matches!(category, BybitCategory::Linear | BybitCategory::Inverse) {
+                let observation = self.cached_instruments(category).await;
+                let catalog = observation.result.as_ref().map_err(Clone::clone)?;
+                markets.extend(
+                    catalog
+                        .markets
+                        .iter()
+                        .filter(|market| params.include_inactive || market.active)
+                        .cloned(),
+                );
+                continue;
+            }
             let mut cursor = None::<String>;
 
             loop {
-                let mut query = vec![
-                    ("category", category.as_str().to_string()),
-                    ("limit", DEFAULT_FETCH_MARKETS_LIMIT.to_string()),
-                ];
+                let mut query = vec![("category", category.as_str().to_string())];
+                if category != BybitCategory::Spot {
+                    query.push(("limit", DEFAULT_FETCH_MARKETS_LIMIT.to_string()));
+                }
 
                 if let Some(next_cursor) = cursor.as_ref() {
                     if !next_cursor.is_empty() {
@@ -317,6 +364,10 @@ impl MarketDataExchange for BybitExchange {
                     }
                 }
 
+                if category == BybitCategory::Spot {
+                    break;
+                }
+
                 let next_cursor = result
                     .get("nextPageCursor")
                     .and_then(Value::as_str)
@@ -343,6 +394,7 @@ struct BybitEnvelope {
     #[serde(rename = "retMsg")]
     ret_msg: String,
     result: Option<Value>,
+    time: Option<Value>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -504,6 +556,7 @@ fn map_market_row(
         });
 
     Ok(Some(UnifiedMarket {
+        identity: None,
         exchange: "bybit".to_string(),
         symbol: format!("{base}/{quote}"),
         base,
@@ -517,6 +570,7 @@ fn map_market_row(
             category: Some(category.as_str().to_string()),
             raw_symbol: Some(exchange_symbol.to_string()),
             exchange_symbol: Some(exchange_symbol.to_string()),
+            ..Default::default()
         },
     }))
 }
@@ -528,15 +582,15 @@ fn resolve_market_assets(
     let base = raw
         .get("baseCoin")
         .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .map(sanitize_asset)
-        .transpose()?;
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
     let quote = raw
         .get("quoteCoin")
         .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .map(sanitize_asset)
-        .transpose()?;
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
 
     if let (Some(base), Some(quote)) = (base, quote) {
         return Ok((base, quote));

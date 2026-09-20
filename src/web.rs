@@ -1,6 +1,9 @@
 use std::{
     collections::HashMap,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -30,16 +33,22 @@ use tracing::warn;
 use crate::{
     errors::ApiError,
     exchanges::{registry::ExchangeRegistry, traits::ExchangeError},
+    market_stats::{projection_key, MarketStatsCoordinator},
     models::{
-        CcxtOhlcv, CcxtOrderBook, CcxtTrade, FetchMarketsParams, FetchMarketsRequest,
-        FetchMarketsResponse, FetchOhlcvRequest, FetchOrderBookRequest, FetchTradesRequest,
-        HealthResponse,
+        CapabilitiesResponse, CapabilityState, CcxtOhlcv, CcxtOrderBook, CcxtTrade,
+        ExchangeCapabilities, FeatureCapability, FetchMarketStatsRequest, FetchMarketsParams,
+        FetchMarketsRequest, FetchMarketsResponse, FetchOhlcvRequest, FetchOrderBookRequest,
+        FetchTradesRequest, HealthResponse, MarketStatsCapabilities, MarketStatsSnapshot,
+        MarketStatsTopic,
     },
     realtime::{
         OhlcvTopic, OhlcvTopicManager, OrderBookTopic, OrderBookTopicManager, TradesTopic,
         TradesTopicManager,
     },
 };
+
+mod market_stats_stream;
+use market_stats_stream::spawn_market_stats_forwarder;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -48,6 +57,7 @@ pub struct AppState {
     order_book_topic_manager: OrderBookTopicManager,
     ohlcv_topic_manager: OhlcvTopicManager,
     markets_cache: MarketsCache,
+    market_stats: MarketStatsCoordinator,
 }
 
 impl AppState {
@@ -58,12 +68,17 @@ impl AppState {
         ohlcv_topic_manager: OhlcvTopicManager,
     ) -> Self {
         Self {
+            market_stats: MarketStatsCoordinator::new(exchange_registry.clone()),
             exchange_registry,
             trades_topic_manager,
             order_book_topic_manager,
             ohlcv_topic_manager,
             markets_cache: MarketsCache::new(Duration::from_secs(30)),
         }
+    }
+
+    pub async fn shutdown_market_stats(&self) {
+        self.market_stats.shutdown().await;
     }
 }
 
@@ -208,6 +223,40 @@ impl IntoResponse for FetchMarketsApiError {
 
 pub async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
+}
+
+pub async fn fetch_market_stats(
+    State(state): State<AppState>,
+    payload: Result<Json<FetchMarketStatsRequest>, JsonRejection>,
+) -> Result<Json<MarketStatsSnapshot>, ApiError> {
+    let Json(request) = payload.map_err(|error| ApiError::Validation(error.body_text()))?;
+    state.market_stats.snapshot(request).await.map(Json)
+}
+
+pub async fn capabilities(State(state): State<AppState>) -> Json<CapabilitiesResponse> {
+    let exchanges = state
+        .exchange_registry
+        .ids()
+        .into_iter()
+        .filter_map(|id| {
+            let exchange = state.exchange_registry.get(id)?;
+            let market_stats = exchange
+                .market_stats_source()
+                .map(|source| source.capabilities())
+                .unwrap_or_else(|| MarketStatsCapabilities::Unsupported {
+                    reason: "adapter-not-implemented".to_string(),
+                });
+            Some(ExchangeCapabilities {
+                exchange: id.to_string(),
+                market_stats,
+                funding_rate_history: FeatureCapability {
+                    state: CapabilityState::Unsupported,
+                    reason: Some("adapter-not-implemented".to_string()),
+                },
+            })
+        })
+        .collect();
+    Json(CapabilitiesResponse { exchanges })
 }
 
 pub async fn fetch_trades(
@@ -431,6 +480,10 @@ struct ClientStreamCommand {
     symbol: Option<String>,
     #[serde(default)]
     params: Value,
+    #[serde(default)]
+    market_ids: Value,
+    #[serde(default)]
+    fields: Value,
 }
 
 enum ParsedStreamCommand {
@@ -442,6 +495,8 @@ enum ParsedStreamCommand {
         channel: RealtimeChannel,
         topic: TradesTopic,
     },
+    SubscribeMarketStats(FetchMarketStatsRequest),
+    UnsubscribeMarketStats(FetchMarketStatsRequest),
     Ping,
 }
 
@@ -478,6 +533,12 @@ struct ClientSubscription {
     forward_task: JoinHandle<()>,
 }
 
+struct MarketStatsClientSubscription {
+    topic: MarketStatsTopic,
+    key: String,
+    forward_task: JoinHandle<()>,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct WsErrorMessage {
@@ -489,11 +550,11 @@ struct WsErrorMessage {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct WsAckMessage<'a> {
+struct WsAckMessage<'a, T: Serialize> {
     #[serde(rename = "type")]
     message_type: &'static str,
     op: &'static str,
-    topic: &'a TradesTopic,
+    topic: &'a T,
 }
 
 #[derive(Serialize)]
@@ -554,6 +615,7 @@ async fn handle_trades_stream_socket(socket: WebSocket, state: AppState) {
     let (outgoing_sender, mut outgoing_receiver) =
         channel::<Message>(CLIENT_OUTGOING_QUEUE_CAPACITY);
     let close_signal = Arc::new(Notify::new());
+    let force_close = Arc::new(AtomicBool::new(false));
 
     let writer_task = tokio::spawn(async move {
         while let Some(message) = outgoing_receiver.recv().await {
@@ -564,6 +626,7 @@ async fn handle_trades_stream_socket(socket: WebSocket, state: AppState) {
     });
 
     let mut subscriptions: HashMap<String, ClientSubscription> = HashMap::new();
+    let mut stats_subscriptions: HashMap<String, MarketStatsClientSubscription> = HashMap::new();
 
     loop {
         let next_message = tokio::select! {
@@ -617,15 +680,17 @@ async fn handle_trades_stream_socket(socket: WebSocket, state: AppState) {
                     }
                 };
 
-                if !handle_stream_command(
+                let keep_open = handle_stream_command(
                     &state,
                     command,
                     &outgoing_sender,
                     &close_signal,
                     &mut subscriptions,
+                    &mut stats_subscriptions,
+                    &force_close,
                 )
-                .await
-                {
+                .await;
+                if !keep_open {
                     break;
                 }
             }
@@ -636,8 +701,19 @@ async fn handle_trades_stream_socket(socket: WebSocket, state: AppState) {
         subscription.forward_task.abort();
         unsubscribe_channel(&state, subscription.channel, &subscription.upstream_key).await;
     }
+    for (_, subscription) in stats_subscriptions {
+        subscription.forward_task.abort();
+        let _ = subscription.forward_task.await;
+        state
+            .market_stats
+            .unsubscribe_by_key(&subscription.key)
+            .await;
+    }
 
     drop(outgoing_sender);
+    if force_close.load(Ordering::Acquire) {
+        writer_task.abort();
+    }
     let _ = writer_task.await;
 }
 
@@ -647,8 +723,106 @@ async fn handle_stream_command(
     outgoing_sender: &Sender<Message>,
     close_signal: &Arc<Notify>,
     subscriptions: &mut HashMap<String, ClientSubscription>,
+    stats_subscriptions: &mut HashMap<String, MarketStatsClientSubscription>,
+    force_close: &Arc<AtomicBool>,
 ) -> bool {
     match command {
+        ParsedStreamCommand::SubscribeMarketStats(request) => {
+            let topic = match state.market_stats.normalize_request(request.clone()) {
+                Ok(topic) => topic,
+                Err(error) => return send_stats_error(outgoing_sender, error),
+            };
+            let key = match projection_key(&topic) {
+                Ok(key) => key,
+                Err(error) => return send_stats_error(outgoing_sender, error),
+            };
+            if let Some(existing) = stats_subscriptions.get(&key) {
+                return send_ws_json(
+                    outgoing_sender,
+                    &WsAckMessage {
+                        message_type: "alreadySubscribed",
+                        op: "subscribe",
+                        topic: &existing.topic,
+                    },
+                );
+            }
+            if stats_subscriptions.len() >= 16 {
+                return send_ws_error(
+                    outgoing_sender,
+                    "SUBSCRIPTION_LIMIT",
+                    "at most 16 statistics subscriptions are allowed per connection",
+                );
+            }
+            let result = tokio::select! {
+                _ = close_signal.notified() => return false,
+                result = state.market_stats.subscribe(request) => result,
+            };
+            let subscription = match result {
+                Ok(subscription) => subscription,
+                Err(error) => return send_stats_error(outgoing_sender, error),
+            };
+            if !send_ws_json(
+                outgoing_sender,
+                &WsAckMessage {
+                    message_type: "subscribed",
+                    op: "subscribe",
+                    topic: &subscription.topic,
+                },
+            ) {
+                state
+                    .market_stats
+                    .unsubscribe_by_key(&subscription.key)
+                    .await;
+                force_close.store(true, Ordering::Release);
+                close_signal.notify_one();
+                return false;
+            }
+            let forward_task = spawn_market_stats_forwarder(
+                subscription.topic.clone(),
+                subscription.receiver,
+                outgoing_sender.clone(),
+                close_signal.clone(),
+                force_close.clone(),
+            );
+            stats_subscriptions.insert(
+                key,
+                MarketStatsClientSubscription {
+                    topic: subscription.topic,
+                    key: subscription.key,
+                    forward_task,
+                },
+            );
+            true
+        }
+        ParsedStreamCommand::UnsubscribeMarketStats(request) => {
+            // Canonicalize syntax/scope only: vanished identities must remain unsubscribable.
+            let topic = match state.market_stats.normalize_request(request) {
+                Ok(topic) => topic,
+                Err(error) => return send_stats_error(outgoing_sender, error),
+            };
+            let key = match projection_key(&topic) {
+                Ok(key) => key,
+                Err(error) => return send_stats_error(outgoing_sender, error),
+            };
+            let Some(existing) = stats_subscriptions.remove(&key) else {
+                return send_ws_error(
+                    outgoing_sender,
+                    "NOT_SUBSCRIBED",
+                    "topic is not currently subscribed on this connection",
+                );
+            };
+            existing.forward_task.abort();
+            let _ = existing.forward_task.await;
+            state.market_stats.unsubscribe_by_key(&existing.key).await;
+            send_ws_json(
+                outgoing_sender,
+                &WsAckMessage {
+                    message_type: "unsubscribed",
+                    op: "unsubscribe",
+                    topic: &existing.topic,
+                },
+            )
+        }
         ParsedStreamCommand::Ping => send_ws_json(
             outgoing_sender,
             &WsPongMessage {
@@ -1001,13 +1175,36 @@ fn parse_stream_command(payload: &str) -> Result<ParsedStreamCommand, String> {
                 .trim()
                 .to_ascii_lowercase();
 
+            if channel_value == "marketstats" {
+                if command
+                    .symbol
+                    .as_deref()
+                    .is_some_and(|symbol| !symbol.is_empty())
+                {
+                    return Err("marketstats uses marketIds, not symbol".to_string());
+                }
+                let mut value = serde_json::json!({
+                    "marketIds": command.market_ids, "fields": command.fields, "params": command.params,
+                });
+                if let Some(exchange) = command.exchange {
+                    value["exchange"] = Value::String(exchange);
+                }
+                let request = serde_json::from_value(value)
+                    .map_err(|error| format!("invalid statistics command: {error}"))?;
+                return Ok(if op == "subscribe" {
+                    ParsedStreamCommand::SubscribeMarketStats(request)
+                } else {
+                    ParsedStreamCommand::UnsubscribeMarketStats(request)
+                });
+            }
+
             let channel = if channel_value.is_empty() {
                 RealtimeChannel::Trades
             } else if let Some(channel) = RealtimeChannel::from_client_value(&channel_value) {
                 channel
             } else {
                 return Err(format!(
-                    "unsupported channel `{channel_value}`; supported channels: `trades`, `orderbook`, `ohlcv`"
+                    "unsupported channel `{channel_value}`; supported channels: `trades`, `orderbook`, `ohlcv`, `marketstats`"
                 ));
             };
 
@@ -1034,6 +1231,16 @@ fn ws_message_to_text(message: Message) -> Result<Option<String>, String> {
             .map_err(|err| format!("invalid UTF-8 websocket payload: {err}")),
         Message::Ping(_) | Message::Pong(_) | Message::Close(_) => Ok(None),
     }
+}
+
+fn send_stats_error(outgoing_sender: &Sender<Message>, error: ApiError) -> bool {
+    let code = match &error {
+        ApiError::Validation(_) => "INVALID_TOPIC",
+        ApiError::UnsupportedExchange(_) => "UNSUPPORTED_EXCHANGE",
+        ApiError::UnsupportedFeature(_) => "UNSUPPORTED_FEATURE",
+        ApiError::Exchange(_) => "SUBSCRIBE_FAILED",
+    };
+    send_ws_error(outgoing_sender, code, error.to_string())
 }
 
 fn send_ws_error(

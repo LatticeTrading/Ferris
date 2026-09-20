@@ -249,7 +249,7 @@ async fn websocket_fanout_shares_upstream_for_same_topic() {
     );
     let app = Router::new()
         .route("/v1/ws", get(web::trades_stream_ws))
-        .with_state(app_state);
+        .with_state(app_state.clone());
     let (backend_bind, backend_shutdown, backend_task) = spawn_server(app).await;
 
     let backend_ws_url = format!("ws://{backend_bind}/v1/ws");
@@ -348,6 +348,7 @@ async fn websocket_fanout_shares_upstream_for_same_topic() {
 
     let _ = client_a.close(None).await;
     let _ = client_b.close(None).await;
+    app_state.shutdown_market_stats().await;
 
     let _ = backend_shutdown.send(());
     let _ = upstream_shutdown.send(());
