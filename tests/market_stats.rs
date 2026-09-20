@@ -1,3 +1,5 @@
+#[path = "market_stats/aster.rs"]
+mod aster;
 #[path = "market_stats/binance.rs"]
 mod binance;
 #[path = "market_stats/bybit.rs"]
@@ -513,7 +515,11 @@ async fn backend(
     };
     let mut registry = ExchangeRegistry::new();
     registry.register(source.clone());
-    registry.register(Arc::new(AsterExchange::new(1_000).unwrap()));
+    if source.id() != "aster" {
+        registry.register(Arc::new(
+            AsterExchange::with_base_url("http://127.0.0.1:1".into(), 1_000).unwrap(),
+        ));
+    }
     if source.id() != "binance" {
         registry.register(Arc::new(BinanceExchange::new(1_000).unwrap()));
     }
@@ -699,21 +705,31 @@ async fn market_stats_http_capabilities_bounds_and_catalog_proof() {
             for field in ["lastSettledFunding", "volume24h", "openInterest"] {
                 assert_eq!(stats["fields"]["perp"][field]["state"], "unsupported");
             }
+        } else if exchange["exchange"] == "aster" {
+            let stats = &exchange["marketStats"];
+            assert_eq!(stats["state"], "supported");
+            assert_eq!(stats["scope"]["params"], json!({}));
+            assert_eq!(stats["upstreamMode"], "sharedPolling");
+            assert_eq!(stats["pollIntervalMs"], 30_000);
+            assert_eq!(stats["staleAfterMs"], 90_000);
+            assert_eq!(stats["rateIntervalMs"], Value::Null);
+            assert_eq!(stats["paymentIntervalMs"], Value::Null);
+            assert_eq!(stats["fundingKinds"], json!(["estimate"]));
+            assert_eq!(stats["allMarkets"]["types"], json!(["perp"]));
+            assert_eq!(stats["selectedMarkets"]["types"], json!(["perp"]));
+            for field in ["funding", "markPrice", "indexPrice"] {
+                assert_eq!(stats["fields"]["perp"][field]["state"], "supported");
+            }
+            for field in [
+                "lastSettledFunding",
+                "lastPrice",
+                "volume24h",
+                "openInterest",
+            ] {
+                assert_eq!(stats["fields"]["perp"][field]["state"], "unsupported");
+            }
         } else {
-            assert_eq!(
-                exchange["marketStats"],
-                json!({"state":"unsupported","reason":"adapter-not-implemented"})
-            );
-            assert_eq!(
-                stats_http(
-                    &client,
-                    &url,
-                    json!({"exchange":exchange["exchange"]}),
-                    StatusCode::NOT_IMPLEMENTED
-                )
-                .await["code"],
-                "UNSUPPORTED_FEATURE"
-            );
+            panic!("uncovered capability: {exchange}");
         }
     }
     for body in [
@@ -1485,12 +1501,6 @@ async fn market_stats_ws_classifies_errors_and_limits_distinct_connection_topics
         &mut socket,
         stats_command("subscribe", &json!({"exchange":"unknown"})),
         "UNSUPPORTED_EXCHANGE",
-    )
-    .await;
-    ws_error(
-        &mut socket,
-        stats_command("subscribe", &json!({"exchange":"aster"})),
-        "UNSUPPORTED_FEATURE",
     )
     .await;
     assert_eq!(

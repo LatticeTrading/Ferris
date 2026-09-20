@@ -34,7 +34,10 @@ async fn main() -> anyhow::Result<()> {
         config.extended_rest_base_url.clone(),
         config.request_timeout_ms,
     )?);
-    let aster_exchange = Arc::new(AsterExchange::new(config.request_timeout_ms)?);
+    let aster_exchange = Arc::new(AsterExchange::with_base_url(
+        config.aster_base_url.clone(),
+        config.request_timeout_ms,
+    )?);
     let binance_exchange = Arc::new(BinanceExchange::with_base_url(
         config.binance_base_url.clone(),
         config.request_timeout_ms,

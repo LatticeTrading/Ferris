@@ -32,6 +32,8 @@ fn is_lighter(exchange: &str) -> bool {
 fn catalog_source(exchange: &str, product: UnifiedMarketType, params: &Value) -> &'static str {
     if is_binance(exchange) {
         "binance:exchangeInfo"
+    } else if exchange == "aster" {
+        "aster:exchangeInfo"
     } else if is_lighter(exchange) {
         "lighterxyz:orderBookDetails"
     } else if exchange == "bybit" {
@@ -57,6 +59,7 @@ pub fn normalize_topic(request: FetchMarketStatsRequest) -> Result<MarketStatsTo
     match (&exchange[..], &request.params) {
         (_, Value::Null) => {}
         ("binance", Value::Object(params)) if params.is_empty() => {}
+        ("aster", Value::Object(params)) if params.is_empty() => {}
         ("lighterxyz", Value::Object(params)) if params.is_empty() => {}
         ("extended", Value::Object(params)) if params.is_empty() => {}
         ("bybit", Value::Object(params))
@@ -68,6 +71,7 @@ pub fn normalize_topic(request: FetchMarketStatsRequest) -> Result<MarketStatsTo
                     )) => {}
         (_, Value::Object(params))
             if !is_binance(&exchange)
+                && exchange != "aster"
                 && !is_lighter(&exchange)
                 && exchange != "bybit"
                 && exchange != "extended"
@@ -78,6 +82,8 @@ pub fn normalize_topic(request: FetchMarketStatsRequest) -> Result<MarketStatsTo
             return Err(ApiError::Validation(
                 if is_binance(&exchange) {
                     "Binance market statistics params must be null or {}"
+                } else if exchange == "aster" {
+                    "Aster market statistics params must be null or {}"
                 } else if is_lighter(&exchange) {
                     "Lighter market statistics params must be null or {}"
                 } else if exchange == "bybit" {
@@ -93,7 +99,10 @@ pub fn normalize_topic(request: FetchMarketStatsRequest) -> Result<MarketStatsTo
     }
     let params = if exchange == "bybit" {
         json!({"category": request.params.get("category").and_then(Value::as_str).unwrap_or("linear")})
-    } else if is_binance(&exchange) || is_lighter(&exchange) || exchange == "extended" {
+    } else if is_binance(&exchange)
+        || is_lighter(&exchange)
+        || matches!(&exchange[..], "aster" | "extended")
+    {
         json!({})
     } else {
         json!({"dex": ""})
@@ -152,7 +161,7 @@ fn market_id_type(id: &str, exchange: &str, params: &Value) -> Result<UnifiedMar
             && ((native_id.len() > 1 && native_id.starts_with('0'))
                 || !native_id.bytes().all(|byte| byte.is_ascii_digit())
                 || native_id.parse::<u64>().is_err()))
-        || !(if is_binance(exchange) || matches!(exchange, "bybit" | "extended") {
+        || !(if is_binance(exchange) || matches!(exchange, "aster" | "bybit" | "extended") {
             matches!((product, dex.as_deref()), (UnifiedMarketType::Perp, None))
         } else if is_lighter(exchange) {
             matches!(
@@ -405,6 +414,8 @@ pub fn merge_outcome(
                 } else {
                     field.source.as_deref().unwrap_or(if is_binance(exchange) {
                         "binance:premiumIndex"
+                    } else if exchange == "aster" {
+                        "aster:premiumIndex"
                     } else {
                         PRIMARY_SOURCE
                     })
@@ -502,7 +513,7 @@ pub fn expire_snapshot(
                     .and_then(|fields| fields.get(name))
                     .copied()
                     .or(snapshot.received_at);
-                let reason = if row.market.exchange == "bybit"
+                let reason = if matches!(row.market.exchange.as_str(), "aster" | "bybit")
                     && *name == MarketStatsFieldName::Funding
                     && funding_payment_passed(field, receipt, now)
                 {

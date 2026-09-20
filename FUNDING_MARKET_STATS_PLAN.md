@@ -1,8 +1,8 @@
-# Funding market statistics: Hyperliquid + Binance + Lighter + Bybit + Extended delivery ledger
+# Funding market statistics: Hyperliquid + Binance + Lighter + Bybit + Extended + Aster delivery ledger
 
 ## 1. Active slice and exchange delivery ledger
 
-**Approved execution scope: Hyperliquid primary-DEX active perpetuals, Binance USDⓈ-M active `PERPETUAL` markets, Lighter native perpetual statistics, Bybit linear/inverse perpetuals, and Extended exact `PERPETUAL` markets.** Hyperliquid, Binance, Bybit, and Extended use shared 30-second REST polling; Lighter uses native `market_stats` WebSocket acquisition through the same coordinator. Deliver exchange-wide and selected-market statistics, truthful capabilities, and snapshot/delta delivery on Ferris's existing WebSocket. Catalog-known inactive Binance/Bybit/Extended perps remain selectable with implemented fields unavailable / `inactive-market`; supported selected spot funding is not applicable. This is backend work in Ferris; do not modify the sibling Lattice frontend.
+**Approved execution scope: Hyperliquid primary-DEX active perpetuals, Binance USDⓈ-M active `PERPETUAL` markets, Lighter native perpetual statistics, Bybit linear/inverse perpetuals, Extended exact `PERPETUAL` markets, and Aster V3 exact `PERPETUAL` markets.** Hyperliquid, Binance, Bybit, Extended, and Aster use shared 30-second REST polling; Lighter uses native `market_stats` WebSocket acquisition through the same coordinator. Deliver exchange-wide and selected-market statistics, truthful capabilities, and snapshot/delta delivery on Ferris's existing WebSocket. Catalog-known inactive Binance/Bybit/Extended/Aster perps remain selectable with implemented fields unavailable / `inactive-market`; supported selected spot funding is not applicable. This is backend work in Ferris; do not modify the sibling Lattice frontend.
 
 This active specification supersedes the older research below. Retained sections 2–9 and 11 are historical evidence and deferred design research, not executable tasks or a statement of current implementation. Their venue recipes, broad model proposals, history endpoints, native-stream options, and illustrative wire examples do not expand this slice. The exact active contract below wins wherever retained research differs. The old Hyperliquid native-stream recommendation is superseded by shared polling; Binance likewise uses the shipped Hyperliquid coordinator and wire contract rather than a native upstream statistics stream.
 
@@ -11,7 +11,7 @@ This active specification supersedes the older research below. Retained sections
 | [x] | `hyperliquid` | Primary-DEX active perps; selected spot funding explicitly not applicable | **COMPLETE: deterministic and live checks passed** |
 | [x] | `binance` | USDⓈ-M active exact `contractType: PERPETUAL`; selected inactive perps allowed | **COMPLETE: deterministic and live checks passed** |
 | [x] | `bybit` | Linear/inverse exact perpetual contracts; active non-prelisting enumeration, selected known inactive perps | **COMPLETE: deterministic and live REST/WS checks passed** |
-| [ ] | `aster` | Not selected for implementation | Deferred |
+| [x] | `aster` | V3 exact `PERPETUAL`, native quote/settlement variants; active enumeration and selected known inactive perps | **COMPLETE: deterministic and live REST/WS checks passed** |
 | [x] | `extended` | Exact `PERPETUAL`, order-book/RFQ crypto/RWA; active enumeration and selected known inactive perps | **COMPLETE: deterministic and live REST/WS checks passed** |
 | [x] | `lighterxyz` | Native Lighter perpetual market stats; selected spot funding not applicable | **COMPLETE: focused deterministic and bounded live checks passed** |
 
@@ -30,9 +30,52 @@ Binance completion gates:
 - [x] Capabilities advertise only implemented Binance fields and shared-polling freshness.
 - [x] Focused deterministic tests, full Rust tests, formatting, and live Binance REST smoke pass.
 
-**Current ledger status:** Hyperliquid, Binance, Lighter, Bybit, and Extended are complete for their approved slices. Aster is the only remaining deferred exchange and remains unsupported for market statistics. No frontend implementation or funding-history endpoint is added.
+**Current ledger status:** Hyperliquid, Binance, Lighter, Bybit, Extended, and Aster are complete for their approved slices. All six venue integrations in this ledger are delivered. No frontend implementation or funding-history endpoint is added; broader fields and historical/native-stream research remain outside these slices.
 
-Aster must remain unsupported until explicitly selected and verified. The exchange contracts below use the shipped API/coordinator; retained research does not expand their scope.
+The exchange contracts below use the shipped API/coordinator; retained research does not expand their scope. Aster's initial integration uses shared polling, superseding its historical native-stream proposal.
+
+### Active Aster contract (completed selected slice)
+
+- **Identity/catalog:** Share unfiltered `GET /fapi/v3/exchangeInfo` [A1] between catalog and statistics. Only exact `contractType: PERPETUAL` rows receive statistics identities. Empty-string pending contract types and dated contracts are excluded, not promoted to perpetuals. Validate unique, nonempty native symbols and required perpetual metadata before accepting a catalog; malformed/empty catalogs are incomplete, not authoritative deletions. Active means `status: TRADING`; known other perpetuals remain explicitly selectable. IDs are opaque compact JSON strings such as `["aster","perp",null,null,"BTCUSDT"]`; category/DEX are null. Preserve native symbols, Unicode, punctuation, base/quote denominations, and native `marginAsset` for both settlement fields. Missing/invalid margin assets stay null with `settlement-unresolved`. Keep existing ASCII display-symbol forms, but never sanitize identity or price denominations; previously omitted Unicode markets must be represented.
+- **Selection:** Accept only null/`{}`, canonicalized to `{}`; no category/DEX/coin/symbol shortcuts. Omitted IDs enumerate active perpetuals; explicit selections use 1–100 catalog-issued perpetual IDs. Invalid/foreign/noncanonical/product-incompatible IDs fail before acquisition. Unknown is 400 only with a complete catalog; unresolved membership during catalog failure is 502. Inactive implemented fields are `unavailable` / `inactive-market`.
+- **Funding:** Use only symbol-less V3 `premiumIndex.lastFundingRate`, preserving its exact decimal-fraction string with `kind: estimate`, `rateUnit: decimalFraction`, and null `paymentTimestamp`. Positive native integer `nextFundingTime` and `time` are millisecond next-payment and exchange timestamps; invalid timestamps stay null. This evolving upcoming rate is not last-settled funding. Use the same-symbol V3 `fundingInfo.fundingIntervalHours`, a positive integer with checked hour-to-millisecond conversion, for rate/payment intervals and simple-linear display equivalents. No venue-wide eight-hour default, interest-rate-derived interval, or inference from countdowns. Missing/invalid/failed configuration leaves intervals/equivalents null without discarding a valid rate; report `funding-interval-unavailable` for missing/invalid active-market configuration, or the endpoint failure. Fresh configuration replaces the old schedule rather than retaining a guessed one.
+- **Funding boundaries:** Use the existing estimate payment-boundary expiry: crossing the advertised next payment marks only retained funding `stale` / `funding-payment-passed` using source clock plus monotonic elapsed time. Preserve values/receipts, do not invent settlement, and keep sibling prices available until their own expiry. A fresh upcoming observation restores availability.
+- **Retained observations:** When the premium observation itself is missing/failed, retain the complete prior funding value with its original interval basis and receipts, explicitly stale. New configuration cannot retroactively rescale an old rate. Configuration changes or failures affect normalization of the currently observed/cached premium body without renewing that body's receipt.
+- **Prices/limitations:** Support exact positive mark/index decimal strings with native base/quote denominations independent of settlement. Present invalid/missing scalars explicitly clear only their own field. Last-settled funding, last price, volume, open interest, and history remain unsupported / `adapter-not-implemented`. No ticker acquisition, per-market calls, quantity models, private endpoints, or native statistics WebSocket is added.
+- **Acquisition/freshness:** Reuse the adapter HTTP client with three independent, shared, single-flight 30-second success/failure caches for V3 `exchangeInfo`, `premiumIndex`, and `fundingInfo`. Public calls need no credentials. REST catalog, REST all/selected statistics, and Ferris WS share acquisition. Each endpoint captures wall/monotonic receipt immediately on HTTP/JSON completion, before normalization or awaiting siblings. Schedule the earliest cache deadline; consumer reads never renew source receipts. No reader/writer cache lock crosses network awaits. Only the coordinator retains previous normalized membership and stale values after failures. Missing mark rows retain stale values with original per-field receipts; duplicate/malformed mark batches cannot reassociate values. Explicit clears cannot be resurrected. The independent 90-second stale timer remains live during pending HTTP work. `ASTER_BASE_URL` defaults to `https://fapi.asterdex.com`.
+- **Capabilities/wire:** Advertise only delivered perpetual funding/mark/index support, `sharedPolling`, `pollIntervalMs: 30000`, `staleAfterMs: 90000`, estimate semantics, and null venue-wide intervals. Keep ordered acknowledgements/snapshots, contiguous generation/revision deltas, coalescing, unsubscribe, and demand leases unchanged.
+
+#### Aster qualification evidence
+
+[A1] specifies the V3 bulk routes, exact native identity/settlement fields, integer funding intervals, and native funding/time scalars. Official funding rules [A3] define the interval-adjusted formula, variable schedules, and the funding amount as position size × mark price × rate. The production real-time funding table [A4] renders `Number(lastFundingRate) * 100` as a percentage, directly alongside `fundingIntervalHours` and a `nextFundingTime` countdown. This establishes decimal-fraction units independently of observed magnitudes.
+
+An unauthenticated bounded V3 capture returned 602 catalog rows: 597 exact perpetuals (581 trading, 16 settling), plus five pending rows with empty contract type. Native quote/settlement pairs were USDT/USDT (584), USD1/USD1 (11), and U/U (2). Both bulk statistics endpoints returned 752 rows, including native markets outside the supported catalog; all 581 active catalog perpetuals had mark and funding-config coverage. Their intervals were 1h (51), 4h (344), and 8h (186). These counts are observations, not fixtures. Five native Unicode bases and `B-MONEY` establish why ASCII display sanitization must not drive identity or price denomination.
+
+The bulk BANKUSDT observation at `1789887194000` had rate `-0.00074088`; a later V3 observation at `1789887460000` had `-0.00075105`, with the same future payment boundary `1789891200000`. History's latest BANKUSDT entry was `0.00003350` at `1789876800000`. BTC's current `0.00010000` likewise differed from its latest historical `0.00009408`. Together with the official current-rate/countdown presentation and funding formula, these distinguish an evolving estimate from finalized history. History probes qualify semantics only; they are not runtime acquisition or a new endpoint.
+
+#### Aster acceptance gates
+
+- [x] Native catalog/statistics IDs, Unicode/display collisions, quote/settlement variants, product filtering, inactive selection, and strict scope agree.
+- [x] Exact funding/price scalars, variable intervals and overflow, null/invalid timestamps, payment-boundary expiry, and unsupported fields follow the contract.
+- [x] Concurrent catalog/REST/WS demand shares receipt-based acquisition; incomplete catalogs, sparse/malformed statistics, failures, explicit clears, in-flight stale expiry, recovery, and authoritative removals preserve state correctly.
+- [x] Actual-server REST and ordered WS snapshot/delta/unsubscribe smoke, legacy Aster endpoints, and full Rust validation pass.
+
+#### Aster delivery and verification record
+
+`cargo test --test market_stats aster -- --nocapture` passed all eight Aster scenarios. `cargo test --all-targets` passed 203 tests with 5 ignored. `cargo fmt --all`, `cargo fmt --all -- --check`, and `cargo build --bin ferris-market-data-backend` passed. `cargo clippy --all-targets` completed with warnings elsewhere in the tree; no Aster-specific warning was emitted. Deterministic localhost scenarios cover native identity/display collisions and denominations; strict REST/WS selection; exact scalars and checked interval/timestamp boundaries; concurrent bulk acquisition; sparse/failed/malformed observations, clears and authoritative removals; independent endpoint receipt/failure deadlines; and payment-boundary/90-second stale expiry during pending HTTP work.
+
+The temporary actual server used `HOST=127.0.0.1`, `PORT=8788`, `TRADE_COLLECTOR_ENABLED=false`, and `REQUEST_TIMEOUT_MS=15000`, separate from staging. `bun scripts/aster_market_stats_smoke.ts` exercised capability discovery, catalog/statistics agreement, selected/inactive/invalid requests, exact funding/prices and derived intervals, ordered WS acknowledgement/snapshot, contiguous deltas, next-poll receipts, REST convergence, and unsubscribe. It produced:
+
+```text
+PASS Aster REST: 581 active / 597 catalog perps; intervals=1/4/8h; BTC rate=0.00010000, intervalMs=28800000; USDT/USD1/U, Unicode and punctuation preserved
+PASS Aster WS: ordered ack/snapshot, contiguous deltas (all=1, selected=1), next-poll receipts, all/selected REST convergence, unsubscribe
+PASS Aster capabilities, native identity/settlement, exact estimate funding/prices, variable intervals, inactive and invalid selection
+```
+
+`python3 scripts/smoke_endpoints.py --base-url http://127.0.0.1:8788 --exchange aster --markets-exchange aster --symbol BTC/USDT:USDT --timeout 25 --wait-seconds 0` also passed health, trades (5 rows), OHLCV (3 rows), order book, and the active Aster catalog (581 rows). Counts/rates are observations, not constants or unit-basis evidence. The temporary server exited cleanly and its throwaway client was removed; staging was not restarted. No frontend implementation files were changed.
+
+[A3]: https://docs.asterdex.com/trading/perpetuals/fees-and-specs/funding-rate.md
+[A4]: https://static2.asterdexfx.com/assets/_-_locale_.futures.futures-info.real-time-funding-rate-C8TW2j0Z.js
 
 ### Active Extended contract (completed selected slice)
 

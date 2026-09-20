@@ -7,14 +7,17 @@ use serde_json::Value;
 
 use crate::{
     binance_orderbook::{BinanceDepthLevel, BinanceDepthSnapshot, OrderBookSnapshotProvider},
-    exchanges::traits::{ExchangeError, MarketDataExchange},
+    exchanges::traits::{ExchangeError, MarketDataExchange, MarketStatsSource},
+    market_stats::make_market_id,
     models::{
         CcxtOhlcv, CcxtOrderBook, CcxtTrade, FetchMarketsParams, FetchOhlcvParams,
-        FetchOrderBookParams, FetchTradesParams, UnifiedMarket, UnifiedMarketInfo,
+        FetchOrderBookParams, FetchTradesParams, MarketIdentity, UnifiedMarket, UnifiedMarketInfo,
         UnifiedMarketType,
     },
     ws_shared::{resolve_aster_ws_symbol, resolve_public_symbol as public_symbol, ASTER_QUOTES},
 };
+
+mod statistics;
 
 const ASTER_REST_BASE_URL: &str = "https://fapi.asterdex.com";
 const DEFAULT_FETCH_TRADES_LIMIT: usize = 100;
@@ -26,21 +29,31 @@ const MAX_FETCH_ORDER_BOOK_LEVELS: usize = 1_000;
 
 pub struct AsterExchange {
     http_client: reqwest::Client,
+    base_url: String,
+    statistics_cache: statistics::AsterStatisticsCache,
 }
 
 impl AsterExchange {
     pub fn new(timeout_ms: u64) -> Result<Self, ExchangeError> {
+        Self::with_base_url(ASTER_REST_BASE_URL.to_string(), timeout_ms)
+    }
+
+    pub fn with_base_url(base_url: String, timeout_ms: u64) -> Result<Self, ExchangeError> {
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_millis(timeout_ms))
             .build()
             .map_err(|err| {
                 ExchangeError::Internal(format!("failed to build Aster REST client: {err}"))
             })?;
-        Ok(Self { http_client })
+        Ok(Self {
+            http_client,
+            base_url: base_url.trim_end_matches('/').to_string(),
+            statistics_cache: Default::default(),
+        })
     }
 
     async fn get(&self, path: &str, query: &[(&str, String)]) -> Result<Value, ExchangeError> {
-        let url = format!("{ASTER_REST_BASE_URL}{path}");
+        let url = format!("{}{path}", self.base_url);
         let response = self
             .http_client
             .get(url)
@@ -105,6 +118,10 @@ impl AsterExchange {
 impl MarketDataExchange for AsterExchange {
     fn id(&self) -> &'static str {
         "aster"
+    }
+
+    fn market_stats_source(&self) -> Option<&dyn MarketStatsSource> {
+        Some(self)
     }
 
     async fn fetch_trades(
@@ -206,16 +223,12 @@ impl MarketDataExchange for AsterExchange {
         &self,
         params: FetchMarketsParams,
     ) -> Result<Vec<UnifiedMarket>, ExchangeError> {
-        let value = self.get("/fapi/v3/exchangeInfo", &[]).await?;
-        let rows = value
-            .get("symbols")
-            .and_then(Value::as_array)
-            .ok_or_else(|| {
-                ExchangeError::UpstreamData("Aster exchangeInfo missing symbols".to_string())
-            })?;
-        Ok(rows
+        let observation = self.cached_exchange_info().await;
+        let markets = observation.result.as_ref().map_err(Clone::clone)?;
+        Ok(markets
             .iter()
-            .filter_map(|row| map_market(row, params.include_inactive))
+            .filter(|market| params.include_inactive || market.active)
+            .cloned()
             .collect())
     }
 }
@@ -401,37 +414,62 @@ fn map_exact_levels(
         .collect()
 }
 
-fn map_market(row: &Value, include_inactive: bool) -> Option<UnifiedMarket> {
-    if row.get("contractType").and_then(Value::as_str) != Some("PERPETUAL") {
-        return None;
+fn map_market(row: &Value) -> Result<Option<UnifiedMarket>, ExchangeError> {
+    if !row.is_object() {
+        return Err(statistics::invalid_data(
+            "exchangeInfo contains a nonobject row",
+        ));
     }
-    let symbol = row.get("symbol").and_then(Value::as_str)?.trim();
-    let base = sanitize_asset(row.get("baseAsset").and_then(Value::as_str)?).ok()?;
-    let quote = sanitize_asset(row.get("quoteAsset").and_then(Value::as_str)?).ok()?;
-    let active = row.get("status").and_then(Value::as_str) == Some("TRADING");
-    if !include_inactive && !active {
-        return None;
+    let native = statistics::required_string(row, "symbol")?;
+    let contract_type = row
+        .get("contractType")
+        .and_then(Value::as_str)
+        .filter(|value| value.trim() == *value)
+        .ok_or_else(|| statistics::invalid_data("market has invalid contractType"))?;
+    // Pending empty-string types and dated contracts are known nonperpetual products.
+    if contract_type != "PERPETUAL" {
+        return Ok(None);
     }
-    let min_order_size = filter_number(row, "LOT_SIZE", "minQty");
-    let tick_size = filter_number(row, "PRICE_FILTER", "tickSize");
-    Some(UnifiedMarket {
-        identity: None,
+    let base = statistics::required_string(row, "baseAsset")?;
+    let quote = statistics::required_string(row, "quoteAsset")?;
+    let status = statistics::required_string(row, "status")?;
+    let settle = row
+        .get("marginAsset")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.trim() == *value);
+    let display_asset = |asset: &str| {
+        if asset.is_ascii() {
+            sanitize_asset(asset).unwrap_or_else(|_| asset.to_string())
+        } else {
+            asset.to_string()
+        }
+    };
+    Ok(Some(UnifiedMarket {
+        identity: Some(MarketIdentity {
+            market_id: make_market_id("aster", UnifiedMarketType::Perp, None, None, native)?,
+            exchange_market_id: native.to_string(),
+            category: None,
+            dex: None,
+            contract_type: Some(contract_type.to_string()),
+            settle: settle.map(str::to_string),
+            settlement_asset_id: settle.map(str::to_string),
+        }),
         exchange: "aster".to_string(),
-        symbol: format!("{base}/{quote}"),
-        base,
-        quote,
+        symbol: format!("{}/{}", display_asset(base), display_asset(quote)),
+        base: base.to_string(),
+        quote: quote.to_string(),
         market_type: UnifiedMarketType::Perp,
-        active,
-        min_order_size,
-        tick_size,
+        active: status == "TRADING",
+        min_order_size: filter_number(row, "LOT_SIZE", "minQty"),
+        tick_size: filter_number(row, "PRICE_FILTER", "tickSize"),
         contract_size: Some(1.0),
         info: UnifiedMarketInfo {
             category: Some("futures".to_string()),
-            raw_symbol: Some(symbol.to_string()),
-            exchange_symbol: Some(symbol.to_string()),
+            raw_symbol: Some(native.to_string()),
+            exchange_symbol: Some(native.to_string()),
             ..Default::default()
         },
-    })
+    }))
 }
 
 fn filter_number(row: &Value, kind: &str, field: &str) -> Option<f64> {
@@ -511,17 +549,16 @@ mod tests {
     #[test]
     fn filters_perpetual_markets() {
         let mut row = serde_json::json!({"symbol":"BTCUSDT","contractType":"PERPETUAL","status":"TRADING","baseAsset":"BTC","quoteAsset":"USDT","filters":[{"filterType":"LOT_SIZE","minQty":"0.001"},{"filterType":"PRICE_FILTER","tickSize":"0.1"}]});
-        let market = map_market(&row, false).unwrap();
+        let market = map_market(&row).unwrap().unwrap();
         assert_eq!(market.symbol, "BTC/USDT");
         assert_eq!(market.min_order_size, Some(0.001));
         assert_eq!(market.tick_size, Some(0.1));
         row["status"] = serde_json::json!("PENDING_TRADING");
-        assert!(map_market(&row, false).is_none());
-        assert!(!map_market(&row, true).unwrap().active);
+        assert!(!map_market(&row).unwrap().unwrap().active);
         row["contractType"] = serde_json::json!("");
-        assert!(map_market(&row, true).is_none());
+        assert!(map_market(&row).unwrap().is_none());
         row["contractType"] = serde_json::json!("CURRENT_QUARTER");
-        assert!(map_market(&row, true).is_none());
+        assert!(map_market(&row).unwrap().is_none());
     }
 
     #[test]

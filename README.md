@@ -10,7 +10,7 @@ Frontend integration guidance lives in `INTEGRATION_README.md`.
 - backend websocket fanout for realtime channels (`GET /v1/ws`)
 - pluggable exchange adapter architecture
 - market-data support for `hyperliquid`, `binance`, `bybit`, `aster`, `extended`, and `lighterxyz` perpetuals
-- shared upstream websocket topics for trades/books/candles; Hyperliquid, Binance, Bybit, and Extended statistics use shared 30-second REST polling, while Lighter marketstats uses its native WebSocket through the coordinator
+- shared upstream websocket topics for trades/books/candles; Hyperliquid, Binance, Bybit, Extended, and Aster statistics use shared 30-second REST polling, while Lighter marketstats uses its native WebSocket through the coordinator
 - background websocket trade collector with in-memory ring buffer for deeper snapshot history
 
 ## Why this exists
@@ -37,7 +37,7 @@ Frontend apps (including Electron and web frontends) often cannot directly use s
   - `POST /v1/fetchOHLCV`
   - `POST /v1/fetchOrderBook`
   - `POST /v1/fetchMarkets`
-- `POST /v1/fetchMarketStats` (Hyperliquid primary perps, Binance USDⓈ-M PERPETUAL markets, Bybit linear/inverse perpetuals, Extended perpetuals, and Lighter perpetual marketstats)
+- `POST /v1/fetchMarketStats` (Hyperliquid primary perps, Binance USDⓈ-M PERPETUAL markets, Bybit linear/inverse perpetuals, Extended and Aster perpetuals, and Lighter perpetual marketstats)
 - Capability discovery: `GET /v1/capabilities` (no upstream acquisition)
 - Realtime endpoint:
   - `GET /v1/ws` (channels `trades`, `orderbook`, `ohlcv`, `marketstats`)
@@ -45,13 +45,13 @@ Frontend apps (including Electron and web frontends) often cannot directly use s
   - `trades`: `hyperliquid`, `binance`, `bybit`, `aster`, `extended`
   - `orderbook`: `hyperliquid`, `binance`, `bybit`, `aster`, `extended`
   - `ohlcv`: `binance`, `bybit`, `aster`, `extended`
-  - `marketstats`: `hyperliquid`, `binance`, `bybit`, `extended` (`sharedPolling`), `lighterxyz` (`nativeWebSocket`); Aster remains unsupported
+  - `marketstats`: `hyperliquid`, `binance`, `bybit`, `extended`, `aster` (`sharedPolling`), `lighterxyz` (`nativeWebSocket`)
 - exchange supported:
   - `hyperliquid` (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`, `fetchMarkets`, `fetchMarketStats`)
   - `binance` (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`, `fetchMarkets`, `fetchMarketStats` for USDⓈ-M perpetuals)
   - `lighterxyz` (`fetchMarkets`, `fetchMarketStats` for native perpetual marketstats; no unrelated realtime trade/OHLCV claim)
   - `bybit` (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`, `fetchMarkets`, `fetchMarketStats` for linear/inverse perpetuals)
-  - `aster` futures/perpetual markets (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`, `fetchMarkets`; marketstats unsupported)
+  - `aster` perpetual markets (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`, `fetchMarkets`, `fetchMarketStats`)
   - `extended` perpetual public market data: all five snapshot endpoints plus realtime trades, order books, OHLCV, and marketstats
 - Extended accepts `BASE-USD`, `BASE/USD`, and `BASE/USD:USD`; trade/book/realtime responses use `BASE/USD:USD`. The market catalog uses `BASE/USD`, consistent with the shared catalog contract.
 - Extended's standard websocket order book is indicative, not the RFQ real-book stream. Spot, private trading/account, funding history, and account streams are not supported.
@@ -144,7 +144,7 @@ Response body (CCXT-like `OHLCV[]`):
 
 `GET /v1/ws`
 
-The websocket endpoint supports `trades`, `orderbook`, `ohlcv`, and `marketstats`. The first three share upstream exchange streams. Hyperliquid, Binance, Bybit, and Extended statistics use shared REST acquisition; Lighter statistics use its native WebSocket through the coordinator. All statistics use the snapshot/delta contract below.
+The websocket endpoint supports `trades`, `orderbook`, `ohlcv`, and `marketstats`. The first three share upstream exchange streams. Hyperliquid, Binance, Bybit, Extended, and Aster statistics use shared REST acquisition; Lighter statistics use its native WebSocket through the coordinator. All statistics use the snapshot/delta contract below.
 
 Subscribe command:
 
@@ -341,9 +341,9 @@ Response body (CCXT-like `OrderBook`):
 
 `POST /v1/fetchMarkets`
 
-Snapshot endpoint for exchange symbols/market metadata. Display symbols use `BASE/QUOTE` format without a settlement suffix like `:USDT`. Bybit and Extended preserve native catalog asset names, including punctuation, Unicode, and case; do not normalize them into statistics identities.
+Snapshot endpoint for exchange symbols/market metadata. Display symbols use `BASE/QUOTE` format without a settlement suffix like `:USDT`. Bybit, Extended, and Aster preserve native catalog asset names, including punctuation, Unicode, and case; do not normalize them into statistics identities. Aster retains legacy ASCII display-symbol formatting, so distinct native markets can share a display symbol.
 
-Statistics-supported Hyperliquid, Binance, Bybit, Extended, and Lighter catalog rows include `marketId`, `exchangeMarketId`, `category`, `dex`, `contractType`, `settle`, and `settlementAssetId`. Use the opaque catalog-issued `marketId` to select statistics; never derive it from display symbols. Hyperliquid primary perps have `dex: ""`; Binance USDⓈ-M perps have `category: null`, `dex: null`, and `contractType: "PERPETUAL"`. Binance IDs are exact JSON tuples such as `["binance","perp",null,null,"BTCUSDT"]`; native punctuation and Unicode are preserved. Binance settlement and `settlementAssetId` come from `marginAsset`, or are null when unresolved. Bybit perpetual IDs contain `category: "linear"` or `"inverse"`, `dex: null`, and the native contract type; settlement comes from `settleCoin`. Extended IDs preserve native names such as `["extended","perp",null,null,"BTC-USD"]`; native collateral name/ID supply settlement, and `info.isRfq`/`info.isOffHours` preserve execution metadata when present. Lighter IDs use numeric native market IDs as strings. Unsupported adapters/products omit the identity extension.
+Statistics-supported Hyperliquid, Binance, Bybit, Extended, Aster, and Lighter catalog rows include `marketId`, `exchangeMarketId`, `category`, `dex`, `contractType`, `settle`, and `settlementAssetId`. Use the opaque catalog-issued `marketId` to select statistics; never derive it from display symbols. Hyperliquid primary perps have `dex: ""`; Binance USDⓈ-M perps have `category: null`, `dex: null`, and `contractType: "PERPETUAL"`. Binance IDs are exact JSON tuples such as `["binance","perp",null,null,"BTCUSDT"]`; native punctuation and Unicode are preserved. Binance settlement and `settlementAssetId` come from `marginAsset`, or are null when unresolved. Aster IDs likewise preserve native symbols, for example `["aster","perp",null,null,"BTCUSD1"]`, and use native `marginAsset` for both settlement fields. Bybit perpetual IDs contain `category: "linear"` or `"inverse"`, `dex: null`, and the native contract type; settlement comes from `settleCoin`. Extended IDs preserve native names such as `["extended","perp",null,null,"BTC-USD"]`; native collateral name/ID supply settlement, and `info.isRfq`/`info.isOffHours` preserve execution metadata when present. Lighter IDs use numeric native market IDs as strings. Unsupported products omit the identity extension.
 
 
 Request body:
@@ -459,9 +459,23 @@ Funding preserves `marketStats.fundingRate` as an exact `decimalFraction` string
 
 Catalog, REST statistics, and Ferris WS projections share one unfiltered `/info/markets` acquisition and 30-second success/failure cache; freshness expires at 90 seconds. Malformed catalogs retain known membership as incomplete. Missing/nonobject `marketStats` retains only that row's prior values stale; explicit invalid scalars clear only their fields. The existing Ferris snapshot/delta protocol is used, not a native Extended statistics WebSocket. `EXTENDED_REST_BASE_URL` configures the backend source.
 
+### Aster Market Statistics
+
+Aster statistics cover exact V3 `PERPETUAL` contracts. All-market requests enumerate `status: TRADING`; selected catalog-known inactive perpetuals report implemented fields as `unavailable` / `inactive-market`. Pending empty contract types, dated futures, and spot are excluded.
+
+```json
+{"exchange":"aster","fields":["funding","markPrice","indexPrice"],"params":{}}
+```
+
+Send this body to `POST /v1/fetchMarketStats`. Only null/empty params are accepted; no symbol, coin, category, or DEX shortcuts. Select using catalog-issued IDs such as `["aster","perp",null,null,"BTCUSDT"]`. Native symbols, Unicode, punctuation, and quote variants remain distinct. Native base/quote assets qualify prices independently of `marginAsset`, which supplies `settle` and `settlementAssetId`; unresolved settlement stays null with `settlement-unresolved`.
+
+Funding preserves `premiumIndex.lastFundingRate` as an exact decimal-fraction string with `kind: estimate`, not last-settled funding. Per-market `fundingInfo.fundingIntervalHours` supplies rate/payment intervals and simple-linear percentage equivalents; observed schedules include 1h, 4h, and 8h. Missing/invalid/failed configuration leaves intervals/equivalents null without losing a valid rate. `paymentTimestamp` is null; native `nextFundingTime` supplies the upcoming payment timestamp and `time` supplies the exchange timestamp. Crossing that payment boundary makes an old estimate `stale` / `funding-payment-passed`, never settled.
+
+Unfiltered V3 `exchangeInfo`, `premiumIndex`, and `fundingInfo` have independent shared 30-second success/failure caches. Catalog, REST statistics, and Ferris WS use the same acquisition; observations expire after 90 seconds, including during pending HTTP work. Missing/failed premium observations retain prior values and original receipts stale, including their original funding interval basis; fresh configuration cannot rescale a missing old rate. Explicit invalid scalars clear only their own fields. Mark/index prices preserve positive native decimal strings. Last-settled funding, last price, volume, open interest, and history remain unsupported. `ASTER_BASE_URL` defaults to `https://fapi.asterdex.com`; no native statistics WebSocket is added.
+
 ### Market Statistics and Capabilities
 
-`GET /v1/capabilities` enumerates registered adapters without fetching upstream data. Hyperliquid, Binance, Bybit, Extended, and Lighter advertise statistics support; Aster remains unsupported for marketstats; funding history remains unsupported everywhere. Runtime failures do not change capabilities.
+`GET /v1/capabilities` enumerates registered adapters without fetching upstream data. Hyperliquid, Binance, Bybit, Extended, Aster, and Lighter advertise statistics support; funding history remains unsupported everywhere. Runtime failures do not change capabilities.
 
 `POST /v1/fetchMarketStats`:
 
@@ -471,21 +485,21 @@ Catalog, REST statistics, and Ferris WS projections share one unfiltered `/info/
 
 For Binance, use the same shape with `"exchange":"binance"`, exact catalog-issued Binance `marketId` values, and only `params: null` or `{}`. Binance is USDⓈ-M `PERPETUAL` only; active all-market enumeration and selected known inactive perp IDs follow the catalog and field-state rules above.
 
-Omitted/null `marketIds` selects all active supported perpetuals for the requested exchange/scope. For selected markets, pass exact catalog-issued ID strings (1–100 inputs, case-sensitive; duplicates removed). Binance/Bybit/Extended selections are perpetual IDs only; Hyperliquid/Lighter also accept their supported spot identities. Omitted/null `fields` means `["funding"]`; empty lists are invalid. Params accept null/`{}`, Hyperliquid's `{"dex":""}`, or Bybit's `{"category":"linear"}` / `{"category":"inverse"}` as appropriate. Bybit defaults to linear and rejects cross-category IDs. REST rejects unknown top-level keys, including `symbol`. Unknown IDs require a complete corresponding catalog; incomplete catalog identity yields 502, not a fabricated 400.
+Omitted/null `marketIds` selects all active supported perpetuals for the requested exchange/scope. For selected markets, pass exact catalog-issued ID strings (1–100 inputs, case-sensitive; duplicates removed). Binance/Bybit/Extended/Aster selections are perpetual IDs only; Hyperliquid/Lighter also accept their supported spot identities. Omitted/null `fields` means `["funding"]`; empty lists are invalid. Params accept null/`{}`, Hyperliquid's `{"dex":""}`, or Bybit's `{"category":"linear"}` / `{"category":"inverse"}` as appropriate. Bybit defaults to linear and rejects cross-category IDs. REST rejects unknown top-level keys, including `symbol`. Unknown IDs require a complete corresponding catalog; incomplete catalog identity yields 502, not a fabricated 400.
 
-Response: `{timestamp, scope, markets, coverage}`. Scope is exchange-specific: Hyperliquid has `params: {"dex":""}`, Binance/Extended/Lighter have `{}`, and Bybit has the canonical `{"category":"linear"}` or `{"category":"inverse"}`. Rows flatten catalog columns and add only requested `fields`. Coverage contains `expectedMarkets`, `returnedMarkets`, `enumerationComplete`, and `sourceFailures`. Cold all-market upstream failure returns 200 with no rows, null expected count, incomplete enumeration, and explicit failures. Known membership is retained on failure. Registered deferred adapters return 501 / `UNSUPPORTED_FEATURE`; errors use flat `{code,message}`.
+Response: `{timestamp, scope, markets, coverage}`. Scope is exchange-specific: Hyperliquid has `params: {"dex":""}`, Binance/Extended/Aster/Lighter have `{}`, and Bybit has the canonical `{"category":"linear"}` or `{"category":"inverse"}`. Rows flatten catalog columns and add only requested `fields`. Coverage contains `expectedMarkets`, `returnedMarkets`, `enumerationComplete`, and `sourceFailures`. Cold all-market upstream failure returns 200 with no rows, null expected count, incomplete enumeration, and explicit failures. Known membership is retained on failure. An adapter without statistics support returns 501 / `UNSUPPORTED_FEATURE`; errors use flat `{code,message}`.
 
-Each field is `{state,value,reason,exchangeTimestamp,receivedTimestamp,source}`. Available funding and its supported capability have `reason: null`; unsupported, inactive, stale, and upstream-error reasons remain meaningful. Hyperliquid and Extended use an hourly `decimalFraction` basis; Binance and Bybit use `decimalFraction` with qualified per-market intervals; Lighter uses an hourly `percent` basis. Funding values include the native `rate`, explicit `rateUnit`, qualified `rateIntervalMs`, payment schedule when known, and optional `equivalents`:
+Each field is `{state,value,reason,exchangeTimestamp,receivedTimestamp,source}`. Available funding and its supported capability have `reason: null`; unsupported, inactive, stale, and upstream-error reasons remain meaningful. Hyperliquid and Extended use an hourly `decimalFraction` basis; Binance, Bybit, and Aster use `decimalFraction` with qualified per-market intervals; Lighter uses an hourly `percent` basis. Funding values include the native `rate`, explicit `rateUnit`, qualified `rateIntervalMs`, payment schedule when known, and optional `equivalents`:
 
 ```json
 {"rate":"-0.0003","rateUnit":"percent","kind":"estimate","rateIntervalMs":3600000,"paymentIntervalMs":3600000,"paymentTimestamp":null,"nextPaymentTimestamp":null,"equivalents":{"oneHourPercent":"-0.0003","eightHourPercent":"-0.0024","oneDayPercent":"-0.0072","annualizedPercent":"-2.628"}}
 ```
 
 `equivalents` use decimal-string arithmetic and simple linear scaling. Missing/invalid intervals or arithmetic overflow leave equivalents null without discarding the exact native rate, including zero. Positive means longs pay shorts. Do not treat an equivalent interval as a separate funding event or compound the annualized value.
-- `markPrice`/`indexPrice` are mark/index observations with `{amount,baseAsset,quoteAsset}`. Binance, Bybit, and Extended use native catalog assets, independent of settlement. Hyperliquid's oracle quote is USDC for exact HYPE/PURR names, otherwise USDT. Never replace oracle/index with mid price.
-- Hyperliquid/Lighter selected spot funding/last-settled funding are `notApplicable`; Binance/Bybit/Extended spot IDs are rejected. Selected inactive perp observations are `unavailable` / `inactive-market`.
+- `markPrice`/`indexPrice` are mark/index observations with `{amount,baseAsset,quoteAsset}`. Binance, Bybit, Extended, and Aster use native catalog assets, independent of settlement. Hyperliquid's oracle quote is USDC for exact HYPE/PURR names, otherwise USDT. Never replace oracle/index with mid price.
+- Hyperliquid/Lighter selected spot funding/last-settled funding are `notApplicable`; Binance/Bybit/Extended/Aster spot IDs are rejected. Selected inactive perp observations are `unavailable` / `inactive-market`.
 - Perp `volume24h`/`openInterest` remain unsupported. Bybit, Extended, and Lighter implement `lastPrice`; only Lighter implements perp `lastSettledFunding`. Spot non-funding fields remain unsupported.
-- One shared acquisition every 30 seconds per exchange/scope (per category on Bybit) serves HTTP and WS clients; Hyperliquid spot metadata and Binance funding-info metadata cache for five minutes. Field receipts change only on upstream observation, not reads. Failures immediately stale retained values; independent 90-second expiry also stales observations, including while a request is pending. Bybit estimates additionally stale at their advertised payment boundary. Explicit invalid scalars clear values and cannot be resurrected by later failures.
+- One shared acquisition every 30 seconds per exchange/scope (per category on Bybit) serves HTTP and WS clients; Hyperliquid spot metadata and Binance funding-info metadata cache for five minutes. Field receipts change only on upstream observation, not reads. Failures immediately stale retained values; independent 90-second expiry also stales observations, including while a request is pending. Bybit and Aster estimates additionally stale at their advertised payment boundary. Explicit invalid scalars clear values and cannot be resurrected by later failures.
 - HTTP requests renew a 90-second demand lease; WS subscriptions hold persistent reference-counted demand. Idle workers stop. Capabilities disclose these limits and receipt-time freshness.
 
 Statistics socket subscription (no `symbol`; `funding` is not a channel alias):
@@ -551,6 +565,7 @@ Defaults:
 - `HYPERLIQUID_BASE_URL` (default: `https://api.hyperliquid.xyz`)
 - `BINANCE_BASE_URL` (default: `https://fapi.binance.com`)
 - `BYBIT_BASE_URL` (default: `https://api.bybit.com`)
+- `ASTER_BASE_URL` (default: `https://fapi.asterdex.com`)
 - `EXTENDED_REST_BASE_URL` (default: `https://api.starknet.extended.exchange/api/v1`)
 - `EXTENDED_WS_URL` (default: `wss://api.starknet.extended.exchange/stream.extended.exchange/v1`)
 - `REQUEST_TIMEOUT_MS` (default: `10000`)
@@ -772,7 +787,7 @@ Aster supports perpetual futures market data only. REST order-book `limit` and r
 
 REST trades default to 100 rows (maximum 1000); OHLCV defaults to 200 candles (maximum 1500). `since` filters trades/candles, and OHLCV also accepts `params.until` or `params.endTime`. Market catalogs include only `PERPETUAL` contracts; `includeInactive` includes non-trading perpetuals, not pending rows without a contract type.
 
-For implementation purposes, Aster REST uses `https://fapi.asterdex.com` and websocket streams use `wss://fstream.asterdex.com/ws`. These are backend upstream details; frontend clients always connect through this backend's `/v1/ws` endpoint.
+For implementation purposes, Aster REST defaults to `https://fapi.asterdex.com` (configurable with `ASTER_BASE_URL`) and websocket streams use `wss://fstream.asterdex.com/ws`. These are backend upstream details; frontend clients always connect through this backend's `/v1/ws` endpoint. Statistics use shared V3 REST polling, not those native streams.
 
 The terminal viewer supports the same limits. For example:
 
