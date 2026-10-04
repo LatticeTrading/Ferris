@@ -2,6 +2,62 @@
 
 **For the agent writing the migration plan. This is not that plan.**
 
+**Implementation successor:** [FERRIS_V2_PLAN.md](FERRIS_V2_PLAN.md). It records the
+user's later coverage decisions, replacement/deletion map and implementation
+sequence. Its decisions supersede this handoff's suggestions about retaining
+native exceptions or preserving unsupported features; the technical findings
+below remain evidence, not a completed migration.
+
+**Current issue status:** [CCXT_KNOWN_ISSUES.md](CCXT_KNOWN_ISSUES.md) separates open
+upstream risks from implemented Phase 3 mitigations and fixed Ferris regressions,
+with reproduction evidence and closure checks. The historical unresolved-lifecycle
+statements and native source paths below predate that cutover; they are not a
+current implementation inventory.
+
+## Phase 4 statistics qualification — 2026-10-03
+
+The implementation/support contract now lives in [README.md](README.md#market-statistics-and-capabilities),
+its [numeric unit table](README.md#numeric-statistics-units), and the Phase 4 handoff
+in [FERRIS_V2_PLAN.md](FERRIS_V2_PLAN.md). Historical native paths below are references,
+not retained fallback transports.
+
+- Exact stock `4.5.85`: Binance `fetchTickers`, `fetchFundingRates`,
+  `fetchFundingIntervals`, selected `fetchOpenInterest`; options additionally use
+  `fetchMarkPrices` and implicit `eapiPublicGetIndex` once per catalog underlying.
+  Bybit bulk `fetchTickers` plus stock `parseOpenInterest`; Hyperliquid primary-DEX
+  `fetchTickers`; Aster funding/interval/ticker methods; Extended `fetchTickers`;
+  Lighter REST `fetchTickers` plus maintained Pro `watchTickers`.
+- User decisions: no Binance all-market OI sweep; selected-ID demand is shared.
+  Aster OI has no stock method. Lighter OI remains unsupported until stock supplies
+  qualified units; neither raw magnitude nor the unified field name establishes them.
+- Provenance is `{exchange}:ccxt:{method}`. Each stock response has its own receipt;
+  catalog/cache reads do not freshen values. Lighter REST cannot freshen silent live
+  funding/mark/index. Missing exchange time remains null. Funding/price strings
+  preserve raw spelling; only the two new metrics use nullable finite JSON numbers.
+- Binance `is_linear`/`is_inverse` prioritize subtype over type; a constructor's
+  linear default misrouted bulk spot/option tickers. Real backend reproduction
+  published fixture futures price `30001.20` for spot expected `500.00`. Product
+  owners now clear that subtype outside contracts, and option mark calls specify type.
+- Stock safe-number parsing can turn malformed OI into null. Ferris checks the
+  retained raw members for invalidity while keeping stock amount/value mapping;
+  genuine null stays missing, zero stays available, malformed/nonfinite clears the field.
+- [Binance option ticker volume](https://developers.binance.com/legacy-docs/derivatives/options-trading/market-data/24hr-Ticker-Price-Change-Statistics)
+  is contracts; [catalog `unit`](https://developers.binance.com/legacy-docs/derivatives/options-trading/market-data/Exchange-Information)
+  defines underlying quantity per contract. No contract conversion is performed:
+  base volume is null unless explicit unit is 1. OI preserves contracts and USD value.
+  Option ticker `exercisePrice` changes to an estimated settlement price near expiry;
+  the [stock index endpoint](https://developers.binance.com/legacy-docs/derivatives/options-trading/market-data/Symbol-Price-Ticker)
+  supplies an unambiguous index instead. Bybit option amount is base quantity with
+  [multiplier 1](https://www.bybit.com/en/learn/options/bybit-options-lesson-options-parameters-introduction).
+- Actual backend HTTP/WS smoke delivered statistics for Binance, Bybit, Hyperliquid,
+  Aster and Lighter. Extended loopback covered zero/null numeric deltas, invalid-value
+  clearing, failure retention, recovery and catalog removal; Lighter finite frames
+  followed by silence expired funding independently of REST volume. Extended's
+  accepted public API failure was not retried and remains unqualified.
+
+
+## Historical research handoff
+
 The direction is to replace Ferris's exchange-specific public market-data
 acquisition with **CCXT Rust / CCXT Pro**, reducing duplicated integration and
 maintenance work while retaining Ferris's product contract. Use these findings

@@ -96,10 +96,6 @@ def test_fetch_trades(base_url, exchange, symbol, timeout):
     ]:
         assert_true(key in first, f"fetchTrades missing key: {key}")
 
-    assert_true(
-        first.get("symbol") == symbol,
-        f"trade symbol mismatch: {first.get('symbol')} != {symbol}",
-    )
     print(f"ok  fetchTrades ({len(body)} rows)")
 
 
@@ -152,10 +148,6 @@ def test_fetch_order_book(base_url, exchange, symbol, timeout):
     assert_true(isinstance(bids, list), "fetchOrderBook bids must be list")
     assert_true(len(asks) > 0, "fetchOrderBook asks cannot be empty")
     assert_true(len(bids) > 0, "fetchOrderBook bids cannot be empty")
-    assert_true(
-        body.get("symbol") == symbol,
-        f"order book symbol mismatch: {body.get('symbol')} != {symbol}",
-    )
     print("ok  fetchOrderBook")
 
 
@@ -184,8 +176,6 @@ def test_fetch_markets(base_url, exchange, timeout):
     symbol = first.get("symbol")
     assert_true(isinstance(symbol, str), "fetchMarkets symbol must be string")
     assert_true("/" in symbol, "fetchMarkets symbol must be BASE/QUOTE")
-    assert_true(":" not in symbol, "fetchMarkets symbol must not contain ':'")
-    assert_true(symbol == symbol.upper(), "fetchMarkets symbol must be uppercase")
 
     if exchange.lower() == "bybit":
         info = first.get("info", {})

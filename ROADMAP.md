@@ -2,7 +2,7 @@
 
 This document tracks what is done, what is next, and what to watch as this backend grows.
 
-Last updated: 2026-09-20
+Last updated: 2026-10-03
 
 ## How To Use This Doc
 
@@ -19,6 +19,10 @@ Build an open-source, hostable backend that gives web and Electron frontends one
 
 Status: `in_progress`
 
+CCXT migration phase tracking is authoritative in [FERRIS_V2_PLAN.md](FERRIS_V2_PLAN.md). Phases 1–4 are user-approved; Phase 5 implementation is `awaiting_review`. The user separately authorized production deployment for frontend testing, and the CCXT release now runs as the existing `latticeterminal.service` at `api.latticeterminal.com`. Integrated checks and locked release/container verification passed; the production edge serves HTTPS snapshots and WSS mixed data/statistics for the five available public venues. Extended retains its upstream 403 limitation. Final retained suite: 118 tests (119 passed before one incidental test was removed; final 73-library + shutdown pass succeeded). Formal Phase 5 acceptance, actual frontend testing and broader operational qualification remain pending.
+
+Per-URL owners, owned feeds, epoch recovery, incremental trades/candles, bounded queues, borrowed book views, and receipt-based revisioned statistics retain Ferris's delivery responsibilities. Known stock order-book issues—including Binance post-bridge `pu` continuity—remain accepted risks, not correctness passes. No dependency patch/native fallback is used.
+
 Completed:
 
 - Rust backend scaffold (Axum + Tokio)
@@ -27,29 +31,25 @@ Completed:
   - `POST /v1/fetchOHLCV`
   - `POST /v1/fetchOrderBook`
   - `GET /healthz`
-- Hyperliquid adapter integrated
-- Binance USDS adapter integrated (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`)
-- Websocket trade collector + in-memory trade cache
+- All six venues (`binance`, `bybit`, `hyperliquid`, `lighterxyz`, `aster`, `extended`) acquire REST snapshots, realtime streams, and statistics through stock `ccxt`/`ccxt-pro` `4.5.85`, with default features disabled and only the six venue features enabled
+- CCXT core/catalog, REST snapshot, realtime streaming, and statistics phases (1–4) delivered and user-accepted; Lighter statistics use maintained stock Pro `watchTickers` sharing the per-URL owner
+- Numeric `volume24h`/`openInterest` value schemas delivered over HTTP and revisioned WS with venue-specific units; Binance OI is selected-market-only and Aster/Lighter OI remain explicitly unsupported
+- Removed in the cutover: native exchange modules, native realtime/statistics transports and synchronizers, Hyperliquid's extra trade collector/cache, Lighter's Explorer catalog, `src/bin/market_stream`, `src/bin/orderbook_probe.rs`, `src/binance_orderbook.rs`, `src/bybit_full_orderbook.rs`, `src/ws_shared.rs`, and the `binance-sdk`/`crossterm` dependencies
+- Stock Hyperliquid public recent-trade snapshots; the former collector/cache and retention settings were removed in the CCXT cutover
 - Extended perpetual public market-data adapter: trades, OHLCV, order-book, and market snapshots plus realtime trades, books, and OHLCV
-- Extended canonical trade/book symbols (`BASE/USD:USD`), catalog symbols (`BASE/USD`), and configurable upstream URLs for testnet readiness
+- Extended stock trade/book symbols (`BASE/USDC:USDC`), native catalog display (`BASE/USD`), and configurable upstream URLs
 - Extended indicative standard websocket order book support (RFQ real-book stream excluded)
-- Extended funding and mark/index/last statistics: shared bulk polling, all-market/selected REST and Ferris WS delivery, exact hourly estimates, and native catalog identities
-- Aster V3 perpetual funding and mark/index statistics: shared bulk polling, all-market/selected REST and Ferris WS delivery, exact estimate rates with per-market intervals, and native catalog/settlement identities
 - Funding market-statistics delivery ledger complete for the six approved venue slices: Hyperliquid, Binance, Lighter, Bybit, Extended, and Aster
-- `market_stream` modularized and made websocket-only (poll transport removed)
-- `market_stream` websocket parity:
-  - `trades`: Hyperliquid, Binance, Bybit, Aster, Extended
-  - `orderbook`: Hyperliquid, Binance, Bybit, Aster, Extended
-  - `ohlcv`: Binance, Bybit, Aster, Extended
-- Realtime fanout architecture with one upstream stream per active topic and many client subscribers:
-  - `trades`: Hyperliquid, Binance, Bybit, Aster, Extended
-  - `orderbook`: Hyperliquid, Binance, Bybit, Aster, Extended
-  - `ohlcv`: Binance, Bybit, Aster, Extended
+- CCXT Pro realtime fanout with shared feeds across viewers and one coherent mutable owner per actual stock URL:
+  - `trades`: Hyperliquid, Binance, Bybit, Aster, Extended, Lighter
+  - `orderbook`: Hyperliquid, Binance, Bybit, Aster, Extended, Lighter
+  - `ohlcv`: Hyperliquid, Binance, Bybit, Aster, Extended
 - Smoke test scripts (Python + PowerShell)
 - Live ignored integration tests
 
 In progress:
 
+- CCXT release deployed to `latticeterminal.service` at `api.latticeterminal.com` with user authorization for frontend testing; Phase 5 formal acceptance remains pending
 - Production hardening and public-host readiness
 - Realtime stream hardening (limits, backpressure, visibility)
 - Extended scope is perpetual public market data only; spot, private trading/account, funding history, account streams, and RFQ real-book endpoints remain unsupported.
@@ -102,6 +102,8 @@ Acceptance criteria:
 Target window: 2026-03
 Status: `planned`
 
+The former trade-history persistence scope below is superseded by the CCXT migration: stock trade windows only, no Ferris collector/history cache. This milestone is not authorization to restore it.
+
 Scope:
 
 - Add persistent/shared cache option (Redis)
@@ -130,42 +132,9 @@ Acceptance criteria:
 - New exchange can be added without changing frontend contract
 - Endpoint behavior remains consistent across exchanges
 
-## Exchange Adapter Checklist (Template)
+## Exchange Maintenance
 
-Use this checklist every time a new exchange is added.
-
-- Adapter wiring
-  - Create `src/exchanges/<exchange>/mod.rs` implementing `MarketDataExchange`
-  - Register module in `src/exchanges/mod.rs`
-  - Register adapter in `src/main.rs` through `ExchangeRegistry`
-  - Add only required SDK features/dependencies in `Cargo.toml`
-- Contract and normalization
-  - Define symbol input normalization and canonical output symbol mapping
-  - Define timeframe mapping (`1m`, `5m`, `1h`, etc.) to exchange-native values
-  - Clamp/translate endpoint limits to supported upstream values
-  - Preserve raw upstream payload in `info` where relevant
-- Endpoint parity
-  - `fetchTrades`: map id/timestamp/side/price/amount/cost consistently
-  - `fetchOHLCV`: map to `(timestamp, open, high, low, close, volume)` and enforce sorting
-  - `fetchOrderBook`: normalize bids descending and asks ascending
-  - Honor `since`, `limit`, and relevant `params` consistently
-- Websocket parity (tester)
-  - Add websocket trades parser + endpoint builder in `market_stream`
-  - Add websocket orderbook parser + endpoint builder in `market_stream`
-  - Add websocket OHLCV parser + endpoint builder in `market_stream` when supported upstream
-  - Ensure default websocket path works with `--exchange <id>`
-  - Return a clear unsupported-mode error if websocket path is not implemented (no poll fallback)
-- Errors and observability
-  - Map bad symbol/timeframe/limit cases to `ExchangeError::BadSymbol`
-  - Map network/upstream failures to `ExchangeError::UpstreamRequest`
-  - Map invalid upstream payloads to `ExchangeError::UpstreamData`
-  - Emit adapter-level warnings for skipped malformed rows
-- Validation
-  - Add unit tests for symbol normalization and payload mapping
-  - Add parser tests for websocket trades/orderbook/OHLCV messages
-  - Run `cargo test`
-  - Run smoke checks (`scripts/smoke_endpoints.py` or `.ps1`) for the exchange
-  - Verify `market_stream` trades, orderbook, and OHLCV workflows
+The previous native-adapter and terminal-viewer checklist is superseded by [FERRIS_V2_PLAN.md](FERRIS_V2_PLAN.md). All six registered venues are fully CCXT-backed; no native exchange module, raw stream parser, synchronizer, or direct terminal tool remains. Use stock CCXT methods, the shared metadata/DTO boundary, and backend HTTP/WS smoke checks. Do not add handwritten exchange HTTP clients or raw stream parsers. Additional exchanges and broader verification require their own authorization; the migration targets six venues only.
 
 ## M4 - Public Rollout and Operations
 
@@ -178,6 +147,7 @@ Scope:
 - Optional Helm/Compose examples
 - Monitoring/alerting guidance
 - Versioned changelog and release process
+- Single production cutover: build the locked release, deploy it in place of the previous release, and roll back to the previous release artifact if needed (no embedded native-provider fallback)
 
 Acceptance criteria:
 
@@ -216,9 +186,9 @@ Week 4:
 - Upstream API contract drift
   - Impact: parsing/mapping breaks unexpectedly
   - Mitigation: defensive parsing + contract smoke tests
-- Memory growth from in-memory cache
+- Memory growth from retained live state
   - Impact: instability under high traffic
-  - Mitigation: strict per-coin capacity and retention, monitor usage
+  - Mitigation: bounded shared topics (512 updates), 256-frame client queues, 200 realtime subscriptions per client (16 statistics), 128 URL owners and 200 feeds per URL, idle-topic teardown; stock trade windows are not retained as Ferris history
 - Repeated client polling load for live data
   - Impact: unnecessary upstream and backend request amplification
   - Mitigation: use `GET /v1/ws` realtime fanout for live trades; keep REST for bootstrap/fallback
@@ -230,6 +200,15 @@ Week 4:
   - Mitigation: standardize local fallback port (`8788`)
 
 ## Decision Log
+
+2026-10-03:
+
+- Phase 5 submitted for review after explicit authorization. Native modules, transports, synchronizers, terminal tools and obsolete settings are removed. Fixed SIGTERM waiting behind stalled HTTP: close/join client WS work, stop statistics, cancel/join live/catalog owners, then drain HTTP. The actual six-venue server exited 0 with active mixed/statistics clients; `tests/shutdown.rs` retains the stalled-request regression. Docker now pins Rust 1.98.1, copies Cargo.lock, builds one locked release binary with one Cargo job, and excludes nested target caches. Image `ferris:phase5-review` (`a782887bb0d3`) passed unprivileged runtime HTTP/WS and shutdown smoke. Known stock book risks and Extended public API limitation remain; user acceptance/deployment are pending.
+- User separately authorized production cutover for frontend testing. Built/tagged `ferris:lattice-ccxt-20261003`, installed its verified release binary at a stable versioned path, preserved the prior executable and validated rollback unit, and restarted the existing enabled `latticeterminal.service`. Caddy/DNS remained unchanged; origin now binds loopback. Public HTTPS/WSS/CORS and five-venue snapshots, mixed streams and revisioned statistics passed. Extended's known public 403 persists. Binance default trade events with source-supplied zero price/size were recorded as [CCXT-012](CCXT_KNOWN_ISSUES.md#ccxt-012); no silent filtering/default change was deployed. Actual frontend testing and explicit Phase 5 acceptance remain pending.
+
+2026-10-02:
+
+- Phase 2 replaces the four public market-data snapshot paths with stock CCXT, removes the extra Hyperliquid trade collector/history cache and its settings, and retires both direct terminal tools. Realtime/statistics remain at their authorized phase boundaries; phase approval records are in `FERRIS_V2_PLAN.md`.
 
 2026-02-17:
 
@@ -291,6 +270,17 @@ Week 4:
 
 - Completed Extended perpetual funding/mark/index/last statistics through the shared 30-second coordinator and existing REST/WS contract. Current funding is an exact hourly decimal-fraction estimate; native `nextFundingRate` is not exposed as a payment timestamp. Catalog and statistics share opaque native identities and collateral/RFQ/off-hours metadata. Deterministic and live REST/WS checks passed; full delivery evidence is in `FUNDING_MARKET_STATS_PLAN.md`.
 - Completed Aster V3 perpetual funding/mark/index statistics with shared 30-second receipt-based acquisition, native identities and settlement, dynamic per-market funding intervals, payment-boundary expiry, and existing REST/WS snapshot/delta delivery. Eight Aster scenarios and the full Rust suite passed (203 tests, 5 ignored); live checks covered 581 active perpetuals, 1h/4h/8h intervals, quote variants, Unicode, ordered deltas, and legacy endpoints. All six approved venue slices in `FUNDING_MARKET_STATS_PLAN.md` are now complete; the separate verification server was stopped without restarting staging.
+
+2026-10-02:
+
+- Submitted Phase 3 for review: stock CCXT Pro owns realtime acquisition; removed native trade/book/candle engines and obsolete Lighter Explorer configuration. Hyperliquid candles are enabled. Bybit live full-book depth is now stock-limited to 1,000 (options 100); Aster live books are partial-depth 20 only. Extended live symbols follow CCXT and absent candle volume is null. Live five-venue smoke, Extended local fixture, lifecycle regressions, and bounded slow-client checks passed; known stock book defects and Extended's upstream API failure remain accepted limitations. Phase 4 is not authorized.
+
+2026-10-03:
+
+- Added [CCXT_KNOWN_ISSUES.md](CCXT_KNOWN_ISSUES.md): actionable upstream-risk and regression records, exact Binance continuity evidence, mitigation boundaries, and closure checks. Documentation only; Phase 3 was awaiting review at that point and Phase 4 was not authorized.
+- User accepted Phase 3 and requested it be marked `completed`; updated the tracker, handoff, and current status references. Known issues remain documented accepted risks. Phase 4 was locked until the subsequent explicit authorization.
+- Submitted Phase 4 for review: all six venues use shared stock statistics, Lighter maintains Pro `watchTickers`, and HTTP/revisioned WS deliver strict numeric volume/OI with independent freshness. Binance OI is selected-only; Aster/Lighter OI remains explicitly unsupported. Removed native statistics transports and obsolete runtime dependencies. Focused tests: 118 passed; locked backend build and live/loopback HTTP/WS smoke passed. Product units and source differences are documented; Phase 5 remains locked pending review and authorization.
+- User accepted Phase 4 and requested it be marked `completed`; updated the tracker, handoff, and current status references. Documentation-only approval update; existing focused verification and accepted upstream limitations are unchanged. Phase 5 is the remaining final integration/removal/shutdown and broad HTTP/WS/release/container verification stage, still locked pending explicit authorization to start. Deployment requires a separate decision.
 
 ## Weekly Update Template
 

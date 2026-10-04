@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{future::IntoFuture, net::SocketAddr, sync::Arc};
 
 use anyhow::Context;
 use axum::{
@@ -8,15 +8,10 @@ use axum::{
 use ferris_market_data_backend::{
     config::Config,
     exchanges::{
-        aster::AsterExchange,
-        binance::BinanceExchange,
-        bybit::BybitExchange,
-        extended::ExtendedExchange,
-        hyperliquid::HyperliquidExchange,
-        lighterxyz::{LighterExchange, LighterMarketCatalogService},
+        ccxt::{CcxtExchange, CcxtService, Venue},
         registry::ExchangeRegistry,
     },
-    realtime::{OhlcvTopicManager, OrderBookTopicManager, TradesTopicManager},
+    realtime::RealtimeService,
     web::{self, AppState},
 };
 use tokio::signal;
@@ -29,73 +24,23 @@ async fn main() -> anyhow::Result<()> {
     init_tracing();
 
     let config = Config::from_env().context("failed to load configuration")?;
+    let addr: SocketAddr = format!("{}:{}", config.host, config.port)
+        .parse()
+        .context("invalid bind address")?;
 
-    let extended_exchange = Arc::new(ExtendedExchange::new(
-        config.extended_rest_base_url.clone(),
-        config.request_timeout_ms,
-    )?);
-    let aster_exchange = Arc::new(AsterExchange::with_base_url(
-        config.aster_base_url.clone(),
-        config.request_timeout_ms,
-    )?);
-    let binance_exchange = Arc::new(BinanceExchange::with_base_url(
-        config.binance_base_url.clone(),
-        config.request_timeout_ms,
-    )?);
-    let lighter_catalog_service = Arc::new(LighterMarketCatalogService::new(
-        config.request_timeout_ms,
-        config.lighter_markets_url.clone(),
-        config.lighter_market_catalog_refresh_ms,
-    )?);
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .context("failed to bind tcp listener")?;
+    let ccxt = CcxtService::start(&config).context("failed to start CCXT owners")?;
+
     let mut registry = ExchangeRegistry::new();
-    registry.register(extended_exchange.clone());
-    registry.register(aster_exchange.clone());
-    registry.register(binance_exchange.clone());
-    registry.register(Arc::new(BybitExchange::with_base_url(
-        config.bybit_base_url.clone(),
-        config.request_timeout_ms,
-    )?));
-    registry.register(Arc::new(
-        LighterExchange::new(
-            config.lighter_rest_base_url.clone(),
-            config.request_timeout_ms,
-            lighter_catalog_service.clone(),
-        )?
-        .with_stats_ws_url(config.lighter_ws_url.clone(), config.request_timeout_ms),
-    ));
-    registry.register(Arc::new(HyperliquidExchange::new(
-        config.hyperliquid_base_url.clone(),
-        config.request_timeout_ms,
-        config.trade_cache_capacity_per_coin,
-        config.trade_cache_retention_ms,
-        config.trade_collector_enabled,
-    )?));
+    for venue in Venue::ALL {
+        registry.register(Arc::new(CcxtExchange::new(venue, ccxt.clone())));
+    }
 
-    let trades_topic_manager = TradesTopicManager::new(
-        config.hyperliquid_base_url.clone(),
-        config.extended_ws_url.clone(),
-        config.lighter_ws_url.clone(),
-        lighter_catalog_service.clone(),
-    );
-    let order_book_topic_manager = OrderBookTopicManager::new(
-        config.hyperliquid_base_url.clone(),
-        config.extended_ws_url.clone(),
-        binance_exchange,
-        aster_exchange,
-        config.lighter_ws_url.clone(),
-        lighter_catalog_service.clone(),
-    );
-    let ohlcv_topic_manager = OhlcvTopicManager::new(
-        config.hyperliquid_base_url.clone(),
-        config.extended_ws_url.clone(),
-    );
+    let realtime = RealtimeService::new(ccxt.clone());
 
-    let state = AppState::new(
-        Arc::new(registry),
-        trades_topic_manager,
-        order_book_topic_manager,
-        ohlcv_topic_manager,
-    );
+    let state = AppState::new(Arc::new(registry), realtime);
 
     let app = Router::new()
         .route("/healthz", get(web::health))
@@ -110,34 +55,38 @@ async fn main() -> anyhow::Result<()> {
         .layer(CorsLayer::permissive())
         .with_state(state.clone());
 
-    let addr: SocketAddr = format!("{}:{}", config.host, config.port)
-        .parse()
-        .context("invalid bind address")?;
-
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .context("failed to bind tcp listener")?;
-
     info!(
         host = %config.host,
         port = config.port,
         hyperliquid_url = %config.hyperliquid_base_url,
         lighter_rest_url = %config.lighter_rest_base_url,
-        lighter_markets_url = %config.lighter_markets_url,
         lighter_ws_url = %config.lighter_ws_url,
-        lighter_market_catalog_refresh_ms = config.lighter_market_catalog_refresh_ms,
-        trade_cache_capacity = config.trade_cache_capacity_per_coin,
-        trade_cache_retention_ms = config.trade_cache_retention_ms,
-        trade_collector_enabled = config.trade_collector_enabled,
         "server started"
     );
 
-    let result = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("server error");
+    let (stop, stopping) = tokio::sync::oneshot::channel();
+    let server = axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            let _ = stopping.await;
+        })
+        .into_future();
+    tokio::pin!(server);
+    let result = tokio::select! {
+        result = &mut server => Some(result),
+        _ = shutdown_signal() => None,
+    };
+    let _ = stop.send(());
+    // Cancel acquisition before awaiting Axum's in-flight HTTP drain. Upgraded
+    // websockets are separate tasks and must be closed/joined explicitly.
+    state.shutdown_websockets().await;
     state.shutdown_market_stats().await;
-    result?;
+    let owners = ccxt.shutdown().await.context("failed to stop CCXT owners");
+    let result = match result {
+        Some(result) => result,
+        None => server.await,
+    };
+    owners?;
+    result.context("server error")?;
 
     Ok(())
 }

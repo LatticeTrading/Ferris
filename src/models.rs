@@ -43,6 +43,11 @@ pub struct FetchMarketStatsRequest {
 #[derive(Debug, Clone)]
 pub struct FetchMarketStatsParams {
     pub params: Value,
+    /// Union of selected Binance markets that currently need a singular observation.
+    /// Other venues acquire their bulk interest alongside the shared ticker source.
+    pub open_interest_market_ids: Vec<String>,
+    /// False for new singular demand between the shared bulk polling deadlines.
+    pub include_bulk: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -164,7 +169,7 @@ pub struct CcxtFee {
     pub rate: Option<f64>,
 }
 
-pub type CcxtOhlcv = (u64, f64, f64, f64, f64, f64);
+pub type CcxtOhlcv = (u64, f64, f64, f64, f64, Option<f64>);
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -319,7 +324,7 @@ pub enum MarketStatsFieldState {
     Stale,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MarketStatsField {
     pub state: MarketStatsFieldState,
@@ -330,11 +335,54 @@ pub struct MarketStatsField {
     pub source: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum MarketStatsValue {
     Funding(FundingValue),
     Price(PriceValue),
+    Volume24h(Volume24hValue),
+    OpenInterest(OpenInterestValue),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Volume24hValue {
+    #[serde(with = "nullable_finite_number")]
+    pub base_volume: Option<f64>,
+    #[serde(with = "nullable_finite_number")]
+    pub quote_volume: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OpenInterestValue {
+    #[serde(with = "nullable_finite_number")]
+    pub open_interest_amount: Option<f64>,
+    #[serde(with = "nullable_finite_number")]
+    pub open_interest_value: Option<f64>,
+}
+
+// `with` makes each key required even when its value is null. Reject non-finite
+// values on both sides rather than letting JSON silently turn them into null.
+mod nullable_finite_number {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &Option<f64>, serializer: S) -> Result<S::Ok, S::Error> {
+        if value.is_some_and(|value| !value.is_finite()) {
+            return Err(serde::ser::Error::custom("metric number must be finite"));
+        }
+        value.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<f64>, D::Error> {
+        let value = Option::<f64>::deserialize(deserializer)?;
+        if value.is_some_and(|value| !value.is_finite()) {
+            return Err(serde::de::Error::custom("metric number must be finite"));
+        }
+        Ok(value)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -362,7 +410,7 @@ pub enum FundingKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FundingValue {
     pub rate: String,
     pub rate_unit: FundingRateUnit,
@@ -430,7 +478,7 @@ fn funding_rate_equivalents(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PriceValue {
     pub amount: String,
     pub base_asset: String,
@@ -642,6 +690,55 @@ mod tests {
             serde_json::from_value::<MarketStatsValue>(encoded).unwrap(),
             price
         );
+    }
+
+    #[test]
+    fn numeric_metrics_keep_zero_null_and_distinct_required_member_sets() {
+        for (value, encoded) in [
+            (
+                MarketStatsValue::Volume24h(Volume24hValue {
+                    base_volume: Some(0.0),
+                    quote_volume: None,
+                }),
+                json!({"baseVolume": 0.0, "quoteVolume": null}),
+            ),
+            (
+                MarketStatsValue::OpenInterest(OpenInterestValue {
+                    open_interest_amount: None,
+                    open_interest_value: Some(12.5),
+                }),
+                json!({"openInterestAmount": null, "openInterestValue": 12.5}),
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(&value).unwrap(), encoded);
+            assert_eq!(
+                serde_json::from_value::<MarketStatsValue>(encoded).unwrap(),
+                value
+            );
+        }
+        for invalid in [
+            json!({}),
+            json!({"baseVolume": 1.0}),
+            json!({"openInterestAmount": null}),
+            json!({"baseVolume": 1.0, "openInterestValue": 2.0}),
+            json!({"baseVolume": 1.0, "quoteVolume": null, "openInterestAmount": 2.0}),
+            json!({"openInterestAmount": 1.0, "openInterestValue": null, "extra": 2}),
+            json!({"baseVolume": "1.0", "quoteVolume": null}),
+        ] {
+            assert!(serde_json::from_value::<MarketStatsValue>(invalid).is_err());
+        }
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(serde_json::to_value(Volume24hValue {
+                base_volume: Some(invalid),
+                quote_volume: None,
+            })
+            .is_err());
+            assert!(serde_json::to_value(OpenInterestValue {
+                open_interest_amount: None,
+                open_interest_value: Some(invalid),
+            })
+            .is_err());
+        }
     }
 
     #[test]

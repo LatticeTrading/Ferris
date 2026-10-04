@@ -4,13 +4,16 @@ use std::{
 };
 
 use serde::de::IgnoredAny;
-use serde_json::{json, Value};
+use serde_json::Value;
 use tokio::time::Instant;
 
 use super::{make_market_id, MarketStatsSourceSnapshot};
 use crate::{
     errors::ApiError,
-    exchanges::traits::ExchangeError,
+    exchanges::{
+        ccxt::{statistics_profile, Venue},
+        traits::ExchangeError,
+    },
     models::{
         FetchMarketStatsRequest, MarketStatsCoverage, MarketStatsField, MarketStatsFieldName,
         MarketStatsFieldState, MarketStatsRow, MarketStatsScope, MarketStatsSnapshot,
@@ -18,95 +21,30 @@ use crate::{
     },
 };
 
+#[cfg(test)]
 const PRIMARY_SOURCE: &str = "hyperliquid:primary:metaAndAssetCtxs";
+#[cfg(test)]
 const SPOT_SOURCE: &str = "hyperliquid:spotMeta";
-const STALE_AFTER: Duration = Duration::from_secs(90);
-fn is_binance(exchange: &str) -> bool {
-    exchange == "binance"
-}
+use statistics_profile::STALE_AFTER;
 
 fn is_lighter(exchange: &str) -> bool {
     exchange == "lighterxyz"
 }
 
-fn catalog_source(exchange: &str, product: UnifiedMarketType, params: &Value) -> &'static str {
-    if is_binance(exchange) {
-        "binance:exchangeInfo"
-    } else if exchange == "aster" {
-        "aster:exchangeInfo"
-    } else if is_lighter(exchange) {
-        "lighterxyz:orderBookDetails"
-    } else if exchange == "bybit" {
-        match params.get("category").and_then(Value::as_str) {
-            Some("inverse") => "bybit:inverse:instruments-info",
-            _ => "bybit:linear:instruments-info",
-        }
-    } else if exchange == "extended" {
-        "extended:info/markets"
-    } else {
-        match product {
-            UnifiedMarketType::Perp => PRIMARY_SOURCE,
-            UnifiedMarketType::Spot => SPOT_SOURCE,
-            _ => PRIMARY_SOURCE,
-        }
-    }
+fn catalog_source(exchange: &str, _product: UnifiedMarketType, _params: &Value) -> &'static str {
+    Venue::from_public_id(exchange)
+        .map(statistics_profile::catalog_source)
+        .unwrap_or("ccxt:loadMarkets")
 }
 
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
 
 pub fn normalize_topic(request: FetchMarketStatsRequest) -> Result<MarketStatsTopic, ApiError> {
     let exchange = request.exchange.trim().to_ascii_lowercase();
-    match (&exchange[..], &request.params) {
-        (_, Value::Null) => {}
-        ("binance", Value::Object(params)) if params.is_empty() => {}
-        ("aster", Value::Object(params)) if params.is_empty() => {}
-        ("lighterxyz", Value::Object(params)) if params.is_empty() => {}
-        ("extended", Value::Object(params)) if params.is_empty() => {}
-        ("bybit", Value::Object(params))
-            if params.is_empty()
-                || (params.len() == 1
-                    && matches!(
-                        params.get("category").and_then(Value::as_str),
-                        Some("linear" | "inverse")
-                    )) => {}
-        (_, Value::Object(params))
-            if !is_binance(&exchange)
-                && exchange != "aster"
-                && !is_lighter(&exchange)
-                && exchange != "bybit"
-                && exchange != "extended"
-                && (params.is_empty()
-                    || (params.len() == 1
-                        && params.get("dex").and_then(Value::as_str) == Some(""))) => {}
-        _ => {
-            return Err(ApiError::Validation(
-                if is_binance(&exchange) {
-                    "Binance market statistics params must be null or {}"
-                } else if exchange == "aster" {
-                    "Aster market statistics params must be null or {}"
-                } else if is_lighter(&exchange) {
-                    "Lighter market statistics params must be null or {}"
-                } else if exchange == "bybit" {
-                    "Bybit market statistics params must be null, {}, or {\"category\":\"linear\"|\"inverse\"}"
-                } else if exchange == "extended" {
-                    "Extended market statistics params must be null or {}"
-                } else {
-                    "market statistics params must be null, {}, or {\"dex\":\"\"}"
-                }
-                .to_string(),
-            ));
-        }
-    }
-    let params = if exchange == "bybit" {
-        json!({"category": request.params.get("category").and_then(Value::as_str).unwrap_or("linear")})
-    } else if is_binance(&exchange)
-        || is_lighter(&exchange)
-        || matches!(&exchange[..], "aster" | "extended")
-    {
-        json!({})
-    } else {
-        json!({"dex": ""})
-    };
+    let venue = Venue::from_public_id(&exchange)
+        .ok_or_else(|| ApiError::UnsupportedExchange(exchange.clone()))?;
+    let params = statistics_profile::normalize_params(venue, &request.params)
+        .map_err(|error| ApiError::Validation(error.to_string()))?;
 
     let market_ids = match request.market_ids {
         Some(mut ids) => {
@@ -132,6 +70,14 @@ pub fn normalize_topic(request: FetchMarketStatsRequest) -> Result<MarketStatsTo
     }
     fields.sort_unstable();
     fields.dedup();
+    if venue == Venue::Binance
+        && fields.contains(&MarketStatsFieldName::OpenInterest)
+        && market_ids.is_none()
+    {
+        return Err(ApiError::Validation(
+            "Binance openInterest requires selected marketIds".into(),
+        ));
+    }
     Ok(MarketStatsTopic {
         exchange,
         params,
@@ -149,31 +95,27 @@ fn market_id_type(id: &str, exchange: &str, params: &Value) -> Result<UnifiedMar
         Option<String>,
         String,
     ) = serde_json::from_str(id).map_err(|_| invalid())?;
+    let venue = Venue::from_public_id(exchange).ok_or_else(invalid)?;
+    let scope = statistics_profile::scope(venue, params).map_err(|_| invalid())?;
+    let category_matches = if venue == Venue::Bybit {
+        category.as_deref() == params.get("category").and_then(Value::as_str)
+    } else {
+        category.is_none()
+    };
+    let dex_matches = if venue == Venue::Hyperliquid && product == UnifiedMarketType::Perp {
+        dex.as_deref() == Some("")
+    } else {
+        dex.is_none()
+    };
     if id_exchange != exchange
-        || if exchange == "bybit" {
-            !matches!(category.as_deref(), Some("linear" | "inverse"))
-                || category.as_deref() != params.get("category").and_then(Value::as_str)
-        } else {
-            category.is_some()
-        }
+        || !category_matches
+        || !dex_matches
         || native_id.is_empty()
+        || !statistics_profile::catalog_products(venue, scope).contains(&product)
         || (is_lighter(exchange)
             && ((native_id.len() > 1 && native_id.starts_with('0'))
                 || !native_id.bytes().all(|byte| byte.is_ascii_digit())
                 || native_id.parse::<u64>().is_err()))
-        || !(if is_binance(exchange) || matches!(exchange, "aster" | "bybit" | "extended") {
-            matches!((product, dex.as_deref()), (UnifiedMarketType::Perp, None))
-        } else if is_lighter(exchange) {
-            matches!(
-                (product, dex.as_deref()),
-                (UnifiedMarketType::Perp, None) | (UnifiedMarketType::Spot, None)
-            )
-        } else {
-            matches!(
-                (product, dex.as_deref()),
-                (UnifiedMarketType::Perp, Some("")) | (UnifiedMarketType::Spot, None)
-            )
-        })
     {
         return Err(invalid());
     }
@@ -203,17 +145,8 @@ pub fn validate_selection(
         if known.contains(id.as_str()) {
             continue;
         }
-        let (complete, source) = match product {
-            UnifiedMarketType::Perp => (
-                snapshot.perp_enumeration_complete,
-                catalog_source(&topic.exchange, product, &topic.params),
-            ),
-            UnifiedMarketType::Spot => (
-                snapshot.spot_enumeration_complete,
-                catalog_source(&topic.exchange, product, &topic.params),
-            ),
-            _ => unreachable!("market_id_type only accepts supported products"),
-        };
+        let complete = snapshot.complete_catalogs.contains(&product);
+        let source = catalog_source(&topic.exchange, product, &topic.params);
         if complete {
             return Err(ApiError::Validation(format!("unknown marketId: {id}")));
         }
@@ -245,6 +178,7 @@ pub fn project_snapshot(
     topic: &MarketStatsTopic,
     snapshot: &MarketStatsSourceSnapshot,
 ) -> MarketStatsSnapshot {
+    let all_product = statistics_profile::all_market_product(&topic.params);
     let mut markets: Vec<_> = snapshot
         .rows
         .iter()
@@ -254,7 +188,7 @@ pub fn project_snapshot(
                 Some(ids) => ids
                     .binary_search_by(|selected| selected.as_str().cmp(id))
                     .is_ok(),
-                None => row.market.market_type == UnifiedMarketType::Perp && row.market.active,
+                None => row.market.market_type == all_product && row.market.active,
             }
         })
         .map(|row| MarketStatsRow {
@@ -284,24 +218,21 @@ pub fn project_snapshot(
                     _,
                 > = serde_json::from_str(id);
                 match decoded {
-                    Ok((_, UnifiedMarketType::Perp, _, _, _)) => snapshot.perp_enumeration_complete,
-                    Ok((_, UnifiedMarketType::Spot, _, _, _)) => snapshot.spot_enumeration_complete,
+                    Ok((_, product, _, _, _)) => snapshot.complete_catalogs.contains(&product),
                     _ => false,
                 }
             });
             (Some(ids.len()), complete)
         }
         None => (
-            snapshot.perp_catalog_known.then(|| {
+            snapshot.catalog_known.then(|| {
                 snapshot
                     .rows
                     .iter()
-                    .filter(|row| {
-                        row.market.market_type == UnifiedMarketType::Perp && row.market.active
-                    })
+                    .filter(|row| row.market.market_type == all_product && row.market.active)
                     .count()
             }),
-            snapshot.perp_enumeration_complete,
+            snapshot.complete_catalogs.contains(&all_product),
         ),
     };
     MarketStatsSnapshot {
@@ -337,8 +268,7 @@ pub fn merge_outcome(
                 _ => "upstream-failure",
             };
             let mut next = previous.clone();
-            next.perp_enumeration_complete = false;
-            next.spot_enumeration_complete = false;
+            next.complete_catalogs.clear();
             next.contexts_valid = false;
             next.next_poll_at = Instant::now() + POLL_INTERVAL;
             // The failed source call publishes no secondary catalog proof. Retain known
@@ -367,7 +297,7 @@ pub fn merge_outcome(
         .filter_map(|row| row_id(row).map(|id| (id, row)))
         .collect();
     for row in &mut next.rows {
-        if row.market.market_type != UnifiedMarketType::Perp || !row.market.active {
+        if !row.market.active {
             continue;
         }
         let row_key = row_id(row).map(str::to_owned);
@@ -375,9 +305,27 @@ pub fn merge_outcome(
             .as_deref()
             .and_then(|id| prior_rows.get(id).copied());
         for (name, field) in &mut row.fields {
-            if !field_implemented_for_exchange(exchange, *name)
-                || field.reason.as_deref() == Some("invalid-upstream-value")
-            {
+            // This poll did not acquire this field (maintained stream or singular
+            // demand not due). Carry its observation and original monotonic receipt.
+            if field.reason.as_deref() == Some("not-requested") {
+                if let Some(old) = prior.and_then(|prior| prior.fields.get(name)) {
+                    *field = old.clone();
+                    if let Some((id, receipt)) = row_key.as_deref().and_then(|id| {
+                        previous
+                            .field_received_at
+                            .get(id)?
+                            .get(name)
+                            .map(|at| (id, *at))
+                    }) {
+                        next.field_received_at
+                            .entry(id.to_string())
+                            .or_default()
+                            .insert(*name, receipt);
+                    }
+                }
+                continue;
+            }
+            if structural(field) {
                 continue;
             }
             let field_failure = field.state == MarketStatsFieldState::Unavailable
@@ -400,6 +348,21 @@ pub fn merge_outcome(
                 .and_then(|id| previous.field_received_at.get(id))
                 .and_then(|fields| fields.get(name))
                 .copied();
+            if !field_failure
+                && matches!((incoming_receipt, prior_receipt), (Some(incoming), Some(prior)) if incoming <= prior)
+            {
+                if let Some(old) = prior.and_then(|prior| prior.fields.get(name)) {
+                    *field = old.clone();
+                    next.field_received_at
+                        .entry(row_key.as_ref().unwrap().clone())
+                        .or_default()
+                        .insert(*name, prior_receipt.unwrap());
+                }
+                continue;
+            }
+            if field.reason.as_deref() == Some("invalid-upstream-value") {
+                continue;
+            }
             let newly_observed = field.state == MarketStatsFieldState::Available
                 && incoming_receipt.is_some()
                 && incoming_receipt > prior_receipt;
@@ -409,17 +372,7 @@ pub fn merge_outcome(
             let incoming_reason = if field_failure {
                 field.reason.clone().unwrap()
             } else {
-                let source = if is_lighter(exchange) {
-                    "lighterxyz:market_stats"
-                } else {
-                    field.source.as_deref().unwrap_or(if is_binance(exchange) {
-                        "binance:premiumIndex"
-                    } else if exchange == "aster" {
-                        "aster:premiumIndex"
-                    } else {
-                        PRIMARY_SOURCE
-                    })
-                };
+                let source = field.source.as_deref().unwrap_or("");
                 next.source_failures
                     .iter()
                     .find(|failure| failure.source == source)
@@ -438,8 +391,7 @@ pub fn merge_outcome(
                             next.field_received_at
                                 .entry(id.to_string())
                                 .or_default()
-                                .entry(*name)
-                                .or_insert(*receipt);
+                                .insert(*name, *receipt);
                         }
                     }
                 }
@@ -455,18 +407,14 @@ pub fn merge_outcome(
         .rows
         .iter()
         .filter(|row| {
-            let complete = match row.market.market_type {
-                UnifiedMarketType::Perp => next.perp_enumeration_complete,
-                UnifiedMarketType::Spot => next.spot_enumeration_complete,
-                _ => true,
-            };
+            let complete = next.complete_catalogs.contains(&row.market.market_type);
             !complete && row_id(row).is_some_and(|id| !incoming_ids.contains(id))
         })
         .cloned()
         .collect();
     for mut row in retained {
         let retained_id = row_id(&row).map(str::to_owned);
-        if row.market.market_type == UnifiedMarketType::Perp {
+        if row.market.active {
             let reason = next
                 .source_failures
                 .iter()
@@ -486,9 +434,7 @@ pub fn merge_outcome(
         }
         next.rows.push(row);
     }
-    if !next.perp_enumeration_complete {
-        next.perp_catalog_known |= previous.perp_catalog_known;
-    }
+    next.catalog_known |= previous.catalog_known;
     next.rows
         .sort_unstable_by(|left, right| row_id(left).cmp(&row_id(right)));
     next
@@ -500,14 +446,12 @@ pub fn expire_snapshot(
 ) -> Option<MarketStatsSourceSnapshot> {
     let mut expired: Option<MarketStatsSourceSnapshot> = None;
     for row in &snapshot.rows {
-        if row.market.market_type != UnifiedMarketType::Perp || !row.market.active {
+        if !row.market.active {
             continue;
         }
         let id = row_id(row);
         for (name, field) in &row.fields {
-            if field_implemented_for_exchange(&row.market.exchange, *name)
-                && field.state == MarketStatsFieldState::Available
-            {
+            if !structural(field) && field.state == MarketStatsFieldState::Available {
                 let receipt = id
                     .and_then(|id| snapshot.field_received_at.get(id))
                     .and_then(|fields| fields.get(name))
@@ -568,20 +512,6 @@ fn funding_payment_passed(
         >= u128::from(next_payment.saturating_sub(observed_at))
 }
 
-fn field_implemented_for_exchange(exchange: &str, name: MarketStatsFieldName) -> bool {
-    (is_lighter(exchange)
-        && matches!(
-            name,
-            MarketStatsFieldName::Funding
-                | MarketStatsFieldName::LastSettledFunding
-                | MarketStatsFieldName::LastPrice
-                | MarketStatsFieldName::MarkPrice
-                | MarketStatsFieldName::IndexPrice
-        ))
-        || implemented(name)
-        || (matches!(exchange, "bybit" | "extended") && name == MarketStatsFieldName::LastPrice)
-}
-
 fn row_id(row: &MarketStatsRow) -> Option<&str> {
     row.market
         .identity
@@ -589,6 +519,7 @@ fn row_id(row: &MarketStatsRow) -> Option<&str> {
         .map(|identity| identity.market_id.as_str())
 }
 
+#[cfg(test)]
 fn implemented(name: MarketStatsFieldName) -> bool {
     matches!(
         name,
@@ -613,16 +544,14 @@ fn usable(field: &MarketStatsField) -> bool {
 }
 
 fn fail_row(row: &mut MarketStatsRow, reason: &str) {
-    if row.market.market_type == UnifiedMarketType::Perp && row.market.active {
-        for (name, field) in &mut row.fields {
-            if field_implemented_for_exchange(&row.market.exchange, *name) {
-                fail_field(field, reason);
-            }
+    if row.market.active {
+        for field in row.fields.values_mut() {
+            fail_field(field, reason);
         }
     }
 }
 
-fn fail_field(field: &mut MarketStatsField, reason: &str) {
+pub(super) fn fail_field(field: &mut MarketStatsField, reason: &str) {
     if structural(field) || field.reason.as_deref() == Some("invalid-upstream-value") {
         return;
     }
@@ -636,6 +565,7 @@ fn fail_field(field: &mut MarketStatsField, reason: &str) {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
     use std::collections::BTreeMap;
 
     use super::*;
@@ -774,9 +704,10 @@ mod tests {
     fn source(rows: Vec<MarketStatsRow>, received_at: Instant) -> MarketStatsSourceSnapshot {
         MarketStatsSourceSnapshot {
             rows,
-            perp_catalog_known: true,
-            perp_enumeration_complete: true,
-            spot_enumeration_complete: true,
+            catalog_known: true,
+            complete_catalogs: [UnifiedMarketType::Perp, UnifiedMarketType::Spot]
+                .into_iter()
+                .collect(),
             contexts_valid: true,
             received_at: Some(received_at),
             field_received_at: Default::default(),
@@ -794,8 +725,8 @@ mod tests {
         });
         for row in &mut snapshot.rows {
             if row.market.market_type == UnifiedMarketType::Perp && row.market.active {
-                for (name, field) in &mut row.fields {
-                    if field_implemented_for_exchange(&row.market.exchange, *name) {
+                for field in row.fields.values_mut() {
+                    if !structural(field) {
                         field.state = MarketStatsFieldState::Unavailable;
                         field.value = None;
                         field.reason = Some("context-mismatch".to_string());
@@ -899,9 +830,8 @@ mod tests {
         let btc = id("BTC", UnifiedMarketType::Perp);
         let spot = id("0", UnifiedMarketType::Spot);
         let mut cold = source(Vec::new(), now);
-        cold.perp_catalog_known = false;
-        cold.perp_enumeration_complete = false;
-        cold.spot_enumeration_complete = false;
+        cold.catalog_known = false;
+        cold.complete_catalogs.clear();
         cold.received_at = None;
         let empty = project_snapshot(&topic(None), &cold);
         assert_eq!(empty.coverage.expected_markets, None);
@@ -923,10 +853,13 @@ mod tests {
         ));
 
         let mut complete_perps = source(Vec::new(), now);
-        complete_perps.spot_enumeration_complete = false;
-        assert!(
-            matches!(validate_selection(&topic(Some(vec![btc.clone()])), &complete_perps), Err(ApiError::Validation(message)) if message == format!("unknown marketId: {btc}"))
-        );
+        complete_perps
+            .complete_catalogs
+            .remove(&UnifiedMarketType::Spot);
+        assert!(matches!(
+            validate_selection(&topic(Some(vec![btc.clone()])), &complete_perps),
+            Err(ApiError::Validation(_))
+        ));
         assert!(matches!(
             validate_selection(&topic(Some(vec![spot.clone()])), &complete_perps),
             Err(ApiError::Exchange(ExchangeError::UpstreamRequest(_)))
@@ -935,7 +868,9 @@ mod tests {
             .rows
             .push(row("0", UnifiedMarketType::Spot, true, 1, None));
         validate_selection(&topic(Some(vec![spot])), &complete_perps).unwrap();
-        complete_perps.spot_enumeration_complete = true;
+        complete_perps
+            .complete_catalogs
+            .insert(UnifiedMarketType::Spot);
         let failed = merge_outcome(
             &complete_perps,
             Err(ExchangeError::UpstreamRequest("offline".into())),
@@ -1159,7 +1094,7 @@ mod tests {
             vec![row("1", UnifiedMarketType::Spot, true, 20, None)],
             now + POLL_INTERVAL,
         );
-        partial.spot_enumeration_complete = false;
+        partial.complete_catalogs.remove(&UnifiedMarketType::Spot);
         partial.source_failures.push(MarketStatsSourceFailure {
             source: SPOT_SOURCE.to_string(),
             reason: "upstream-failure".to_string(),

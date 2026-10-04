@@ -48,6 +48,9 @@ impl IntoResponse for ApiError {
 fn map_exchange_error(error: ExchangeError) -> (StatusCode, &'static str, String) {
     match error {
         ExchangeError::BadSymbol(message) => (StatusCode::BAD_REQUEST, "BAD_SYMBOL", message),
+        ExchangeError::UnsupportedFeature(message) => {
+            (StatusCode::NOT_IMPLEMENTED, "UNSUPPORTED_FEATURE", message)
+        }
         ExchangeError::UpstreamRequest(message) => {
             (StatusCode::BAD_GATEWAY, "UPSTREAM_REQUEST_FAILED", message)
         }

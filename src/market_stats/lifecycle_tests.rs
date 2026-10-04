@@ -33,8 +33,9 @@ use crate::{
         MarketStatsAllMarketsCapability, MarketStatsCapabilities, MarketStatsField,
         MarketStatsFieldName, MarketStatsFieldState, MarketStatsRow, MarketStatsScope,
         MarketStatsSelectedMarketsCapability, MarketStatsSnapshot,
-        MarketStatsSupportedCapabilities, MarketStatsValue, MarketStatsWsCapability, PriceValue,
-        UnifiedMarket, UnifiedMarketInfo, UnifiedMarketType,
+        MarketStatsSupportedCapabilities, MarketStatsValue, MarketStatsWsCapability,
+        OpenInterestValue, PriceValue, UnifiedMarket, UnifiedMarketInfo, UnifiedMarketType,
+        Volume24hValue,
     },
 };
 
@@ -167,9 +168,10 @@ impl MarketStatsSource for FakeExchange {
             rows: source_rows(
                 WALL_ORIGIN + received_at.duration_since(self.origin).as_millis() as u64,
             ),
-            perp_catalog_known: true,
-            perp_enumeration_complete: true,
-            spot_enumeration_complete: true,
+            catalog_known: true,
+            complete_catalogs: [UnifiedMarketType::Perp, UnifiedMarketType::Spot]
+                .into_iter()
+                .collect(),
             contexts_valid: true,
             received_at: Some(received_at),
             field_received_at: Default::default(),
@@ -337,8 +339,6 @@ fn source_rows(receipt: u64) -> Vec<MarketStatsRow> {
                     "adapter-not-implemented",
                 ),
                 (MarketStatsFieldName::LastPrice, "adapter-not-implemented"),
-                (MarketStatsFieldName::OpenInterest, "units-unverified"),
-                (MarketStatsFieldName::Volume24h, "units-unverified"),
             ] {
                 fields.insert(
                     name,
@@ -349,6 +349,34 @@ fn source_rows(receipt: u64) -> Vec<MarketStatsRow> {
                         exchange_timestamp: None,
                         received_timestamp: None,
                         source: None,
+                    },
+                );
+            }
+            for (name, value) in [
+                (
+                    MarketStatsFieldName::Volume24h,
+                    MarketStatsValue::Volume24h(Volume24hValue {
+                        base_volume: None,
+                        quote_volume: Some(0.0),
+                    }),
+                ),
+                (
+                    MarketStatsFieldName::OpenInterest,
+                    MarketStatsValue::OpenInterest(OpenInterestValue {
+                        open_interest_amount: Some(12.5),
+                        open_interest_value: None,
+                    }),
+                ),
+            ] {
+                fields.insert(
+                    name,
+                    MarketStatsField {
+                        state: MarketStatsFieldState::Available,
+                        value: Some(value),
+                        reason: None,
+                        exchange_timestamp: None,
+                        received_timestamp: Some(receipt),
+                        source: Some(SOURCE.into()),
                     },
                 );
             }
@@ -415,7 +443,14 @@ async fn subscribe_initial(
     coordinator: &MarketStatsCoordinator,
     source: &mut SourceController,
 ) -> MarketStatsSubscription {
-    let mut subscribe = Box::pin(coordinator.subscribe(funding_request(None)));
+    let mut subscribe = Box::pin(coordinator.subscribe(request(
+        None,
+        &[
+            MarketStatsFieldName::Funding,
+            MarketStatsFieldName::Volume24h,
+            MarketStatsFieldName::OpenInterest,
+        ],
+    )));
     assert!(poll!(subscribe.as_mut()).is_pending());
     source.next_call().await.succeed(Instant::now());
     ready(subscribe).await.unwrap()
@@ -727,6 +762,16 @@ async fn market_stats_pending_acquisition_publishes_stale_at_90_seconds_before_r
         funding(&stale).received_timestamp,
         funding(&initial).received_timestamp
     );
+    for name in [
+        MarketStatsFieldName::Volume24h,
+        MarketStatsFieldName::OpenInterest,
+    ] {
+        let field = &stale.markets[0].fields[&name];
+        assert_eq!(field.state, MarketStatsFieldState::Stale);
+        assert_eq!(field.reason.as_deref(), Some("stale-threshold"));
+        assert_eq!(field.value, initial.markets[0].fields[&name].value);
+        assert_eq!(field.received_timestamp, Some(WALL_ORIGIN));
+    }
     assert_eq!(
         source.active(),
         1,
@@ -748,6 +793,15 @@ async fn market_stats_pending_acquisition_publishes_stale_at_90_seconds_before_r
         funding(&recovered).received_timestamp,
         Some(WALL_ORIGIN + 91_000)
     );
+    for name in [
+        MarketStatsFieldName::Volume24h,
+        MarketStatsFieldName::OpenInterest,
+    ] {
+        let field = &recovered.markets[0].fields[&name];
+        assert_eq!(field.state, MarketStatsFieldState::Available);
+        assert_eq!(field.value, initial.markets[0].fields[&name].value);
+        assert_eq!(field.received_timestamp, Some(WALL_ORIGIN + 91_000));
+    }
     ready(coordinator.shutdown()).await;
 }
 
@@ -782,6 +836,15 @@ async fn market_stats_failed_poll_publishes_original_receipt_then_recovers_at_ne
             .collect::<Vec<_>>(),
         "a source failure must not remove known catalog membership",
     );
+    for name in [
+        MarketStatsFieldName::Volume24h,
+        MarketStatsFieldName::OpenInterest,
+    ] {
+        let field = &failed.markets[0].fields[&name];
+        assert_eq!(field.state, MarketStatsFieldState::Stale);
+        assert_eq!(field.value, initial.markets[0].fields[&name].value);
+        assert_eq!(field.received_timestamp, Some(WALL_ORIGIN));
+    }
 
     advance_to(origin + Duration::from_secs(60)).await;
     source.next_call().await.succeed(Instant::now());
