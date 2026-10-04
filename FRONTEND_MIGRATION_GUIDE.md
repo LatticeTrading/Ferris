@@ -412,7 +412,8 @@ estimate or `currentUnclassified` rate is not a settled payment.
 | Bybit inverse contracts | Base/USD volume; OI amount null, value is USD |
 | Bybit options | Base/quote volume; OI base amount, notional null |
 | Hyperliquid perpetuals | Quote-only volume; OI base amount, notional null |
-| Aster / Lighter perpetuals | Base/quote volume; OI unsupported |
+| Aster perpetuals | Base/quote volume; OI unsupported |
+| Lighter perpetuals | Base/quote volume; OI amount null, value is two-sided USDC notional (`2 ×` one-sided WS OI); do not double again |
 | Extended perpetuals | Base/collateral volume and OI; public HTTP verified with the User-Agent fix |
 | Spot | Funding, OI, mark/index are not applicable; use supported last/volume fields; Hyperliquid last remains unsupported |
 
@@ -844,7 +845,8 @@ content type before decoding success data.
 | --- | --- |
 | Hyperliquid `lastPrice` unsupported | Show funding, mark/index, quote volume, and OI amount independently. Leave Last unavailable; if showing mark in a general Price column, label it Mark rather than pretending it is Last. |
 | Binance OI requires selected IDs | Keep bulk funding/prices/volume working; request OI only for selected markets. |
-| Aster/Lighter OI unsupported | Show the rest of the row, not a failed screener. |
+| Aster OI unsupported | Show the rest of the row, not a failed screener. |
+| Lighter OI amount null | Show the available two-sided USDC value; do not treat it as one-sided or multiply it again. |
 | A numeric value member is null | Show that component as missing; keep the other member and other metrics. |
 | Only funding appears | Check whether `fields` was omitted; funding is the default, not all fields. |
 | Catalog loads but numbers do not | Check the separate statistics request, profile, ID join, field states, coverage, and WS reducer. |
@@ -863,6 +865,8 @@ request/decoder bug.
 ## 10. Handoff checks and evidence boundary
 
 The 2026-10-03 deployed compatibility investigation observed:
+
+Lighter's OI exclusion in this historical evidence is superseded by the 2026-10-04 two-sided OI change described above.
 
 - Latest and previous-day BTC one-minute histories: HTTP 200 and 200 ordered
   candles each on Binance, Bybit, Hyperliquid, Aster, and Lighter.

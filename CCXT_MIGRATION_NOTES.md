@@ -28,11 +28,12 @@ not retained fallback transports.
   `fetchTickers`; Aster funding/interval/ticker methods; Extended `fetchTickers`;
   Lighter REST `fetchTickers` plus maintained Pro `watchTickers`.
 - User decisions: no Binance all-market OI sweep; selected-ID demand is shared.
-  Aster OI has no stock method. Lighter OI remains unsupported until stock supplies
-  qualified units; neither raw magnitude nor the unified field name establishes them.
+  Aster OI has no stock method. The 2026-10-04 Lighter decision supersedes its prior
+  unsupported status: publish twice the one-sided WS `open_interest` as two-sided
+  USDC notional, with null amount. REST OI is one-sided base and is not used.
 - Provenance is `{exchange}:ccxt:{method}`. Each stock response has its own receipt;
   catalog/cache reads do not freshen values. Lighter REST cannot freshen silent live
-  funding/mark/index. Missing exchange time remains null. Funding/price strings
+  funding/mark/index/OI. Missing exchange time remains null. Funding/price strings
   preserve raw spelling; only the two new metrics use nullable finite JSON numbers.
 - Binance `is_linear`/`is_inverse` prioritize subtype over type; a constructor's
   linear default misrouted bulk spot/option tickers. Real backend reproduction

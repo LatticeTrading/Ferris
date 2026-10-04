@@ -516,11 +516,13 @@ Mark/index/last prices use catalog base/quote assets, independently of settlemen
 
 Use public exchange ID `lighterxyz`; stock CCXT calls the provider `lighter`. Catalog-issued identities retain numeric native IDs, for example `["lighterxyz","perp",null,null,"1"]`. Default enumeration is perpetuals; `type: "spot"` selects spot. Display symbols are not identities.
 
-Stock `fetchTickers` polls `orderBookDetails` for last price and rolling volume. Stock Pro `watchTickers` maintains `market_stats/all` for perpetual funding, last-settled funding, mark/index, last and volume. Its live subscription shares the per-URL owner with public feeds; REST stays on the separate catalog/statistics owner. Capabilities report `sharedPollingAndWebSocket`. No native Ferris socket/parser remains.
+Stock `fetchTickers` polls `orderBookDetails` for last price and rolling volume. Stock Pro `watchTickers` maintains `market_stats/all` for perpetual funding, last-settled funding, mark/index, open interest, last and volume. Its live subscription shares the per-URL owner with public feeds; REST stays on the separate catalog/statistics owner. Capabilities report `sharedPollingAndWebSocket`. No native Ferris socket/parser remains.
 
 Funding uses exact percentage-valued strings with a one-hour basis: `rateUnit: percent`, `rateIntervalMs: 3600000`, `paymentIntervalMs: 3600000`. `current_funding_rate` is an estimate; `funding_rate` is distinct settled funding. A qualified `funding_timestamp` belongs only to settled `paymentTimestamp`, not to every field's exchange time. Thus `-0.0003` means `-0.0003%`, not `-0.03%`.
 
-REST polling cannot freshen silent live funding/mark/index observations. Each field expires after 90 seconds from its own receipt. **Open interest remains `unsupported` / `open-interest-units-unqualified`**, per the Phase 4 user decision; neither raw endpoint magnitude nor a CCXT field name establishes its units.
+Lighter open interest is **two-sided** (outstanding longs + shorts), matching the venue UI. `openInterestValue` is `2 × market_stats.open_interest` in USDC; the WS API field is one-sided notional. `openInterestAmount` stays null: Ferris does not divide by mark or mix in REST `orderBookDetails.open_interest`, which is one-sided base coins. For example, WS `118223213` yields `{"openInterestAmount":null,"openInterestValue":236446426}`. Do not double the returned value again.
+
+REST polling cannot freshen silent live funding/mark/index/OI observations. Each field expires after 90 seconds from its own receipt. Missing OI keys leave its prior observation untouched; null clears it as missing, invalid/nonfinite/negative values clear it as invalid, and zero remains available. Spot OI is `notApplicable`.
 
 ### Extended Market Statistics
 
@@ -573,7 +575,7 @@ Each field is `{state,value,reason,exchangeTimestamp,receivedTimestamp,source}`.
 `equivalents` use decimal-string arithmetic and simple linear scaling. Missing/invalid intervals or arithmetic overflow leave equivalents null without discarding the exact native rate, including zero. Positive means longs pay shorts. Do not treat an equivalent interval as a separate funding event or compound the annualized value.
 - Prices are `{amount,baseAsset,quoteAsset}`; quote is not necessarily settlement. Never replace index with midpoint or last price.
 - Spot funding/last-settled funding/OI/mark/index are `notApplicable`; supported spot last/volume follow capabilities. Expiry futures/options have no funding. Implemented inactive observations are `unavailable` / `inactive-market`.
-- Last-settled funding is supported only for Lighter perpetuals. Aster OI has no stock method; Lighter OI is unqualified. Other implemented metric units are listed below. Runtime outages do not change capabilities.
+- Last-settled funding is supported only for Lighter perpetuals. Aster OI has no stock method; Lighter OI is two-sided USDC notional. Other implemented metric units are listed below. Runtime outages do not change capabilities.
 - Bulk sources poll every 30 seconds per exchange/acquisition scope; selected Binance OI has shared per-market demand. Catalog metadata refreshes on demand after 30 seconds. Cache reads never manufacture receipts. Failures immediately stale retained values; independent 90-second expiry also runs during pending requests. Aster/Bybit estimates additionally expire at their advertised payment boundary. Explicit invalid values cannot be resurrected by later failures.
 - HTTP requests renew a 90-second demand lease; WS subscriptions hold persistent reference-counted demand. Idle workers stop. Capabilities disclose these limits and receipt-time freshness.
 
@@ -612,7 +614,7 @@ No Ferris currency/contract conversion or missing-side price multiplication is p
 | Hyperliquid perpetual | null / quote `dayNtlVlm` | Base amount / null |
 | Extended perpetual | Base `dailyVolumeBase` / collateral `dailyVolume` | Base `openInterestBase` / collateral `openInterest` (catalog USD naming) |
 | Aster perpetual | Base `volume` / quote `quoteVolume` | Unsupported |
-| Lighter perpetual | Base `daily_base_token_volume` / quote `daily_quote_token_volume` | Unsupported: units unqualified |
+| Lighter perpetual | Base `daily_base_token_volume` / quote `daily_quote_token_volume` | null / two-sided USDC notional (`2 ×` WS `open_interest`) |
 | Supported spot products | Base / quote from the venue ticker; Hyperliquid preserves quote-only volume | Not applicable |
 
 Primary field references: [Binance OI](https://developers.binance.com/docs/derivatives/usds-margined-futures/market-data/rest-api/Open-Interest), [Binance option contracts and units](https://developers.binance.com/legacy-docs/derivatives/options-trading/market-data/Exchange-Information), [option volume](https://developers.binance.com/legacy-docs/derivatives/options-trading/market-data/24hr-Ticker-Price-Change-Statistics), [option OI](https://developers.binance.com/legacy-docs/derivatives/options-trading/market-data/Open-Interest), [Bybit OI units](https://bybit-exchange.github.io/docs/v5/market/open-interest), [Bybit option multiplier/quantity](https://www.bybit.com/en/learn/options/bybit-options-lesson-options-parameters-introduction), [Hyperliquid contexts](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint/perpetuals), [Extended market statistics](https://api.docs.extended.exchange/#get-markets). These explain venue fields; the exact pinned stock mappings and unavailable members remain part of Ferris's contract.

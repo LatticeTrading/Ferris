@@ -71,9 +71,6 @@ pub(crate) fn field_support(
         (_, OpenInterest) if venue == Venue::Aster => {
             (Unsupported, Some("stock-method-not-supported"))
         }
-        (_, OpenInterest) if venue == Venue::Lighter => {
-            (Unsupported, Some("open-interest-units-unqualified"))
-        }
         (_, LastPrice) if venue == Venue::Hyperliquid => {
             (Unsupported, Some("stock-ticker-last-is-midpoint"))
         }
@@ -253,7 +250,7 @@ pub(super) fn capabilities(venue: Venue) -> MarketStatsCapabilities {
         ],
         Venue::Lighter => &[
             "funding-prices-via-stock-watchTickers",
-            "open-interest-units-unqualified",
+            "open-interest-two-sided-USDC-value-only-via-stock-watchTickers",
         ],
         Venue::Extended => &["stock-public-API-availability-limited"],
     };

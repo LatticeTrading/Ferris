@@ -1,5 +1,5 @@
 //! Stock Lighter statistics: `orderBookDetails` catalog + REST last/volume,
-//! with mark/index/last/funding/settled supplied by the maintained stock
+//! with mark/index/last/funding/settled/two-sided OI supplied by the maintained stock
 //! `watch_tickers` aggregate on the same websocket URL as public feeds.
 //!
 //! The fixture is the only upstream. Nothing here depends on a native Lighter
@@ -66,7 +66,7 @@ fn metadata_fixture() -> Value {
     json!({
         "code": 200,
         "order_book_details": [
-            {"market_id":86,"symbol":"BTC","market_type":"perp","status":"active","quote_asset_id":7,
+            {"market_id":86,"symbol":"BTC","market_type":"perp","status":"active","quote_asset_id":7,"open_interest":"999.0",
              "last_trade_price":"50000.00","daily_base_token_volume":100.0,"daily_quote_token_volume":5000000.0},
             {"market_id":87,"symbol":"ETH","market_type":"perp","status":"inactive","quote_asset_id":7,
              "last_trade_price":"1.0","daily_base_token_volume":1.0,"daily_quote_token_volume":1.0},
@@ -337,8 +337,16 @@ async fn lighter_rest_and_live_watch_cover_distinct_fields_on_one_url() {
         btc["fields"]["volume24h"]["value"]["quoteVolume"],
         5000000.0
     );
-    // Open interest stays unqualified.
-    assert_eq!(btc["fields"]["openInterest"]["state"], "unsupported");
+    // WS OI is one-sided USDC notional; publish the venue's two-sided value.
+    let interest = &btc["fields"]["openInterest"];
+    assert_eq!(interest["state"], "available");
+    assert_eq!(interest["reason"], Value::Null);
+    assert_eq!(interest["source"], "lighterxyz:ccxt:watchTickers");
+    assert_eq!(interest["exchangeTimestamp"], Value::Null);
+    assert_eq!(
+        interest["value"],
+        json!({"openInterestAmount":null,"openInterestValue":246.0})
+    );
     // Distinct rows carry distinct funding.
     let doge = row(&all["markets"], &id(99));
     assert_eq!(doge["fields"]["funding"]["value"]["rate"], "-0.0025");
@@ -439,6 +447,8 @@ async fn lighter_finite_frame_then_silence_keeps_live_receipts_across_bulk_polls
     let live_receipt = view.markets[&btc]["fields"]["markPrice"]["receivedTimestamp"].clone();
     let live_funding = view.markets[&btc]["fields"]["funding"]["receivedTimestamp"].clone();
     let rest_receipt = view.markets[&btc]["fields"]["lastPrice"]["receivedTimestamp"].clone();
+    let live_interest = view.markets[&btc]["fields"]["openInterest"].clone();
+    assert_eq!(live_interest["state"], "available");
     assert!(live_receipt.is_u64());
     assert!(rest_receipt.is_u64());
     // The finite frame delivered both rows even though no later frame arrives.
@@ -463,6 +473,7 @@ async fn lighter_finite_frame_then_silence_keeps_live_receipts_across_bulk_polls
         view.markets[&btc]["fields"]["lastSettledFunding"]["receivedTimestamp"],
         live_funding
     );
+    assert_eq!(view.markets[&btc]["fields"]["openInterest"], live_interest);
     assert_ne!(
         view.markets[&btc]["fields"]["lastPrice"]["receivedTimestamp"], rest_receipt,
         "REST-sourced fields do advance with a new bulk observation"
@@ -477,6 +488,7 @@ async fn lighter_finite_frame_then_silence_keeps_live_receipts_across_bulk_polls
         view.markets[&btc]["fields"]["markPrice"]["receivedTimestamp"],
         live_receipt
     );
+    assert_eq!(view.markets[&btc]["fields"]["openInterest"], live_interest);
     super::ws_unsubscribe(&mut socket, &view.topic).await;
     super::ws_disconnect(socket).await;
     state.shutdown_market_stats().await;
@@ -516,10 +528,51 @@ async fn lighter_live_invalid_scalars_clear_only_themselves() {
     assert_eq!(btc["fields"]["lastPrice"]["state"], "available");
     assert_eq!(btc["fields"]["lastSettledFunding"]["state"], "available");
     assert_eq!(btc["fields"]["volume24h"]["state"], "available");
+    assert_eq!(
+        btc["fields"]["openInterest"]["value"],
+        json!({"openInterestAmount":null,"openInterestValue":246.0})
+    );
     // A second row in the same frame is unaffected.
     let doge = row(&all["markets"], &id(99));
     assert_eq!(doge["fields"]["markPrice"]["state"], "available");
     assert_eq!(doge["fields"]["funding"]["value"]["rate"], "-0.0025");
+    state.shutdown_market_stats().await;
+    state.shutdown_realtime().await.unwrap();
+    backend_stop.send(()).unwrap();
+    backend_task.await.unwrap();
+    stop.send(()).unwrap();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn lighter_oi_only_frame_reports_two_sided_notional_without_a_mark() {
+    let (mock, base, stop, task) = server().await;
+    *mock.frames.write().await = vec![json!({
+        "type":"update/market_stats", "channel":"market_stats:all",
+        "market_stats": {
+            "86":{"market_id":86,"open_interest":118223213},
+            "99":{"market_id":99,"open_interest":0}
+        }
+    })];
+    let source: Arc<dyn MarketDataExchange> =
+        super::ccxt_stats_exchange(Venue::Lighter, &base, 2_000);
+    let (url, state, backend_stop, backend_task) = super::backend(source).await;
+    let client = reqwest::Client::new();
+    let all = super::stats_http(
+        &client,
+        &url,
+        json!({"exchange":"lighterxyz","fields":["openInterest"]}),
+        StatusCode::OK,
+    )
+    .await;
+    for (market_id, expected) in [(86, 236446426.0), (99, 0.0)] {
+        let interest = &row(&all["markets"], &id(market_id))["fields"]["openInterest"];
+        assert_eq!(interest["state"], "available");
+        assert_eq!(
+            interest["value"],
+            json!({"openInterestAmount":null,"openInterestValue":expected})
+        );
+    }
     state.shutdown_market_stats().await;
     state.shutdown_realtime().await.unwrap();
     backend_stop.send(()).unwrap();

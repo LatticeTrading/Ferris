@@ -33,7 +33,7 @@ Completed:
   - `GET /healthz`
 - All six venues (`binance`, `bybit`, `hyperliquid`, `lighterxyz`, `aster`, `extended`) acquire REST snapshots, realtime streams, and statistics through stock `ccxt`/`ccxt-pro` `4.5.85`, with default features disabled and only the six venue features enabled
 - CCXT core/catalog, REST snapshot, realtime streaming, and statistics phases (1–4) delivered and user-accepted; Lighter statistics use maintained stock Pro `watchTickers` sharing the per-URL owner
-- Numeric `volume24h`/`openInterest` value schemas delivered over HTTP and revisioned WS with venue-specific units; Binance OI is selected-market-only and Aster/Lighter OI remain explicitly unsupported
+- Numeric `volume24h`/`openInterest` value schemas delivered over HTTP and revisioned WS with venue-specific units; Binance OI is selected-market-only, Aster OI remains unsupported, and Lighter OI is two-sided USDC notional (`2 ×` one-sided WS OI, null amount)
 - Removed in the cutover: native exchange modules, native realtime/statistics transports and synchronizers, Hyperliquid's extra trade collector/cache, Lighter's Explorer catalog, `src/bin/market_stream`, `src/bin/orderbook_probe.rs`, `src/binance_orderbook.rs`, `src/bybit_full_orderbook.rs`, `src/ws_shared.rs`, and the `binance-sdk`/`crossterm` dependencies
 - Stock Hyperliquid public recent-trade snapshots; the former collector/cache and retention settings were removed in the CCXT cutover
 - Extended perpetual public market-data adapter: trades, OHLCV, order-book, and market snapshots plus realtime trades, books, and OHLCV

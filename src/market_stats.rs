@@ -543,6 +543,7 @@ fn fail_live(snapshot: &mut MarketStatsSourceSnapshot, message: &str) {
                         | MarketStatsFieldName::LastSettledFunding
                         | MarketStatsFieldName::MarkPrice
                         | MarketStatsFieldName::IndexPrice
+                        | MarketStatsFieldName::OpenInterest
                 )
             {
                 projection::fail_field(field, "upstream-failure");

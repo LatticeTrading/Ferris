@@ -777,6 +777,7 @@ fn lighter_ticker_frame(raw: &ccxt::Value) -> bool {
         && [
             "mark_price",
             "index_price",
+            "open_interest",
             "last_trade_price",
             "current_funding_rate",
             "daily_base_token_volume",

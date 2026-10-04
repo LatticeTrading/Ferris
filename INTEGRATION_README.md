@@ -19,7 +19,7 @@ All five snapshot endpoints and all `/v1/ws` channel acquisitions now use stock 
 - Hyperliquid exposes only the stock recent-trade window (no Ferris history collector/cache); Lighter has no realtime candle watcher, and Bybit option candles are unsupported.
 - Lighter WS book nonce is stock `offset`, not the former native `nonce`; Bybit live books cap at 1,000 levels (options 100); Aster live books cap at 20; Extended uses indicative standard books with `ts`/`seq`, not RFQ liquidity.
 - Extended REST/live trade and book symbols use `BASE/USDC:USDC` while the catalog display stays `BASE/USD`.
-- Statistics use numeric `volume24h`/`openInterest` value objects and venue-specific units; Binance OI requires selected IDs, Aster OI is unsupported, and Lighter OI remains unsupported.
+- Statistics use numeric `volume24h`/`openInterest` value objects and venue-specific units; Binance OI requires selected IDs, Aster OI is unsupported, and Lighter OI is two-sided USDC notional with null amount.
 - Sources name stock methods (`{exchange}:ccxt:{method}`); missing exchange timestamps stay `null` rather than being fabricated.
 
 ## What To Build
@@ -257,13 +257,13 @@ Important: use the `topic` returned in `subscribed` ack as your canonical local 
 
 ## Funding Statistics Client Flow
 
-All six registered venues now acquire statistics through stock CCXT/Pro. `volume24h` is supported across their qualified products; OI is supported for Binance selected contracts, Bybit contracts, Hyperliquid perpetuals, and Extended perpetuals. Aster OI has no stock method; Lighter OI remains unqualified/unsupported. Funding history and premium normalization remain unsupported. Query capabilities by product, not just exchange registration; see [numeric units](README.md#numeric-statistics-units).
+All six registered venues now acquire statistics through stock CCXT/Pro. `volume24h` is supported across their qualified products; OI is supported for Binance selected contracts, Bybit contracts, Hyperliquid perpetuals, Extended perpetuals, and Lighter perpetuals. Aster OI has no stock method. Funding history and premium normalization remain unsupported. Query capabilities by product, not just exchange registration; see [numeric units](README.md#numeric-statistics-units).
 
 1. Get `/v1/capabilities`, then `/v1/fetchMarkets` for authoritative `marketId` strings. Display pairs can collide; statistics use opaque IDs, not `symbol`.
 
 For Binance options, `openInterestAmount` is contracts and `openInterestValue` is USD; do not convert or label them as base/quote automatically. `baseVolume` is null unless explicit catalog contract unit is 1; quote turnover remains available. Option `indexPrice` comes from stock `eapiPublicGetIndex`, not the ticker's settlement-sensitive `exercisePrice`.
 
-For Lighter, use `exchange: "lighterxyz"` and catalog-issued numeric IDs, for example `["lighterxyz","perp",null,null,"1"]`. Stock REST `fetchTickers` and maintained Pro `watchTickers` share the owner service (`sharedPollingAndWebSocket`), with independent field receipts. Funding remains hourly `percent`: `current_funding_rate` is an estimate, `funding_rate` is settled, and `funding_timestamp` is only the latter's payment timestamp. `-0.0003` means `-0.0003%`. REST volume refreshes do not freshen silent live funding/mark/index. `type: "spot"` selects spot.
+For Lighter, use `exchange: "lighterxyz"` and catalog-issued numeric IDs, for example `["lighterxyz","perp",null,null,"1"]`. Stock REST `fetchTickers` and maintained Pro `watchTickers` share the owner service (`sharedPollingAndWebSocket`), with independent field receipts. Funding remains hourly `percent`: `current_funding_rate` is an estimate, `funding_rate` is settled, and `funding_timestamp` is only the latter's payment timestamp. `-0.0003` means `-0.0003%`. OI is venue-style two-sided: `openInterestValue = 2 ×` WS `open_interest` in USDC, with `openInterestAmount: null`; do not double again or use REST's one-sided base OI as notional. REST volume refreshes do not freshen silent live funding/mark/index/OI. `type: "spot"` selects spot, where OI is not applicable.
 
 For Bybit, null/empty params mean `{"category":"linear"}`. `category: "inverse"`, `"spot"`, and `"option"` select other products; `type: "future"` selects expiry futures in a contract category. IDs must match the category, for example `["bybit","perp","linear",null,"BTCUSDT"]`. Default enumeration remains active non-prelisting perpetuals; known inactive selections report `inactive-market`. Stock bulk tickers supply prices, volume and OI. Linear OI is base amount; inverse OI is USD value, **not** base quantity. The absent stock numeric member remains null.
 

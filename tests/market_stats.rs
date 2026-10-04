@@ -458,7 +458,7 @@ async fn market_stats_http_capabilities_bounds_and_catalog_proof() {
                 );
                 assert_eq!(
                     stats["fields"]["perp"]["openInterest"]["state"],
-                    "unsupported"
+                    "supported"
                 );
                 assert_eq!(stats["fields"]["spot"]["funding"]["state"], "notApplicable");
             }

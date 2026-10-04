@@ -46,7 +46,7 @@ use super::{
 pub(super) const NOT_REQUESTED: &str = "not-requested";
 
 /// Source label for the maintained Lighter `market_stats/all` stream, which is
-/// the only stock source for Lighter funding/mark/index. Matches the
+/// the source for Lighter funding/mark/index/two-sided OI. Matches the
 /// coordinator's live-failure source constant.
 pub(super) const LIGHTER_LIVE_SOURCE: &str = "lighterxyz:ccxt:watchTickers";
 
@@ -914,10 +914,11 @@ fn build_fields(
                             | MarketStatsFieldName::LastSettledFunding
                             | MarketStatsFieldName::MarkPrice
                             | MarketStatsFieldName::IndexPrice
+                            | MarketStatsFieldName::OpenInterest
                     )
                 {
-                    // REST `fetch_tickers` does not carry these; the shared
-                    // live `watchTickers` feed is the only stock source.
+                    // These use live `watchTickers` only. REST OI is base
+                    // amount, unlike the live one-sided USDC notional.
                     (not_requested(), None)
                 } else if !entry.market.active {
                     (unavailable("inactive-market"), None)
@@ -1794,6 +1795,12 @@ pub(super) fn lighter_ticker_patch(
             fields.insert(name, lighter_price(raw, base, quote, receipt));
         }
     }
+    if let Some(raw) = info.get("open_interest") {
+        fields.insert(
+            MarketStatsFieldName::OpenInterest,
+            lighter_open_interest(raw, receipt),
+        );
+    }
     if info.contains_key("daily_base_token_volume") || info.contains_key("daily_quote_token_volume")
     {
         let base = info
@@ -1841,6 +1848,32 @@ fn lighter_price(raw: &Value, base: &str, quote: &str, receipt: Receipt) -> Mark
     match lexical(raw).and_then(|raw| price_value(Some(raw), base, quote)) {
         Some(value) => observed(LIGHTER_LIVE_SOURCE, value, None, Some(receipt)),
         None => invalid(LIGHTER_LIVE_SOURCE, receipt),
+    }
+}
+
+fn lighter_open_interest(raw: &Value, receipt: Receipt) -> MarketStatsField {
+    match nonneg_number(raw) {
+        Err(()) => invalid(LIGHTER_LIVE_SOURCE, receipt),
+        Ok(None) => MarketStatsField {
+            received_timestamp: Some(receipt.wall),
+            ..missing(LIGHTER_LIVE_SOURCE, None)
+        },
+        Ok(Some(one_sided)) => {
+            // WS OI is one-sided USDC notional; Lighter displays longs + shorts.
+            let two_sided = 2.0 * one_sided;
+            if !two_sided.is_finite() {
+                return invalid(LIGHTER_LIVE_SOURCE, receipt);
+            }
+            observed(
+                LIGHTER_LIVE_SOURCE,
+                MarketStatsValue::OpenInterest(OpenInterestValue {
+                    open_interest_amount: None,
+                    open_interest_value: Some(two_sided),
+                }),
+                None,
+                Some(receipt),
+            )
+        }
     }
 }
 
@@ -2016,6 +2049,45 @@ mod tests {
         assert_eq!(mark.state, MarketStatsFieldState::Unavailable);
         assert_eq!(mark.value, None);
         assert_eq!(mark.reason.as_deref(), Some("invalid-upstream-value"));
+    }
+
+    #[test]
+    fn lighter_open_interest_doubles_notional_and_rejects_invalid_values() {
+        let receipt = Receipt {
+            at: Instant::now(),
+            wall: 42,
+        };
+        for (raw, expected) in [
+            (Value::from("118223213"), 236446426.0),
+            (Value::Float(123.25), 246.5),
+            (Value::Int(0), 0.0),
+        ] {
+            let field = lighter_open_interest(&raw, receipt);
+            assert_eq!(field.state, MarketStatsFieldState::Available);
+            assert_eq!(
+                serde_json::to_value(field.value).unwrap(),
+                serde_json::json!({"openInterestAmount":null,"openInterestValue":expected})
+            );
+            assert_eq!(field.received_timestamp, Some(42));
+            assert_eq!(field.exchange_timestamp, None);
+        }
+        for raw in [
+            Value::from("-1"),
+            Value::from("not-a-number"),
+            Value::from("NaN"),
+            Value::Float(f64::INFINITY),
+            Value::Float(f64::MAX),
+        ] {
+            let field = lighter_open_interest(&raw, receipt);
+            assert_eq!(field.state, MarketStatsFieldState::Unavailable);
+            assert_eq!(field.value, None);
+            assert_eq!(field.reason.as_deref(), Some("invalid-upstream-value"));
+        }
+        let field = lighter_open_interest(&Value::from_json(&JsonValue::Null), receipt);
+        assert_eq!(field.state, MarketStatsFieldState::Unavailable);
+        assert_eq!(field.value, None);
+        assert_eq!(field.reason.as_deref(), Some("missing-upstream-row"));
+        assert_eq!(field.received_timestamp, Some(42));
     }
 
     #[test]
@@ -2221,7 +2293,8 @@ mod tests {
         let value = ticker(serde_json::json!({
             "last_trade_price": "3013.13",
             "daily_base_token_volume": "1",
-            "daily_quote_token_volume": "2"
+            "daily_quote_token_volume": "2",
+            "open_interest": "43923.19"
         }));
         let src = sources(Some(&value));
         let (fields, _) = build_fields(Venue::Lighter, &catalog, &src, true);
@@ -2230,6 +2303,7 @@ mod tests {
             MarketStatsFieldName::LastSettledFunding,
             MarketStatsFieldName::MarkPrice,
             MarketStatsFieldName::IndexPrice,
+            MarketStatsFieldName::OpenInterest,
         ] {
             assert_eq!(fields[&name].reason.as_deref(), Some(NOT_REQUESTED));
             assert_eq!(fields[&name].received_timestamp, None);
@@ -2237,10 +2311,6 @@ mod tests {
         assert_eq!(
             fields[&MarketStatsFieldName::LastPrice].state,
             MarketStatsFieldState::Available
-        );
-        assert_eq!(
-            fields[&MarketStatsFieldName::OpenInterest].state,
-            MarketStatsFieldState::Unsupported
         );
     }
 
