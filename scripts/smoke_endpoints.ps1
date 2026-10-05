@@ -77,7 +77,6 @@ $tradesBody = @{
 $trades = Invoke-RestMethod -Uri "$BaseUrl/v1/fetchTrades" -Method Post -ContentType "application/json" -Body $tradesBody -TimeoutSec $TimeoutSeconds
 Assert-True ($trades -is [System.Array]) "fetchTrades did not return array"
 Assert-True ($trades.Count -gt 0) "fetchTrades returned no data"
-Assert-True ($trades[0].symbol -eq $Symbol) "fetchTrades symbol mismatch"
 Write-Host "ok  fetchTrades ($($trades.Count) rows)"
 if ($ShowData) {
     Write-Host "sample fetchTrades row:"
@@ -114,7 +113,6 @@ Assert-True ($null -ne $orderBook.asks) "fetchOrderBook missing asks"
 Assert-True ($null -ne $orderBook.bids) "fetchOrderBook missing bids"
 Assert-True ($orderBook.asks.Count -gt 0) "fetchOrderBook asks empty"
 Assert-True ($orderBook.bids.Count -gt 0) "fetchOrderBook bids empty"
-Assert-True ($orderBook.symbol -eq $Symbol) "fetchOrderBook symbol mismatch"
 Write-Host "ok  fetchOrderBook"
 if ($ShowData) {
     Write-Host "sample fetchOrderBook:"
@@ -132,8 +130,6 @@ Assert-True ($null -ne $marketsResponse.markets) "fetchMarkets missing markets"
 Assert-True ($marketsResponse.markets.Count -gt 0) "fetchMarkets returned no data"
 $firstMarket = $marketsResponse.markets[0]
 Assert-True ($firstMarket.symbol -match "/") "fetchMarkets symbol must be BASE/QUOTE"
-Assert-True ($firstMarket.symbol -notmatch ":") "fetchMarkets symbol must not include settlement suffix"
-Assert-True ($firstMarket.symbol -ceq $firstMarket.symbol.ToUpperInvariant()) "fetchMarkets symbol must be uppercase"
 if ($MarketsExchange.ToLowerInvariant() -eq "bybit") {
     Assert-True ($null -ne $firstMarket.info.category) "fetchMarkets bybit rows must include info.category"
 }

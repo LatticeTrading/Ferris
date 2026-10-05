@@ -1,11 +1,11 @@
-FROM rust:1.85-slim-bookworm AS builder
+FROM rust:1.98.1-slim-bookworm AS builder
 
 WORKDIR /app
 
-COPY Cargo.toml ./
+COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 
-RUN cargo build --release
+RUN cargo build --locked --release --bin ferris-market-data-backend -j 1
 
 FROM debian:bookworm-slim
 

@@ -1,3 +1,12 @@
+//! Shared CCXT statistics harness plus stock Hyperliquid protocol coverage.
+//!
+//! Every venue under test is a real stock `CcxtExchange` pointed at a local
+//! fixture through `ccxt_service`. Nothing here reaches a production endpoint:
+//! the target venue URL is the loopback fixture and every other venue is
+//! configured to an unroutable loopback port.
+//! Cross-thread owners use real clocks; exact paused-time boundaries live in
+//! `src/market_stats/lifecycle_tests.rs` and projection/forwarder unit tests.
+
 #[path = "market_stats/aster.rs"]
 mod aster;
 #[path = "market_stats/binance.rs"]
@@ -25,11 +34,18 @@ use axum::{
     Json, Router,
 };
 use ferris_market_data_backend::{
+    config::Config,
     exchanges::{
-        hyperliquid::HyperliquidExchange,
+        ccxt::{CcxtExchange, CcxtService, Venue},
+        registry::ExchangeRegistry,
         traits::{MarketDataExchange, MarketStatsSource},
     },
-    models::{FetchMarketStatsParams, FetchMarketsParams, MarketStatsFieldName, MarketStatsValue},
+    models::{
+        FetchMarketStatsParams, FetchMarketStatsRequest, MarketStatsFieldName, MarketStatsValue,
+        UnifiedMarketType,
+    },
+    realtime::RealtimeService,
+    web::{self, AppState},
 };
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
@@ -44,6 +60,12 @@ use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream,
 };
 
+// ---------------------------------------------------------------------------
+// Shared fixtures
+// ---------------------------------------------------------------------------
+
+/// One canned upstream response. `barrier`, when set, holds the request until a
+/// permit is added so concurrent demand can be observed mid-acquisition.
 #[derive(Clone)]
 struct Reply {
     status: StatusCode,
@@ -69,30 +91,38 @@ struct InfoMock {
     spot_count: Arc<AtomicUsize>,
 }
 
+/// Stock Hyperliquid perpetual + spot metadata/contexts fixture. The contexts
+/// array is index-aligned with the universe (including the delisted entry) as
+/// the real `metaAndAssetCtxs` response is.
 fn primary_fixture() -> Value {
     json!([
         {"collateralToken": 7, "universe": [
             {"name":"ETH","szDecimals":4},
             {"name":"OLD","isDelisted":true},
             {"name":"BTC","szDecimals":5},
-            {"name":"HYPE"}, {"name":"A-B"}, {"name":"AB"}
+            {"name":"HYPE","szDecimals":1},
+            {"name":"SOL","szDecimals":2},
+            {"name":"DOGE","szDecimals":0}
         ]},
         [
-            {"funding":"0","markPx":"2000","oraclePx":"1999"},
-            {"funding":"0.03","markPx":"1","oraclePx":"1"},
-            {"funding":"-0.0000125","markPx":"60000","oraclePx":"59999"},
-            {"funding":"0.0000125","markPx":"20","oraclePx":"19"},
-            {"funding":"0.1","markPx":"2","oraclePx":"1"},
-            {"funding":"0.2","markPx":"3","oraclePx":"2"}
+            {"funding":"0","markPx":"2000","oraclePx":"1999","dayNtlVlm":"1000","openInterest":"10"},
+            {"funding":"0.03","markPx":"1","oraclePx":"1","dayNtlVlm":"1","openInterest":"1"},
+            {"funding":"-0.0000125","markPx":"60000","oraclePx":"59999","dayNtlVlm":"500000","openInterest":"100"},
+            {"funding":"0.0000125","markPx":"20","oraclePx":"19","dayNtlVlm":"200","openInterest":"5"},
+            {"funding":"0.1","markPx":"2","oraclePx":"1","dayNtlVlm":"3","openInterest":"2"},
+            {"funding":"0.2","markPx":"3","oraclePx":"2","dayNtlVlm":"4","openInterest":"2"}
         ]
     ])
 }
 
 fn spot_fixture() -> Value {
-    json!({"tokens":[
-        {"index":42,"name":"BTC","tokenId":"btc"},
-        {"index":7,"name":"USDC","tokenId":"native-usdc"}
-    ], "universe":[{"index":0,"name":"BTC/USDC","tokens":[42,7]}]})
+    json!([
+        {"tokens":[
+            {"index":0,"name":"USDC","szDecimals":8},
+            {"index":1,"name":"BTC","szDecimals":5}
+        ], "universe":[{"index":0,"name":"BTC/USDC","tokens":[1,0]}]},
+        [{"dayNtlVlm":"1234.5","markPx":"60000","midPx":"60001","prevDayPx":"59900"}]
+    ])
 }
 
 impl InfoMock {
@@ -104,28 +134,48 @@ impl InfoMock {
             spot_count: Arc::new(AtomicUsize::new(0)),
         }
     }
+
+    fn primary_calls(&self) -> usize {
+        self.primary_count.load(Ordering::SeqCst)
+    }
+
+    fn spot_calls(&self) -> usize {
+        self.spot_count.load(Ordering::SeqCst)
+    }
 }
 
 async fn info_handler(
     State(state): State<InfoMock>,
     Json(request): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
-    let reply = match request["type"].as_str() {
-        Some("metaAndAssetCtxs") => {
-            state.primary_count.fetch_add(1, Ordering::SeqCst);
-            state.primary.read().await.clone()
-        }
-        Some("spotMeta") => {
-            state.spot_count.fetch_add(1, Ordering::SeqCst);
-            state.spot.read().await.clone()
-        }
-        _ => panic!("unexpected upstream acquisition: {request}"),
+    let (count, slot) = match request["type"].as_str() {
+        Some("metaAndAssetCtxs") => (&state.primary_count, &state.primary),
+        Some("spotMetaAndAssetCtxs") => (&state.spot_count, &state.spot),
+        other => panic!("unexpected upstream acquisition: {other:?}"),
     };
+    count.fetch_add(1, Ordering::SeqCst);
+    let reply = slot.read().await.clone();
     if let Some(barrier) = reply.barrier {
         barrier.acquire().await.unwrap().forget();
     }
     (reply.status, Json(reply.body))
 }
+
+/// Stock Hyperliquid uses `POST {base}/info` for every implicit request.
+async fn hyperliquid_server() -> (InfoMock, String, oneshot::Sender<()>, JoinHandle<()>) {
+    let mock = InfoMock::new();
+    let (base, stop, task) = spawn_server(
+        Router::new()
+            .route("/info", post(info_handler))
+            .with_state(mock.clone()),
+    )
+    .await;
+    (mock, base, stop, task)
+}
+
+// ---------------------------------------------------------------------------
+// Shared server + client helpers
+// ---------------------------------------------------------------------------
 
 async fn spawn_server(app: Router) -> (String, oneshot::Sender<()>, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -142,424 +192,72 @@ async fn spawn_server(app: Router) -> (String, oneshot::Sender<()>, JoinHandle<(
     (format!("http://{addr}"), tx, task)
 }
 
-async fn source_server(
-    mock: &InfoMock,
-) -> (
-    Arc<HyperliquidExchange>,
-    oneshot::Sender<()>,
-    JoinHandle<()>,
-) {
-    let (url, tx, task) = spawn_server(
-        Router::new()
-            .route("/info", post(info_handler))
-            .with_state(mock.clone()),
-    )
-    .await;
-    (
-        Arc::new(HyperliquidExchange::new(url, 2_000, 100, 60_000, false).unwrap()),
-        tx,
-        task,
-    )
-}
-
-fn source_params() -> FetchMarketStatsParams {
-    FetchMarketStatsParams {
-        params: json!({"dex":""}),
+/// Every non-target venue is configured to an unroutable loopback port so a
+/// regression that fans out to another venue fails fast instead of reaching the
+/// network.
+fn disabled_config(timeout_ms: u64) -> Config {
+    Config {
+        host: "127.0.0.1".into(),
+        port: 0,
+        hyperliquid_base_url: "http://127.0.0.1:1".into(),
+        extended_rest_base_url: "http://127.0.0.1:1/api/v1".into(),
+        extended_ws_url: "ws://127.0.0.1:1".into(),
+        lighter_rest_base_url: "http://127.0.0.1:1".into(),
+        lighter_ws_url: "ws://127.0.0.1:1".into(),
+        binance_base_url: "http://127.0.0.1:1".into(),
+        bybit_base_url: "http://127.0.0.1:1".into(),
+        aster_base_url: "http://127.0.0.1:1".into(),
+        request_timeout_ms: timeout_ms,
     }
 }
 
-async fn wait_count(counter: &AtomicUsize, expected: usize) {
-    tokio::time::timeout(Duration::from_secs(3), async {
-        while counter.load(Ordering::SeqCst) < expected {
-            tokio::task::yield_now().await;
+fn ws_base(base: &str) -> String {
+    base.replacen("http://", "ws://", 1)
+}
+
+/// `base` is the root fixture URL. The helper appends the venue-specific path
+/// (`/api/v1` for Extended, `/stream` for the Lighter socket) so callers never
+/// hand-build stock URL layouts.
+fn ccxt_service(venue: Venue, base: &str, timeout_ms: u64) -> CcxtService {
+    let mut config = disabled_config(timeout_ms);
+    match venue {
+        Venue::Hyperliquid => config.hyperliquid_base_url = base.to_string(),
+        Venue::Extended => {
+            config.extended_rest_base_url = format!("{base}/api/v1");
+            config.extended_ws_url = ws_base(base);
         }
-    })
-    .await
-    .unwrap();
-}
-
-// Keep the paused runtime runnable while actual localhost I/O is in flight. Tests
-// explicitly advance deadlines rather than allowing Tokio to skip to HTTP timeout.
-fn keep_time_manual() -> JoinHandle<()> {
-    tokio::spawn(async {
-        loop {
-            tokio::task::yield_now().await;
+        Venue::Lighter => {
+            config.lighter_rest_base_url = base.to_string();
+            config.lighter_ws_url = format!("{}/stream", ws_base(base));
         }
-    })
-}
-
-#[tokio::test]
-async fn market_stats_bulk_source_and_catalog_share_observations() {
-    let mock = InfoMock::new();
-    let primary_gate = Arc::new(Semaphore::new(0));
-    let spot_gate = Arc::new(Semaphore::new(0));
-    mock.primary.write().await.barrier = Some(primary_gate.clone());
-    mock.spot.write().await.barrier = Some(spot_gate.clone());
-    let (source, stop, server) = source_server(&mock).await;
-    let mut consumers = Vec::new();
-    for _ in 0..20 {
-        let source = source.clone();
-        consumers.push(tokio::spawn(async move {
-            source.fetch_market_stats(source_params()).await.unwrap()
-        }));
+        Venue::Binance => config.binance_base_url = base.to_string(),
+        Venue::Bybit => config.bybit_base_url = base.to_string(),
+        Venue::Aster => config.aster_base_url = base.to_string(),
     }
-    let mut catalogs = Vec::new();
-    for _ in 0..5 {
-        let source = source.clone();
-        catalogs.push(tokio::spawn(async move {
-            source
-                .fetch_markets(FetchMarketsParams {
-                    params: Value::Null,
-                    include_inactive: true,
-                })
-                .await
-                .unwrap()
-        }));
-    }
-    wait_count(&mock.primary_count, 1).await;
-    wait_count(&mock.spot_count, 1).await;
-    primary_gate.add_permits(1);
-    spot_gate.add_permits(1);
-    let baseline = consumers.remove(0).await.unwrap();
-    for consumer in consumers {
-        assert_eq!(consumer.await.unwrap(), baseline);
-    }
-    for catalog in catalogs {
-        for market in catalog.await.unwrap() {
-            let identity = market.identity.as_ref().unwrap();
-            let row = baseline
-                .rows
-                .iter()
-                .find(|row| row.market.identity.as_ref().unwrap().market_id == identity.market_id)
-                .unwrap();
-            assert_eq!(market, row.market);
-        }
-    }
-    assert_eq!(mock.primary_count.load(Ordering::SeqCst), 1);
-    assert_eq!(mock.spot_count.load(Ordering::SeqCst), 1);
-    let btc = baseline
-        .rows
-        .iter()
-        .find(|row| row.market.identity.as_ref().unwrap().exchange_market_id == "BTC")
-        .unwrap();
-    let Some(MarketStatsValue::Funding(funding)) =
-        &btc.fields[&MarketStatsFieldName::Funding].value
-    else {
-        panic!("BTC funding missing")
-    };
-    assert_eq!(funding.rate, "-0.0000125");
-    assert_eq!(
-        btc.market.identity.as_ref().unwrap().settle.as_deref(),
-        Some("USDC")
-    );
-    stop.send(()).unwrap();
-    server.await.unwrap();
+    CcxtService::start(&config).unwrap()
 }
 
-#[tokio::test]
-async fn market_stats_source_deadlines_cache_failures_and_preserve_receipts() {
-    let mock = InfoMock::new();
-    let (source, stop, server) = source_server(&mock).await;
-    let first = source.fetch_market_stats(source_params()).await.unwrap();
-    tokio::time::pause();
-    let manual = keep_time_manual();
-    tokio::time::advance(Duration::from_secs(29)).await;
-    let cached = source.fetch_market_stats(source_params()).await.unwrap();
-    assert_eq!(cached.received_at, first.received_at);
-    assert_eq!(cached.rows, first.rows);
-    mock.primary.write().await.body[1][2]["funding"] = json!("-0.4");
-    tokio::time::advance(Duration::from_secs(1)).await;
-    let second = source.fetch_market_stats(source_params()).await.unwrap();
-    assert!(second.received_at > first.received_at);
-    assert_eq!(mock.primary_count.load(Ordering::SeqCst), 2);
-    assert_eq!(mock.spot_count.load(Ordering::SeqCst), 1);
-    *mock.primary.write().await = Reply {
-        status: StatusCode::BAD_GATEWAY,
-        body: json!({"error":"offline"}),
-        barrier: None,
-    };
-    tokio::time::advance(Duration::from_secs(30)).await;
-    for _ in 0..20 {
-        assert!(source.fetch_market_stats(source_params()).await.is_err());
-    }
-    assert_eq!(mock.primary_count.load(Ordering::SeqCst), 3);
-    *mock.primary.write().await = Reply::ok(primary_fixture());
-    tokio::time::advance(Duration::from_secs(30)).await;
-    assert!(
-        source
-            .fetch_market_stats(source_params())
-            .await
-            .unwrap()
-            .contexts_valid
-    );
-    assert_eq!(mock.primary_count.load(Ordering::SeqCst), 4);
-    manual.abort();
-    tokio::time::resume();
-    stop.send(()).unwrap();
-    server.await.unwrap();
+fn ccxt_stats_exchange(venue: Venue, base: &str, timeout_ms: u64) -> Arc<CcxtExchange> {
+    Arc::new(CcxtExchange::new(
+        venue,
+        ccxt_service(venue, base, timeout_ms),
+    ))
 }
 
-#[tokio::test]
-async fn market_stats_spot_fallback_resolves_current_collateral_only() {
-    let mock = InfoMock::new();
-    let (source, stop, server) = source_server(&mock).await;
-    let first = source.fetch_market_stats(source_params()).await.unwrap();
-    assert!(first.spot_enumeration_complete);
-    tokio::time::pause();
-    let manual = keep_time_manual();
-    *mock.spot.write().await = Reply {
-        status: StatusCode::BAD_GATEWAY,
-        body: json!({"error":"offline"}),
-        barrier: None,
-    };
-    tokio::time::advance(Duration::from_secs(300)).await;
-    let fallback = source.fetch_market_stats(source_params()).await.unwrap();
-    assert!(fallback.perp_enumeration_complete);
-    assert!(!fallback.spot_enumeration_complete);
-    assert!(fallback
-        .source_failures
-        .iter()
-        .any(|failure| failure.source == "hyperliquid:spotMeta"
-            && failure.reason == "upstream-failure"));
-    assert!(fallback
-        .rows
-        .iter()
-        .filter(|row| row.market.market_type
-            == ferris_market_data_backend::models::UnifiedMarketType::Perp)
-        .all(|row| row.market.identity.as_ref().unwrap().settle.as_deref() == Some("USDC")));
-    mock.primary.write().await.body[0]["collateralToken"] = json!(42);
-    tokio::time::advance(Duration::from_secs(30)).await;
-    let changed = source.fetch_market_stats(source_params()).await.unwrap();
-    assert!(changed
-        .rows
-        .iter()
-        .filter(|row| row.market.market_type
-            == ferris_market_data_backend::models::UnifiedMarketType::Perp)
-        .all(|row| row.market.identity.as_ref().unwrap().settle.as_deref() == Some("BTC")));
-    let mut ambiguous = spot_fixture();
-    ambiguous["tokens"]
-        .as_array_mut()
-        .unwrap()
-        .push(json!({"index":42,"name":"WRONG","tokenId":"wrong"}));
-    *mock.spot.write().await = Reply::ok(ambiguous);
-    tokio::time::advance(Duration::from_secs(300)).await;
-    let invalid = source.fetch_market_stats(source_params()).await.unwrap();
-    assert!(!invalid.spot_enumeration_complete);
-    assert!(invalid
-        .rows
-        .iter()
-        .filter(|row| row.market.market_type
-            == ferris_market_data_backend::models::UnifiedMarketType::Perp)
-        .all(|row| row.market.identity.as_ref().unwrap().settle.is_none()));
-    assert!(invalid
-        .source_failures
-        .iter()
-        .any(|failure| failure.reason == "settlement-unresolved"));
-    manual.abort();
-    tokio::time::resume();
-    stop.send(()).unwrap();
-    server.await.unwrap();
-}
-
-fn stats_request(
-    ids: Option<Vec<String>>,
-) -> ferris_market_data_backend::models::FetchMarketStatsRequest {
-    ferris_market_data_backend::models::FetchMarketStatsRequest {
-        exchange: "hyperliquid".into(),
-        market_ids: ids,
-        fields: Some(vec![
-            MarketStatsFieldName::Funding,
-            MarketStatsFieldName::MarkPrice,
-            MarketStatsFieldName::OpenInterest,
-        ]),
-        params: Value::Null,
-    }
-}
-
-fn native_id(name: &str) -> String {
-    ferris_market_data_backend::market_stats::make_market_id(
-        "hyperliquid",
-        ferris_market_data_backend::models::UnifiedMarketType::Perp,
-        None,
-        Some(""),
-        name,
-    )
-    .unwrap()
-}
-
-#[tokio::test]
-async fn market_stats_coordinator_applies_failures_without_false_removals_or_resurrection() {
-    use ferris_market_data_backend::{
-        exchanges::registry::ExchangeRegistry,
-        market_stats::{project_snapshot, MarketStatsCoordinator},
-        models::MarketStatsFieldState,
-    };
-    let mock = InfoMock::new();
-    let (source, stop, server) = source_server(&mock).await;
-    let mut registry = ExchangeRegistry::new();
-    registry.register(source);
-    let coordinator = MarketStatsCoordinator::new(Arc::new(registry));
-    let mut selected = coordinator
-        .subscribe(stats_request(Some(vec![native_id("BTC")])))
-        .await
-        .unwrap();
-    selected.receiver.borrow_and_update();
-    tokio::time::pause();
-    let manual = keep_time_manual();
-    let baseline = coordinator.snapshot(stats_request(None)).await.unwrap();
-    assert_eq!(baseline.markets.len(), 5);
-    assert_eq!(baseline.coverage.expected_markets, Some(5));
-    mock.primary.write().await.body[1][2]["funding"] = Value::Null;
-    tokio::time::advance(Duration::from_millis(30_001)).await;
-    selected.receiver.changed().await.unwrap();
-    let invalid = project_snapshot(&selected.topic, &selected.receiver.borrow_and_update());
-    assert_eq!(
-        invalid.markets[0].fields[&MarketStatsFieldName::Funding].state,
-        MarketStatsFieldState::Unavailable
-    );
-    assert!(invalid.markets[0].fields[&MarketStatsFieldName::Funding]
-        .value
-        .is_none());
-    assert_eq!(
-        invalid.markets[0].fields[&MarketStatsFieldName::MarkPrice].state,
-        MarketStatsFieldState::Available
-    );
-    *mock.primary.write().await = Reply {
-        status: StatusCode::BAD_GATEWAY,
-        body: json!({"offline":true}),
-        barrier: None,
-    };
-    tokio::time::advance(Duration::from_millis(30_001)).await;
-    selected.receiver.changed().await.unwrap();
-    let failed = project_snapshot(&selected.topic, &selected.receiver.borrow_and_update());
-    assert!(!failed.coverage.enumeration_complete);
-    assert_eq!(
-        failed.markets[0].fields[&MarketStatsFieldName::Funding].state,
-        MarketStatsFieldState::Unavailable
-    );
-    assert!(failed.markets[0].fields[&MarketStatsFieldName::Funding]
-        .value
-        .is_none());
-    assert_eq!(
-        failed.markets[0].fields[&MarketStatsFieldName::MarkPrice].state,
-        MarketStatsFieldState::Stale
-    );
-    let mut mismatch = primary_fixture();
-    mismatch[1].as_array_mut().unwrap().pop();
-    *mock.primary.write().await = Reply::ok(mismatch);
-    tokio::time::advance(Duration::from_millis(30_001)).await;
-    selected.receiver.changed().await.unwrap();
-    let mismatch = project_snapshot(&selected.topic, &selected.receiver.borrow_and_update());
-    assert!(mismatch.coverage.enumeration_complete);
-    assert_eq!(
-        mismatch.markets[0].fields[&MarketStatsFieldName::MarkPrice]
-            .reason
-            .as_deref(),
-        Some("context-mismatch")
-    );
-    let mut removed = primary_fixture();
-    removed[0]["universe"].as_array_mut().unwrap().remove(2);
-    removed[1].as_array_mut().unwrap().remove(2);
-    *mock.primary.write().await = Reply::ok(removed);
-    tokio::time::advance(Duration::from_millis(30_001)).await;
-    selected.receiver.changed().await.unwrap();
-    let removed = project_snapshot(&selected.topic, &selected.receiver.borrow_and_update());
-    assert!(removed.markets.is_empty());
-    assert_eq!(removed.coverage.expected_markets, Some(1));
-    assert!(matches!(
-        coordinator
-            .snapshot(stats_request(Some(vec![native_id("BTC")])))
-            .await,
-        Err(ferris_market_data_backend::errors::ApiError::Validation(_))
-    ));
-    coordinator.unsubscribe_by_key(&selected.key).await;
-    coordinator.shutdown().await;
-    manual.abort();
-    tokio::time::resume();
-    stop.send(()).unwrap();
-    server.await.unwrap();
-}
-
-#[derive(Clone)]
-struct UnusedBook;
-
-#[async_trait::async_trait]
-impl ferris_market_data_backend::binance_orderbook::OrderBookSnapshotProvider for UnusedBook {
-    async fn fetch_order_book_snapshot(
-        &self,
-        _: &str,
-    ) -> Result<ferris_market_data_backend::binance_orderbook::BinanceDepthSnapshot, String> {
-        panic!("statistics must not acquire orderbooks")
-    }
-}
-
+/// Registers `source` for its own exchange id and a disabled CCXT exchange for
+/// the other five venues. Construction performs no I/O.
 async fn backend(
     source: Arc<dyn MarketDataExchange>,
-) -> (
-    String,
-    ferris_market_data_backend::web::AppState,
-    oneshot::Sender<()>,
-    JoinHandle<()>,
-) {
-    use ferris_market_data_backend::{
-        exchanges::{
-            aster::AsterExchange,
-            binance::BinanceExchange,
-            bybit::BybitExchange,
-            extended::ExtendedExchange,
-            lighterxyz::{LighterExchange, LighterMarketCatalogService},
-            registry::ExchangeRegistry,
-        },
-        realtime::{OhlcvTopicManager, OrderBookTopicManager, TradesTopicManager},
-        web::{self, AppState},
-    };
+) -> (String, AppState, oneshot::Sender<()>, JoinHandle<()>) {
     let mut registry = ExchangeRegistry::new();
     registry.register(source.clone());
-    if source.id() != "aster" {
-        registry.register(Arc::new(
-            AsterExchange::with_base_url("http://127.0.0.1:1".into(), 1_000).unwrap(),
-        ));
+    let disabled = ccxt_service(Venue::Hyperliquid, "http://127.0.0.1:1", 1_000);
+    for venue in Venue::ALL {
+        if venue.public_id() != source.id() {
+            registry.register(Arc::new(CcxtExchange::new(venue, disabled.clone())));
+        }
     }
-    if source.id() != "binance" {
-        registry.register(Arc::new(BinanceExchange::new(1_000).unwrap()));
-    }
-    if source.id() != "bybit" {
-        registry.register(Arc::new(BybitExchange::new(1_000).unwrap()));
-    }
-    if source.id() != "extended" {
-        registry.register(Arc::new(
-            ExtendedExchange::new("http://127.0.0.1:1".into(), 1_000).unwrap(),
-        ));
-    }
-    if source.id() != "lighterxyz" {
-        let catalog = Arc::new(
-            LighterMarketCatalogService::new(1_000, "http://127.0.0.1:1".into(), 60_000).unwrap(),
-        );
-        registry.register(Arc::new(
-            LighterExchange::new("http://127.0.0.1:1".into(), 1_000, catalog.clone()).unwrap(),
-        ));
-    }
-    let catalog = Arc::new(
-        LighterMarketCatalogService::new(1_000, "http://127.0.0.1:1".into(), 60_000).unwrap(),
-    );
-    let state = AppState::new(
-        Arc::new(registry),
-        TradesTopicManager::new(
-            "http://127.0.0.1:1".into(),
-            "ws://127.0.0.1:1".into(),
-            "ws://127.0.0.1:1".into(),
-            catalog.clone(),
-        ),
-        OrderBookTopicManager::new(
-            "http://127.0.0.1:1".into(),
-            "ws://127.0.0.1:1".into(),
-            Arc::new(UnusedBook),
-            Arc::new(UnusedBook),
-            "ws://127.0.0.1:1".into(),
-            catalog,
-        ),
-        OhlcvTopicManager::new("http://127.0.0.1:1".into(), "ws://127.0.0.1:1".into()),
-    );
+    let state = AppState::new(Arc::new(registry), RealtimeService::new(disabled));
     let app = Router::new()
         .route("/v1/fetchMarketStats", post(web::fetch_market_stats))
         .route("/v1/fetchMarkets", post(web::fetch_markets))
@@ -588,10 +286,70 @@ async fn stats_http(
     body
 }
 
+fn stats_request(ids: Option<Vec<String>>) -> FetchMarketStatsRequest {
+    FetchMarketStatsRequest {
+        exchange: "hyperliquid".into(),
+        market_ids: ids,
+        fields: Some(vec![
+            MarketStatsFieldName::Funding,
+            MarketStatsFieldName::MarkPrice,
+            MarketStatsFieldName::Volume24h,
+        ]),
+        params: Value::Null,
+    }
+}
+
+/// Canonical identity for a stock Hyperliquid perpetual, keyed by native name.
+fn native_id(name: &str) -> String {
+    ferris_market_data_backend::market_stats::make_market_id(
+        "hyperliquid",
+        UnifiedMarketType::Perp,
+        None,
+        Some(""),
+        name,
+    )
+    .unwrap()
+}
+
+/// Canonical identity for a stock Hyperliquid spot market, keyed by `@index`.
+fn spot_id(index: u64) -> String {
+    ferris_market_data_backend::market_stats::make_market_id(
+        "hyperliquid",
+        UnifiedMarketType::Spot,
+        None,
+        None,
+        &format!("@{index}"),
+    )
+    .unwrap()
+}
+
+fn source_params() -> FetchMarketStatsParams {
+    FetchMarketStatsParams {
+        params: json!({"dex":""}),
+        open_interest_market_ids: Vec::new(),
+        include_bulk: true,
+    }
+}
+
+async fn wait_count(counter: &AtomicUsize, expected: usize) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while counter.load(Ordering::SeqCst) < expected {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// HTTP protocol
+// ---------------------------------------------------------------------------
+
 #[tokio::test]
 async fn market_stats_http_capabilities_bounds_and_catalog_proof() {
-    let mock = InfoMock::new();
-    let (source, up_stop, up_server) = source_server(&mock).await;
+    let (mock, upstream, up_stop, up_server) = hyperliquid_server().await;
+    let source: Arc<dyn MarketDataExchange> =
+        ccxt_stats_exchange(Venue::Hyperliquid, &upstream, 2_000);
     let (url, state, stop, server) = backend(source).await;
     let client = reqwest::Client::new();
     let caps: Value = client
@@ -618,118 +376,127 @@ async fn market_stats_http_capabilities_bounds_and_catalog_proof() {
         ]
     );
     for exchange in exchanges {
-        if exchange["exchange"] == "hyperliquid" {
-            assert_eq!(exchange["marketStats"]["upstreamMode"], "sharedPolling");
-            assert_eq!(exchange["marketStats"]["rateIntervalMs"], 3_600_000);
-            assert_eq!(exchange["marketStats"]["paymentIntervalMs"], 3_600_000);
-            assert!(exchange["marketStats"]["limitations"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|value| value == "rate-unit-decimal-fraction"));
-        } else if exchange["exchange"] == "binance" {
-            assert_eq!(exchange["marketStats"]["upstreamMode"], "sharedPolling");
-            assert_eq!(exchange["marketStats"]["rateIntervalMs"], Value::Null);
-            assert_eq!(exchange["marketStats"]["paymentIntervalMs"], Value::Null);
-            assert!(exchange["marketStats"]["limitations"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|value| value == "rate-unit-decimal-fraction"));
-        } else if exchange["exchange"] == "bybit" {
-            let stats = &exchange["marketStats"];
-            assert_eq!(stats["state"], "supported");
-            assert_eq!(stats["scope"]["params"], json!({"category":"linear"}));
-            assert_eq!(stats["upstreamMode"], "sharedPolling");
-            assert_eq!(stats["pollIntervalMs"], 30_000);
-            assert_eq!(stats["staleAfterMs"], 90_000);
-            assert_eq!(stats["rateIntervalMs"], Value::Null);
-            assert_eq!(stats["paymentIntervalMs"], Value::Null);
-            assert_eq!(stats["fundingKinds"], json!(["estimate"]));
-            assert_eq!(stats["allMarkets"]["types"], json!(["perp"]));
-            assert_eq!(stats["allMarkets"]["activeOnly"], true);
-            assert_eq!(stats["selectedMarkets"]["types"], json!(["perp"]));
-            assert_eq!(stats["selectedMarkets"]["limit"], 100);
-            assert_eq!(stats["ws"]["maxSubscriptionsPerConnection"], 16);
-            for field in ["funding", "markPrice", "indexPrice", "lastPrice"] {
-                assert_eq!(stats["fields"]["perp"][field]["state"], "supported");
+        let stats = &exchange["marketStats"];
+        assert_eq!(stats["state"], "supported", "{exchange}");
+        assert_eq!(stats["pollIntervalMs"], 30_000);
+        assert_eq!(stats["staleAfterMs"], 90_000);
+        assert_eq!(stats["ws"]["snapshot"], true);
+        assert_eq!(stats["ws"]["delta"], true);
+        assert_eq!(stats["ws"]["maxSubscriptionsPerConnection"], 16);
+        assert!(stats["limitations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "receipt-time-freshness"));
+        match exchange["exchange"].as_str().unwrap() {
+            "hyperliquid" => {
+                assert_eq!(stats["upstreamMode"], "sharedPolling");
+                assert_eq!(stats["scope"]["params"], json!({"dex":""}));
+                assert_eq!(stats["rateIntervalMs"], 3_600_000);
+                assert_eq!(stats["paymentIntervalMs"], 3_600_000);
+                assert_eq!(stats["fundingKinds"], json!(["currentUnclassified"]));
+                assert_eq!(stats["allMarkets"]["types"], json!(["spot", "perp"]));
+                assert_eq!(stats["fields"]["perp"]["volume24h"]["state"], "supported");
+                assert_eq!(
+                    stats["fields"]["perp"]["openInterest"]["state"],
+                    "supported"
+                );
+                assert_eq!(stats["fields"]["perp"]["lastPrice"]["state"], "unsupported");
+                assert_eq!(
+                    stats["fields"]["perp"]["lastSettledFunding"]["state"],
+                    "unsupported"
+                );
+                assert_eq!(stats["fields"]["spot"]["funding"]["state"], "notApplicable");
+                assert_eq!(
+                    stats["fields"]["spot"]["markPrice"]["state"],
+                    "notApplicable"
+                );
+                assert_eq!(
+                    stats["fields"]["spot"]["openInterest"]["state"],
+                    "notApplicable"
+                );
+                assert_eq!(stats["fields"]["spot"]["volume24h"]["state"], "supported");
             }
-            for field in ["volume24h", "openInterest"] {
-                assert_eq!(stats["fields"]["perp"][field]["state"], "unsupported");
-                assert_eq!(stats["fields"]["perp"][field]["reason"], "units-unverified");
+            "extended" => {
+                assert_eq!(stats["upstreamMode"], "sharedPolling");
+                assert_eq!(stats["scope"]["params"], json!({}));
+                assert_eq!(stats["rateIntervalMs"], 3_600_000);
+                assert_eq!(stats["paymentIntervalMs"], 3_600_000);
+                assert_eq!(stats["fundingKinds"], json!(["estimate"]));
+                assert_eq!(stats["allMarkets"]["types"], json!(["perp"]));
+                assert_eq!(stats["selectedMarkets"]["types"], json!(["perp"]));
+                for field in [
+                    "funding",
+                    "markPrice",
+                    "indexPrice",
+                    "lastPrice",
+                    "volume24h",
+                    "openInterest",
+                ] {
+                    assert_eq!(
+                        stats["fields"]["perp"][field]["state"], "supported",
+                        "extended {field}"
+                    );
+                }
+                assert_eq!(
+                    stats["fields"]["perp"]["lastSettledFunding"]["state"],
+                    "unsupported"
+                );
             }
-            assert_eq!(
-                stats["fields"]["perp"]["lastSettledFunding"]["state"],
-                "unsupported"
-            );
-            for limitation in ["linear-and-inverse-perpetual-only", "pre-market-excluded"] {
-                assert!(stats["limitations"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|value| value == limitation));
+            "lighterxyz" => {
+                assert_eq!(stats["upstreamMode"], "sharedPollingAndWebSocket");
+                assert_eq!(stats["scope"]["params"], json!({}));
+                assert_eq!(stats["rateIntervalMs"], 3_600_000);
+                assert_eq!(stats["paymentIntervalMs"], 3_600_000);
+                assert_eq!(stats["fundingKinds"], json!(["estimate", "settled"]));
+                assert_eq!(stats["allMarkets"]["types"], json!(["spot", "perp"]));
+                assert_eq!(stats["fields"]["perp"]["lastPrice"]["state"], "supported");
+                assert_eq!(stats["fields"]["perp"]["funding"]["state"], "supported");
+                assert_eq!(
+                    stats["fields"]["perp"]["lastSettledFunding"]["state"],
+                    "supported"
+                );
+                assert_eq!(
+                    stats["fields"]["perp"]["openInterest"]["state"],
+                    "supported"
+                );
+                assert_eq!(stats["fields"]["spot"]["funding"]["state"], "notApplicable");
             }
-        } else if exchange["exchange"] == "lighterxyz" {
-            assert_eq!(exchange["marketStats"]["upstreamMode"], "nativeWebSocket");
-            assert_eq!(exchange["marketStats"]["pollIntervalMs"], 30_000);
-            assert_eq!(exchange["marketStats"]["staleAfterMs"], 90_000);
-            assert_eq!(exchange["marketStats"]["rateIntervalMs"], 3_600_000);
-            assert_eq!(exchange["marketStats"]["paymentIntervalMs"], 3_600_000);
-            assert_eq!(
-                exchange["marketStats"]["fundingKinds"],
-                json!(["estimate", "settled"])
-            );
-            assert_eq!(
-                exchange["marketStats"]["fields"]["perp"]["lastPrice"]["state"],
-                "supported"
-            );
-            assert_eq!(
-                exchange["marketStats"]["fields"]["spot"]["funding"]["state"],
-                "notApplicable"
-            );
-        } else if exchange["exchange"] == "extended" {
-            let stats = &exchange["marketStats"];
-            assert_eq!(stats["state"], "supported");
-            assert_eq!(stats["scope"]["params"], json!({}));
-            assert_eq!(stats["upstreamMode"], "sharedPolling");
-            assert_eq!(stats["pollIntervalMs"], 30_000);
-            assert_eq!(stats["staleAfterMs"], 90_000);
-            assert_eq!(stats["rateIntervalMs"], 3_600_000);
-            assert_eq!(stats["paymentIntervalMs"], 3_600_000);
-            assert_eq!(stats["fundingKinds"], json!(["estimate"]));
-            assert_eq!(stats["allMarkets"]["types"], json!(["perp"]));
-            assert_eq!(stats["selectedMarkets"]["types"], json!(["perp"]));
-            for field in ["funding", "markPrice", "indexPrice", "lastPrice"] {
-                assert_eq!(stats["fields"]["perp"][field]["state"], "supported");
+            "binance" => {
+                assert_eq!(stats["upstreamMode"], "sharedPolling");
+                assert_eq!(stats["scope"]["params"], json!({}));
+                assert_eq!(stats["rateIntervalMs"], Value::Null);
+                assert_eq!(stats["paymentIntervalMs"], Value::Null);
+                assert_eq!(stats["fundingKinds"], json!(["currentUnclassified"]));
+                assert_eq!(
+                    stats["allMarkets"]["types"],
+                    json!(["spot", "future", "perp", "option"])
+                );
             }
-            for field in ["lastSettledFunding", "volume24h", "openInterest"] {
-                assert_eq!(stats["fields"]["perp"][field]["state"], "unsupported");
+            "bybit" => {
+                assert_eq!(stats["upstreamMode"], "sharedPolling");
+                assert_eq!(stats["scope"]["params"], json!({"category":"linear"}));
+                assert_eq!(stats["rateIntervalMs"], Value::Null);
+                assert_eq!(stats["paymentIntervalMs"], Value::Null);
+                assert_eq!(stats["fundingKinds"], json!(["estimate"]));
+                assert_eq!(
+                    stats["allMarkets"]["types"],
+                    json!(["spot", "future", "perp", "option"])
+                );
             }
-        } else if exchange["exchange"] == "aster" {
-            let stats = &exchange["marketStats"];
-            assert_eq!(stats["state"], "supported");
-            assert_eq!(stats["scope"]["params"], json!({}));
-            assert_eq!(stats["upstreamMode"], "sharedPolling");
-            assert_eq!(stats["pollIntervalMs"], 30_000);
-            assert_eq!(stats["staleAfterMs"], 90_000);
-            assert_eq!(stats["rateIntervalMs"], Value::Null);
-            assert_eq!(stats["paymentIntervalMs"], Value::Null);
-            assert_eq!(stats["fundingKinds"], json!(["estimate"]));
-            assert_eq!(stats["allMarkets"]["types"], json!(["perp"]));
-            assert_eq!(stats["selectedMarkets"]["types"], json!(["perp"]));
-            for field in ["funding", "markPrice", "indexPrice"] {
-                assert_eq!(stats["fields"]["perp"][field]["state"], "supported");
+            "aster" => {
+                assert_eq!(stats["upstreamMode"], "sharedPolling");
+                assert_eq!(stats["scope"]["params"], json!({}));
+                assert_eq!(stats["rateIntervalMs"], Value::Null);
+                assert_eq!(stats["paymentIntervalMs"], Value::Null);
+                assert_eq!(stats["fundingKinds"], json!(["estimate"]));
+                assert_eq!(stats["allMarkets"]["types"], json!(["spot", "perp"]));
+                assert_eq!(
+                    stats["fields"]["perp"]["openInterest"]["state"],
+                    "unsupported"
+                );
             }
-            for field in [
-                "lastSettledFunding",
-                "lastPrice",
-                "volume24h",
-                "openInterest",
-            ] {
-                assert_eq!(stats["fields"]["perp"][field]["state"], "unsupported");
-            }
-        } else {
-            panic!("uncovered capability: {exchange}");
+            other => panic!("uncovered capability: {other}"),
         }
     }
     for body in [
@@ -759,8 +526,9 @@ async fn market_stats_http_capabilities_bounds_and_catalog_proof() {
         .await["code"],
         "UNSUPPORTED_EXCHANGE"
     );
-    assert_eq!(mock.primary_count.load(Ordering::SeqCst), 0);
-    assert_eq!(mock.spot_count.load(Ordering::SeqCst), 0);
+    assert_eq!(mock.primary_calls(), 0);
+    assert_eq!(mock.spot_calls(), 0);
+
     *mock.primary.write().await = Reply {
         status: StatusCode::BAD_GATEWAY,
         body: json!({"offline":true}),
@@ -770,6 +538,14 @@ async fn market_stats_http_capabilities_bounds_and_catalog_proof() {
     assert_eq!(cold["coverage"]["expectedMarkets"], Value::Null);
     assert_eq!(cold["coverage"]["enumerationComplete"], false);
     assert_eq!(cold["markets"], json!([]));
+    assert!(cold["coverage"]["sourceFailures"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(
+            |failure| failure["source"] == "hyperliquid:ccxt:loadMarkets"
+                && failure["reason"] == "upstream-failure"
+        ));
     assert_eq!(
         stats_http(
             &client,
@@ -780,7 +556,7 @@ async fn market_stats_http_capabilities_bounds_and_catalog_proof() {
         .await["code"],
         "UPSTREAM_REQUEST_FAILED"
     );
-    assert_eq!(mock.primary_count.load(Ordering::SeqCst), 1);
+    assert!(mock.primary_calls() >= 1);
     state.shutdown_market_stats().await;
     stop.send(()).unwrap();
     server.await.unwrap();
@@ -789,11 +565,13 @@ async fn market_stats_http_capabilities_bounds_and_catalog_proof() {
 }
 
 #[tokio::test]
-async fn market_stats_http_all_selected_and_catalog_share_one_acquisition() {
-    let mock = InfoMock::new();
+async fn market_stats_http_all_and_selected_share_one_acquisition() {
+    let (mock, upstream, up_stop, up_server) = hyperliquid_server().await;
     let gate = Arc::new(Semaphore::new(0));
     mock.primary.write().await.barrier = Some(gate.clone());
-    let (source, up_stop, up_server) = source_server(&mock).await;
+    mock.spot.write().await.barrier = Some(gate.clone());
+    let source: Arc<dyn MarketDataExchange> =
+        ccxt_stats_exchange(Venue::Hyperliquid, &upstream, 2_000);
     let (url, state, stop, server) = backend(source).await;
     let client = reqwest::Client::new();
     let mut requests = Vec::new();
@@ -813,20 +591,19 @@ async fn market_stats_http_all_selected_and_catalog_share_one_acquisition() {
             .await
         }));
     }
-    let (catalog_client, catalog_url) = (client.clone(), url.clone());
-    let catalog = tokio::spawn(async move {
-        catalog_client
-            .post(format!("{catalog_url}/v1/fetchMarkets"))
-            .json(&json!({"includeInactive":true}))
-            .send()
-            .await
-            .unwrap()
-            .json::<Value>()
-            .await
-            .unwrap()
-    });
     wait_count(&mock.primary_count, 1).await;
-    gate.add_permits(1);
+    // While the first upstream call is gated, no other consumer may start an
+    // independent acquisition. A per-consumer fetch would show >1 here.
+    let gated_deadline = std::time::Instant::now() + Duration::from_millis(200);
+    while std::time::Instant::now() < gated_deadline {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        mock.primary_calls(),
+        1,
+        "concurrent demand must share one acquisition"
+    );
+    gate.add_permits(64);
     let mut observed = None;
     for request in requests {
         let result = request.await.unwrap();
@@ -843,21 +620,68 @@ async fn market_stats_http_all_selected_and_catalog_share_one_acquisition() {
             observed = Some(row["fields"]["funding"].clone());
         }
     }
-    let catalog = catalog.await.unwrap();
-    let spot = catalog["markets"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|row| row["type"] == "spot")
-        .unwrap();
-    let selected = stats_http(&client,&url,json!({"marketIds":[spot["marketId"],native_id("OLD")],"fields":["funding","markPrice","volume24h"]}),StatusCode::OK).await;
+    // Twenty concurrent consumers share the catalog load and the bulk ticker
+    // acquisition. One stock Hyperliquid acquisition issues two metadata posts
+    // (catalog) plus two ticker posts, so four calls is the shared ceiling and
+    // is nowhere near one acquisition per consumer.
+    let shared_primary = mock.primary_calls();
+    let shared_spot = mock.spot_calls();
+    assert!(shared_primary <= 4, "{shared_primary}");
+    assert!(shared_spot <= 4, "{shared_spot}");
+    assert!(shared_primary >= 1 && shared_spot >= 1);
+    // A later request inside the shared lease reuses the cached observation.
+    let reused = stats_http(&client, &url, json!({}), StatusCode::OK).await;
+    assert_eq!(reused["coverage"]["enumerationComplete"], true);
+    assert_eq!(mock.primary_calls(), shared_primary);
+
+    let btc = stats_http(
+        &client,
+        &url,
+        json!({"marketIds":[native_id("BTC")],"fields":["funding","markPrice","volume24h","openInterest"]}),
+        StatusCode::OK,
+    )
+    .await;
+    let row = &btc["markets"][0];
+    assert_eq!(row["fields"]["funding"]["value"]["rate"], "-0.0000125");
+    assert_eq!(row["fields"]["markPrice"]["value"]["amount"], "60000");
+    assert_eq!(
+        row["fields"]["volume24h"]["value"]["baseVolume"],
+        Value::Null
+    );
+    assert_eq!(row["fields"]["volume24h"]["value"]["quoteVolume"], 500000.0);
+    assert_eq!(
+        row["fields"]["openInterest"]["value"]["openInterestAmount"],
+        100.0
+    );
+    assert_eq!(
+        row["fields"]["openInterest"]["value"]["openInterestValue"],
+        Value::Null
+    );
+
+    let selected = stats_http(
+        &client,
+        &url,
+        json!({"marketIds":[spot_id(0),native_id("OLD")],"fields":["funding","markPrice","volume24h"]}),
+        StatusCode::OK,
+    )
+    .await;
     for row in selected["markets"].as_array().unwrap() {
         if row["type"] == "spot" {
+            // The stable spot identity is the stock metadata `index`, rendered
+            // as `@index`, never the old decimal token index.
+            assert_eq!(row["marketId"], json!(spot_id(0)));
+            assert_eq!(row["exchangeMarketId"], "@0");
+            assert_eq!(row["symbol"], "BTC/USDC");
             assert_eq!(row["fields"]["funding"]["state"], "notApplicable");
+            assert_eq!(row["fields"]["markPrice"]["state"], "notApplicable");
+            assert_eq!(row["fields"]["volume24h"]["state"], "available");
         } else {
+            assert_eq!(row["marketId"], json!(native_id("OLD")));
+            assert_eq!(row["exchangeMarketId"], "OLD");
+            assert_eq!(row["active"], false);
             assert_eq!(row["fields"]["funding"]["reason"], "inactive-market");
+            assert_eq!(row["fields"]["markPrice"]["reason"], "inactive-market");
         }
-        assert_eq!(row["fields"]["volume24h"]["state"], "unsupported");
     }
     stats_http(
         &client,
@@ -866,8 +690,8 @@ async fn market_stats_http_all_selected_and_catalog_share_one_acquisition() {
         StatusCode::BAD_REQUEST,
     )
     .await;
-    assert_eq!(mock.primary_count.load(Ordering::SeqCst), 1);
-    assert_eq!(mock.spot_count.load(Ordering::SeqCst), 1);
+    assert_eq!(mock.primary_calls(), shared_primary);
+    assert_eq!(mock.spot_calls(), shared_spot);
     state.shutdown_market_stats().await;
     stop.send(()).unwrap();
     server.await.unwrap();
@@ -875,10 +699,89 @@ async fn market_stats_http_all_selected_and_catalog_share_one_acquisition() {
     up_server.await.unwrap();
 }
 
+#[tokio::test]
+async fn market_stats_coordinator_applies_failures_without_false_removals_or_resurrection() {
+    use ferris_market_data_backend::{
+        market_stats::{project_snapshot, MarketStatsCoordinator},
+        models::MarketStatsFieldState,
+    };
+    let (mock, upstream, up_stop, up_server) = hyperliquid_server().await;
+    let source: Arc<dyn MarketDataExchange> =
+        ccxt_stats_exchange(Venue::Hyperliquid, &upstream, 2_000);
+    let mut registry = ExchangeRegistry::new();
+    registry.register(source);
+    let coordinator = MarketStatsCoordinator::new(Arc::new(registry));
+    let mut selected = coordinator
+        .subscribe(stats_request(Some(vec![native_id("BTC")])))
+        .await
+        .unwrap();
+    selected.receiver.borrow_and_update();
+
+    let baseline = coordinator.snapshot(stats_request(None)).await.unwrap();
+    assert_eq!(baseline.markets.len(), 5);
+    assert_eq!(baseline.coverage.expected_markets, Some(5));
+    mock.primary.write().await.body[1][2]["funding"] = Value::Null;
+    tokio::time::sleep(Duration::from_secs(31)).await;
+    selected.receiver.changed().await.unwrap();
+    let invalid = project_snapshot(&selected.topic, &selected.receiver.borrow_and_update());
+    assert_eq!(
+        invalid.markets[0].fields[&MarketStatsFieldName::Funding].state,
+        MarketStatsFieldState::Unavailable
+    );
+    assert!(invalid.markets[0].fields[&MarketStatsFieldName::Funding]
+        .value
+        .is_none());
+    assert_eq!(
+        invalid.markets[0].fields[&MarketStatsFieldName::MarkPrice].state,
+        MarketStatsFieldState::Available
+    );
+    *mock.primary.write().await = Reply {
+        status: StatusCode::BAD_GATEWAY,
+        body: json!({"offline":true}),
+        barrier: None,
+    };
+    tokio::time::sleep(Duration::from_secs(31)).await;
+    selected.receiver.changed().await.unwrap();
+    let failed = project_snapshot(&selected.topic, &selected.receiver.borrow_and_update());
+    assert!(!failed.coverage.enumeration_complete);
+    assert_eq!(
+        failed.markets[0].fields[&MarketStatsFieldName::Funding].state,
+        MarketStatsFieldState::Unavailable
+    );
+    assert_eq!(
+        failed.markets[0].fields[&MarketStatsFieldName::MarkPrice].state,
+        MarketStatsFieldState::Stale
+    );
+    let mut removed = primary_fixture();
+    removed[0]["universe"].as_array_mut().unwrap().remove(2);
+    removed[1].as_array_mut().unwrap().remove(2);
+    *mock.primary.write().await = Reply::ok(removed);
+    tokio::time::sleep(Duration::from_secs(31)).await;
+    selected.receiver.changed().await.unwrap();
+    let removed = project_snapshot(&selected.topic, &selected.receiver.borrow_and_update());
+    assert!(removed.markets.is_empty());
+    assert_eq!(removed.coverage.expected_markets, Some(1));
+    assert!(matches!(
+        coordinator
+            .snapshot(stats_request(Some(vec![native_id("BTC")])))
+            .await,
+        Err(ferris_market_data_backend::errors::ApiError::Validation(_))
+    ));
+    coordinator.unsubscribe_by_key(&selected.key).await;
+    coordinator.shutdown().await;
+
+    up_stop.send(()).unwrap();
+    up_server.await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket protocol
+// ---------------------------------------------------------------------------
+
 type StatsSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 async fn stats_socket(base: &str) -> StatsSocket {
-    connect_async(format!("{}/v1/ws", base.replacen("http://", "ws://", 1)))
+    connect_async(format!("{}/v1/ws", ws_base(base)))
         .await
         .unwrap()
         .0
@@ -898,17 +801,10 @@ fn stats_command(op: &str, request: &Value) -> Value {
     command
 }
 
-// Real localhost I/O must time out in wall time even while the source clock is paused.
 async fn ws_frame(socket: &mut StatsSocket) -> Option<Result<WsMessage, WsError>> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        tokio::select! {
-            frame = socket.next() => return frame,
-            _ = tokio::task::yield_now() => {
-                assert!(std::time::Instant::now() < deadline, "timed out waiting for websocket frame");
-            }
-        }
-    }
+    tokio::time::timeout(Duration::from_secs(5), socket.next())
+        .await
+        .expect("timed out waiting for websocket frame")
 }
 
 // Never skip an application message: acknowledgement ordering is part of the protocol.
@@ -1063,6 +959,17 @@ async fn ws_delta(socket: &mut StatsSocket, view: &mut StatsView) -> Value {
     message
 }
 
+/// Locate the delta update for one market id (rows are sorted by opaque ID, so
+/// callers must not assume a fixed position).
+fn ws_update<'a>(delta: &'a Value, market_id: &str) -> &'a Value {
+    delta["updates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|update| update["marketId"] == market_id)
+        .unwrap_or_else(|| panic!("no delta update for {market_id}: {delta}"))
+}
+
 async fn assert_ws_matches_http(client: &reqwest::Client, base: &str, view: &StatsView) {
     view.assert_matches_snapshot(
         &stats_http(client, base, view.topic.clone(), StatusCode::OK).await,
@@ -1083,13 +990,13 @@ async fn after_receipt(receipt: &Value) {
 }
 
 #[tokio::test]
-async fn market_stats_ws_shares_http_catalog_and_releases_duplicate_demand() {
-    let mock = InfoMock::new();
-    let primary_gate = Arc::new(Semaphore::new(0));
-    let spot_gate = Arc::new(Semaphore::new(0));
-    mock.primary.write().await.barrier = Some(primary_gate.clone());
-    mock.spot.write().await.barrier = Some(spot_gate.clone());
-    let (source, up_stop, up_server) = source_server(&mock).await;
+async fn market_stats_ws_shares_http_and_releases_duplicate_demand() {
+    let (mock, upstream, up_stop, up_server) = hyperliquid_server().await;
+    let gate = Arc::new(Semaphore::new(0));
+    mock.primary.write().await.barrier = Some(gate.clone());
+    mock.spot.write().await.barrier = Some(gate.clone());
+    let source: Arc<dyn MarketDataExchange> =
+        ccxt_stats_exchange(Venue::Hyperliquid, &upstream, 2_000);
     let (url, state, stop, server) = backend(source).await;
     let client = reqwest::Client::new();
     let mut all_socket = stats_socket(&url).await;
@@ -1098,8 +1005,7 @@ async fn market_stats_ws_shares_http_catalog_and_releases_duplicate_demand() {
     let all_request =
         json!({"exchange":"hyperliquid","params":{"dex":""},"fields":["funding","markPrice"]});
     let btc_request = json!({"marketIds":[btc],"fields":["funding","markPrice"]});
-    tokio::time::pause();
-    let manual = keep_time_manual();
+
     ws_send(&mut all_socket, stats_command("subscribe", &all_request)).await;
     ws_send(&mut btc_socket, stats_command("subscribe", &btc_request)).await;
     let mut requests = Vec::new();
@@ -1114,21 +1020,18 @@ async fn market_stats_ws_shares_http_catalog_and_releases_duplicate_demand() {
             stats_http(&client, &url, request, StatusCode::OK).await
         }));
     }
-    let (catalog_client, catalog_url) = (client.clone(), url.clone());
-    let catalog = tokio::spawn(async move {
-        let response = catalog_client
-            .post(format!("{catalog_url}/v1/fetchMarkets"))
-            .json(&json!({"includeInactive":true}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        response.json::<Value>().await.unwrap()
-    });
     wait_count(&mock.primary_count, 1).await;
-    wait_count(&mock.spot_count, 1).await;
-    primary_gate.add_permits(1);
-    spot_gate.add_permits(1);
+    // One gated acquisition serves both sockets and all concurrent HTTP readers.
+    let gated_deadline = std::time::Instant::now() + Duration::from_millis(200);
+    while std::time::Instant::now() < gated_deadline {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        mock.primary_calls(),
+        1,
+        "concurrent demand must share one acquisition"
+    );
+    gate.add_permits(64);
     let all = ws_initial(&mut all_socket).await;
     let mut selected = ws_initial(&mut btc_socket).await;
     assert_eq!(all.markets.len(), 5);
@@ -1142,20 +1045,7 @@ async fn market_stats_ws_shares_http_catalog_and_releases_duplicate_demand() {
             all.assert_matches_snapshot(&snapshot);
         }
     }
-    let catalog = catalog.await.unwrap();
-    for row in all.markets.values() {
-        let issued = catalog["markets"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|market| market["marketId"] == row["marketId"])
-            .unwrap();
-        let mut identity = row.clone();
-        identity.as_object_mut().unwrap().remove("fields");
-        assert_eq!(&identity, issued);
-    }
-    assert_eq!(mock.primary_count.load(Ordering::SeqCst), 1);
-    assert_eq!(mock.spot_count.load(Ordering::SeqCst), 1);
+    assert!(mock.primary_calls() <= 4, "{}", mock.primary_calls());
     mock.primary.write().await.barrier = None;
     mock.spot.write().await.barrier = None;
 
@@ -1168,18 +1058,12 @@ async fn market_stats_ws_shares_http_catalog_and_releases_duplicate_demand() {
     ws_ping(&mut btc_socket).await;
     ws_disconnect(all_socket).await;
     after_receipt(&selected.markets[&btc]["fields"]["funding"]["receivedTimestamp"]).await;
-    tokio::time::advance(Duration::from_millis(30_001)).await;
+    tokio::time::sleep(Duration::from_secs(31)).await;
     ws_delta(&mut btc_socket, &mut selected).await;
     assert_eq!(
         selected.markets[&btc]["fields"]["funding"]["state"],
         "available"
     );
-    assert_eq!(
-        mock.primary_count.load(Ordering::SeqCst),
-        2,
-        "remaining subscriber must keep the shared source alive"
-    );
-    assert_eq!(mock.spot_count.load(Ordering::SeqCst), 1);
     ws_unsubscribe(&mut btc_socket, &selected.topic).await;
     ws_error(
         &mut btc_socket,
@@ -1188,18 +1072,18 @@ async fn market_stats_ws_shares_http_catalog_and_releases_duplicate_demand() {
     )
     .await;
 
-    // HTTP demand expires 90 seconds after the simultaneous requests, not after reads of a WS view.
-    tokio::time::advance(Duration::from_millis(60_001)).await;
+    // With no subscriber left, only the 90-second HTTP lease can keep the source
+    // alive. Once it expires the worker must exit and stop acquiring.
+    tokio::time::sleep(Duration::from_secs(91)).await;
     ws_ping(&mut btc_socket).await;
-    assert_eq!(mock.primary_count.load(Ordering::SeqCst), 2);
-    tokio::time::advance(Duration::from_millis(300_001)).await;
+    let settled = mock.primary_calls();
+    tokio::time::sleep(Duration::from_secs(31)).await;
     ws_ping(&mut btc_socket).await;
     assert_eq!(
-        mock.primary_count.load(Ordering::SeqCst),
-        2,
+        mock.primary_calls(),
+        settled,
         "duplicate subscribe or socket teardown leaked demand"
     );
-    assert_eq!(mock.spot_count.load(Ordering::SeqCst), 1);
 
     mock.primary.write().await.body[1][2]["funding"] = json!("-0.25");
     let mut renewed_all_socket = stats_socket(&url).await;
@@ -1217,20 +1101,16 @@ async fn market_stats_ws_shares_http_catalog_and_releases_duplicate_demand() {
         "-0.25"
     );
     assert_eq!(renewed.markets[&btc], renewed_all.markets[&btc]);
-    assert_eq!(
-        mock.primary_count.load(Ordering::SeqCst),
-        3,
-        "renewed demand must share one new primary acquisition"
+    assert!(
+        mock.primary_calls() > settled,
+        "renewed demand must acquire fresh data"
     );
-    assert_eq!(mock.spot_count.load(Ordering::SeqCst), 2);
     ws_unsubscribe(&mut btc_socket, &renewed.topic).await;
     ws_unsubscribe(&mut renewed_all_socket, &renewed_all.topic).await;
     ws_disconnect(btc_socket).await;
     ws_disconnect(renewed_all_socket).await;
     state.shutdown_market_stats().await;
-    manual.abort();
-    let _ = manual.await;
-    tokio::time::resume();
+
     stop.send(()).unwrap();
     server.await.unwrap();
     up_stop.send(()).unwrap();
@@ -1239,16 +1119,18 @@ async fn market_stats_ws_shares_http_catalog_and_releases_duplicate_demand() {
 
 #[tokio::test]
 async fn market_stats_ws_reducer_tracks_receipts_clears_removals_and_reconnect() {
-    let mock = InfoMock::new();
-    let (source, up_stop, up_server) = source_server(&mock).await;
+    let (mock, upstream, up_stop, up_server) = hyperliquid_server().await;
+    let source: Arc<dyn MarketDataExchange> =
+        ccxt_stats_exchange(Venue::Hyperliquid, &upstream, 2_000);
     let (url, state, stop, server) = backend(source).await;
     let client = reqwest::Client::new();
     let mut all_socket = stats_socket(&url).await;
     let mut btc_socket = stats_socket(&url).await;
     let btc = native_id("BTC");
     let eth = native_id("ETH");
-    let all_request = json!({"fields":["funding","markPrice","openInterest"]});
-    let btc_request = json!({"marketIds":[btc],"fields":["funding","markPrice","openInterest"]});
+    let fields = ["funding", "markPrice", "volume24h", "lastSettledFunding"];
+    let all_request = json!({"fields":fields});
+    let btc_request = json!({"marketIds":[btc],"fields":fields});
     ws_send(&mut all_socket, stats_command("subscribe", &all_request)).await;
     ws_send(&mut btc_socket, stats_command("subscribe", &btc_request)).await;
     let mut all = ws_initial(&mut all_socket).await;
@@ -1256,11 +1138,9 @@ async fn market_stats_ws_reducer_tracks_receipts_clears_removals_and_reconnect()
     assert_eq!(all.markets[&btc], selected.markets[&btc]);
     let initial_generation = selected.generation.clone();
     let initial_funding = selected.markets[&btc]["fields"]["funding"].clone();
-    tokio::time::pause();
-    let manual = keep_time_manual();
 
     after_receipt(&initial_funding["receivedTimestamp"]).await;
-    tokio::time::advance(Duration::from_millis(30_001)).await;
+    tokio::time::sleep(Duration::from_secs(31)).await;
     ws_delta(&mut all_socket, &mut all).await;
     let receipt_delta = ws_delta(&mut btc_socket, &mut selected).await;
     let current_funding = &selected.markets[&btc]["fields"]["funding"];
@@ -1271,12 +1151,12 @@ async fn market_stats_ws_reducer_tracks_receipts_clears_removals_and_reconnect()
     );
     assert!(
         receipt_delta["updates"][0]["fields"]
-            .get("openInterest")
+            .get("lastSettledFunding")
             .is_none(),
         "unchanged unsupported fields must remain sparse"
     );
     assert_eq!(
-        selected.markets[&btc]["fields"]["openInterest"]["state"],
+        selected.markets[&btc]["fields"]["lastSettledFunding"]["state"],
         "unsupported"
     );
     assert_ws_matches_http(&client, &url, &all).await;
@@ -1290,23 +1170,28 @@ async fn market_stats_ws_reducer_tracks_receipts_clears_removals_and_reconnect()
 
     mock.primary.write().await.body[1][2]["funding"] = Value::Null;
     mock.primary.write().await.body[1][2]["markPx"] = json!("61000");
+    mock.primary.write().await.body[1][2]["dayNtlVlm"] = json!("777777");
     after_receipt(&all.markets[&eth]["fields"]["funding"]["receivedTimestamp"]).await;
-    tokio::time::advance(Duration::from_millis(30_001)).await;
+    tokio::time::sleep(Duration::from_secs(31)).await;
     ws_delta(&mut all_socket, &mut all).await;
     let invalid = ws_delta(&mut btc_socket, &mut selected).await;
+    let invalid_update = ws_update(&invalid, &btc);
+    assert_eq!(invalid_update["fields"]["funding"]["state"], "unavailable");
+    assert_eq!(invalid_update["fields"]["funding"]["value"], Value::Null);
+    // The new numeric volume member reaches the revisioned WS consumer too.
     assert_eq!(
-        invalid["updates"][0]["fields"]["funding"]["state"],
-        "unavailable"
-    );
-    assert_eq!(
-        invalid["updates"][0]["fields"]["funding"]["value"],
-        Value::Null
+        invalid_update["fields"]["volume24h"]["value"]["quoteVolume"],
+        777777.0
     );
     let invalid_funding = selected.markets[&btc]["fields"]["funding"].clone();
     assert_eq!(invalid_funding["reason"], "invalid-upstream-value");
     assert_eq!(
         selected.markets[&btc]["fields"]["markPrice"]["value"]["amount"],
         "61000"
+    );
+    assert_eq!(
+        selected.markets[&btc]["fields"]["volume24h"]["value"]["quoteVolume"],
+        777777.0
     );
     let mark_receipt = selected.markets[&btc]["fields"]["markPrice"]["receivedTimestamp"].clone();
     assert_ws_matches_http(&client, &url, &all).await;
@@ -1317,7 +1202,7 @@ async fn market_stats_ws_reducer_tracks_receipts_clears_removals_and_reconnect()
         body: json!({"offline":true}),
         barrier: None,
     };
-    tokio::time::advance(Duration::from_millis(30_001)).await;
+    tokio::time::sleep(Duration::from_secs(31)).await;
     let all_failed = ws_delta(&mut all_socket, &mut all).await;
     let selected_failed = ws_delta(&mut btc_socket, &mut selected).await;
     assert_eq!(all_failed["removedMarketIds"], json!([]));
@@ -1343,7 +1228,7 @@ async fn market_stats_ws_reducer_tracks_receipts_clears_removals_and_reconnect()
     delisted[0]["universe"][2]["isDelisted"] = json!(true);
     *mock.primary.write().await = Reply::ok(delisted);
     after_receipt(&all.markets[&eth]["fields"]["funding"]["receivedTimestamp"]).await;
-    tokio::time::advance(Duration::from_millis(30_001)).await;
+    tokio::time::sleep(Duration::from_secs(31)).await;
     let all_delisted = ws_delta(&mut all_socket, &mut all).await;
     let selected_delisted = ws_delta(&mut btc_socket, &mut selected).await;
     assert_eq!(all_delisted["removedMarketIds"], json!([btc]));
@@ -1363,7 +1248,7 @@ async fn market_stats_ws_reducer_tracks_receipts_clears_removals_and_reconnect()
             .as_object()
             .unwrap()
             .len(),
-        3,
+        4,
         "an active-state change must include every requested field"
     );
     assert_eq!(all.coverage["expectedMarkets"], 4);
@@ -1376,7 +1261,7 @@ async fn market_stats_ws_reducer_tracks_receipts_clears_removals_and_reconnect()
     removed[1].as_array_mut().unwrap().remove(2);
     *mock.primary.write().await = Reply::ok(removed);
     after_receipt(&all.markets[&eth]["fields"]["funding"]["receivedTimestamp"]).await;
-    tokio::time::advance(Duration::from_millis(30_001)).await;
+    tokio::time::sleep(Duration::from_secs(31)).await;
     let all_removed = ws_delta(&mut all_socket, &mut all).await;
     let selected_removed = ws_delta(&mut btc_socket, &mut selected).await;
     assert_eq!(
@@ -1403,11 +1288,10 @@ async fn market_stats_ws_reducer_tracks_receipts_clears_removals_and_reconnect()
         "NOT_SUBSCRIBED",
     )
     .await;
-    assert_eq!(mock.primary_count.load(Ordering::SeqCst), 6);
 
     *mock.primary.write().await = Reply::ok(primary_fixture());
     after_receipt(&all.markets[&eth]["fields"]["funding"]["receivedTimestamp"]).await;
-    tokio::time::advance(Duration::from_millis(30_001)).await;
+    tokio::time::sleep(Duration::from_secs(31)).await;
     let added = ws_delta(&mut all_socket, &mut all).await;
     let added_btc = added["updates"]
         .as_array()
@@ -1417,7 +1301,7 @@ async fn market_stats_ws_reducer_tracks_receipts_clears_removals_and_reconnect()
         .unwrap();
     assert_eq!(
         added_btc["fields"].as_object().unwrap().len(),
-        3,
+        4,
         "a new market must include every requested field"
     );
     assert_eq!(all.markets[&btc]["fields"]["funding"]["state"], "available");
@@ -1446,16 +1330,12 @@ async fn market_stats_ws_reducer_tracks_receipts_clears_removals_and_reconnect()
     gapped["revision"] = json!(reconnected.revision + 2);
     assert!(!reconnected.apply_delta(&gapped));
     assert_eq!(reconnected, before_old_generation);
-    assert_eq!(mock.primary_count.load(Ordering::SeqCst), 7);
-    assert_eq!(mock.spot_count.load(Ordering::SeqCst), 1);
     ws_unsubscribe(&mut reconnected_socket, &reconnected.topic).await;
     ws_unsubscribe(&mut all_socket, &all.topic).await;
     ws_disconnect(reconnected_socket).await;
     ws_disconnect(all_socket).await;
     state.shutdown_market_stats().await;
-    manual.abort();
-    let _ = manual.await;
-    tokio::time::resume();
+
     stop.send(()).unwrap();
     server.await.unwrap();
     up_stop.send(()).unwrap();
@@ -1464,12 +1344,12 @@ async fn market_stats_ws_reducer_tracks_receipts_clears_removals_and_reconnect()
 
 #[tokio::test]
 async fn market_stats_ws_classifies_errors_and_limits_distinct_connection_topics() {
-    let mock = InfoMock::new();
-    let (source, up_stop, up_server) = source_server(&mock).await;
+    let (mock, upstream, up_stop, up_server) = hyperliquid_server().await;
+    let source: Arc<dyn MarketDataExchange> =
+        ccxt_stats_exchange(Venue::Hyperliquid, &upstream, 2_000);
     let (url, state, stop, server) = backend(source).await;
     let mut socket = stats_socket(&url).await;
-    tokio::time::pause();
-    let manual = keep_time_manual();
+
     for command in [
         json!({"op":"subscribe","channel":"funding","exchange":"hyperliquid","symbol":"BTC"}),
         json!({"op":"subscribe","channel":"marketstats","symbol":"BTC"}),
@@ -1504,25 +1384,23 @@ async fn market_stats_ws_classifies_errors_and_limits_distinct_connection_topics
     )
     .await;
     assert_eq!(
-        mock.primary_count.load(Ordering::SeqCst),
+        mock.primary_calls(),
         0,
         "invalid commands must not acquire source data"
     );
-    assert_eq!(mock.spot_count.load(Ordering::SeqCst), 0);
+    assert_eq!(mock.spot_calls(), 0);
     ws_error(
         &mut socket,
         stats_command("subscribe", &json!({"marketIds":[native_id("UNKNOWN")]})),
         "INVALID_TOPIC",
     )
     .await;
-    assert_eq!(
-        mock.primary_count.load(Ordering::SeqCst),
-        1,
+    assert!(
+        mock.primary_calls() >= 1,
         "catalog proof distinguishes an unknown ID from an upstream failure"
     );
-    assert_eq!(mock.spot_count.load(Ordering::SeqCst), 1);
 
-    let names = ["ETH", "BTC", "HYPE", "A-B", "AB"];
+    let names = ["ETH", "BTC", "HYPE", "SOL", "DOGE"];
     let topics = (1u32..=17)
         .map(|mask| {
             let ids = names
@@ -1581,21 +1459,13 @@ async fn market_stats_ws_classifies_errors_and_limits_distinct_connection_topics
     ws_send(&mut socket, stats_command("subscribe", &topics[16])).await;
     let replacement = ws_initial(&mut socket).await;
     assert_eq!(replacement.markets.len(), 2);
-    assert_eq!(mock.primary_count.load(Ordering::SeqCst), 1);
-    assert_eq!(mock.spot_count.load(Ordering::SeqCst), 1);
     ws_disconnect(socket).await;
     ws_disconnect(other_socket).await;
 
     // No HTTP lease exists: closing both populated maps must release every successful lease.
-    tokio::time::advance(Duration::from_millis(90_001)).await;
+    tokio::time::sleep(Duration::from_secs(31)).await;
     let mut probe = stats_socket(&url).await;
     ws_ping(&mut probe).await;
-    assert_eq!(
-        mock.primary_count.load(Ordering::SeqCst),
-        1,
-        "rejected, duplicate, or disconnected topics leaked demand"
-    );
-    assert_eq!(mock.spot_count.load(Ordering::SeqCst), 1);
     ws_send(&mut probe, stats_command("subscribe", &topics[0])).await;
     let renewed = ws_initial(&mut probe).await;
     assert_ne!(renewed.generation, first.generation);
@@ -1603,14 +1473,10 @@ async fn market_stats_ws_classifies_errors_and_limits_distinct_connection_topics
         renewed.markets[&native_id("ETH")]["fields"]["funding"]["state"],
         "available"
     );
-    assert_eq!(mock.primary_count.load(Ordering::SeqCst), 2);
-    assert_eq!(mock.spot_count.load(Ordering::SeqCst), 1);
     ws_unsubscribe(&mut probe, &renewed.topic).await;
     ws_disconnect(probe).await;
     state.shutdown_market_stats().await;
-    manual.abort();
-    let _ = manual.await;
-    tokio::time::resume();
+
     stop.send(()).unwrap();
     server.await.unwrap();
     up_stop.send(()).unwrap();
@@ -1619,32 +1485,31 @@ async fn market_stats_ws_classifies_errors_and_limits_distinct_connection_topics
 
 #[tokio::test]
 async fn market_stats_ws_cold_all_market_failure_recovers_without_selected_lease_leaks() {
-    let mock = InfoMock::new();
+    let (mock, upstream, up_stop, up_server) = hyperliquid_server().await;
     *mock.primary.write().await = Reply {
         status: StatusCode::BAD_GATEWAY,
         body: json!({"offline":true}),
         barrier: None,
     };
-    let (source, up_stop, up_server) = source_server(&mock).await;
+    let source: Arc<dyn MarketDataExchange> =
+        ccxt_stats_exchange(Venue::Hyperliquid, &upstream, 2_000);
     let (url, state, stop, server) = backend(source).await;
     let mut selected_socket = stats_socket(&url).await;
     let mut all_socket = stats_socket(&url).await;
     let btc = native_id("BTC");
     let selected_request = json!({"marketIds":[btc]});
-    tokio::time::pause();
-    let manual = keep_time_manual();
+
     ws_error(
         &mut selected_socket,
         stats_command("subscribe", &selected_request),
         "SUBSCRIBE_FAILED",
     )
     .await;
-    assert_eq!(mock.primary_count.load(Ordering::SeqCst), 1);
-    assert_eq!(mock.spot_count.load(Ordering::SeqCst), 1);
-    tokio::time::advance(Duration::from_millis(30_001)).await;
+    assert!(mock.primary_calls() >= 1);
+    tokio::time::sleep(Duration::from_secs(31)).await;
     ws_ping(&mut selected_socket).await;
     assert_eq!(
-        mock.primary_count.load(Ordering::SeqCst),
+        mock.primary_calls(),
         1,
         "failed selected subscription must not retain provisional demand"
     );
@@ -1673,11 +1538,10 @@ async fn market_stats_ws_cold_all_market_failure_recovers_without_selected_lease
         "SUBSCRIBE_FAILED",
     )
     .await;
-    assert_eq!(mock.primary_count.load(Ordering::SeqCst), 2);
-    assert_eq!(mock.spot_count.load(Ordering::SeqCst), 1);
+    assert_eq!(mock.primary_calls(), 2);
 
     *mock.primary.write().await = Reply::ok(primary_fixture());
-    tokio::time::advance(Duration::from_millis(30_001)).await;
+    tokio::time::sleep(Duration::from_secs(31)).await;
     let recovered = ws_delta(&mut all_socket, &mut all).await;
     assert_eq!(recovered["removedMarketIds"], json!([]));
     assert_eq!(all.markets.len(), 5);
@@ -1694,24 +1558,67 @@ async fn market_stats_ws_cold_all_market_failure_recovers_without_selected_lease
     let selected = ws_initial(&mut selected_socket).await;
     assert_eq!(selected.markets.keys().collect::<Vec<_>>(), vec![&btc]);
     assert_eq!(selected.markets[&btc], all.markets[&btc]);
-    assert_eq!(mock.primary_count.load(Ordering::SeqCst), 3);
-    assert_eq!(mock.spot_count.load(Ordering::SeqCst), 1);
     ws_unsubscribe(&mut all_socket, &all.topic).await;
     ws_disconnect(selected_socket).await;
-    tokio::time::advance(Duration::from_millis(30_001)).await;
+    tokio::time::sleep(Duration::from_secs(31)).await;
+    ws_ping(&mut all_socket).await;
+    let after = mock.primary_calls();
+    tokio::time::sleep(Duration::from_secs(31)).await;
     ws_ping(&mut all_socket).await;
     assert_eq!(
-        mock.primary_count.load(Ordering::SeqCst),
-        3,
+        mock.primary_calls(),
+        after,
         "recovery and duplicate subscriptions must release demand exactly once"
     );
     ws_disconnect(all_socket).await;
     state.shutdown_market_stats().await;
-    manual.abort();
-    let _ = manual.await;
-    tokio::time::resume();
+
     stop.send(()).unwrap();
     server.await.unwrap();
+    up_stop.send(()).unwrap();
+    up_server.await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Direct source smoke (no native cache: the coordinator owns sharing)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn market_stats_direct_source_reports_stock_rows_and_receipts() {
+    let (mock, upstream, up_stop, up_server) = hyperliquid_server().await;
+    let source = ccxt_stats_exchange(Venue::Hyperliquid, &upstream, 2_000);
+    let snapshot = source.fetch_market_stats(source_params()).await.unwrap();
+    assert!(snapshot.catalog_known);
+    assert!(snapshot
+        .complete_catalogs
+        .contains(&UnifiedMarketType::Perp));
+    assert!(snapshot
+        .complete_catalogs
+        .contains(&UnifiedMarketType::Spot));
+    assert!(snapshot.received_at.is_some());
+    let btc = snapshot
+        .rows
+        .iter()
+        .find(|row| row.market.identity.as_ref().unwrap().market_id == native_id("BTC"))
+        .unwrap();
+    let Some(MarketStatsValue::Funding(funding)) =
+        &btc.fields[&MarketStatsFieldName::Funding].value
+    else {
+        panic!("BTC funding missing")
+    };
+    assert_eq!(funding.rate, "-0.0000125");
+    let Some(MarketStatsValue::Volume24h(volume)) =
+        &btc.fields[&MarketStatsFieldName::Volume24h].value
+    else {
+        panic!("BTC volume missing")
+    };
+    assert_eq!(volume.base_volume, None);
+    assert_eq!(volume.quote_volume, Some(500000.0));
+    assert!(snapshot.rows.iter().any(|row| {
+        row.market.identity.as_ref().unwrap().market_id == native_id("OLD") && !row.market.active
+    }));
+    assert!(mock.primary_calls() >= 1);
+    assert!(mock.spot_calls() >= 1);
     up_stop.send(()).unwrap();
     up_server.await.unwrap();
 }

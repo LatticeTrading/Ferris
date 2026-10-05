@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -8,16 +8,11 @@ pub struct Config {
     pub extended_rest_base_url: String,
     pub extended_ws_url: String,
     pub lighter_rest_base_url: String,
-    pub lighter_markets_url: String,
     pub lighter_ws_url: String,
-    pub lighter_market_catalog_refresh_ms: u64,
     pub binance_base_url: String,
     pub bybit_base_url: String,
     pub aster_base_url: String,
     pub request_timeout_ms: u64,
-    pub trade_cache_capacity_per_coin: usize,
-    pub trade_cache_retention_ms: u64,
-    pub trade_collector_enabled: bool,
 }
 
 impl Config {
@@ -42,46 +37,30 @@ impl Config {
             .to_string();
 
         let extended_rest_base_url = std::env::var("EXTENDED_REST_BASE_URL")
-            .unwrap_or_else(|_| {
-                crate::exchanges::extended::DEFAULT_EXTENDED_REST_BASE_URL.to_string()
-            })
+            .unwrap_or_else(|_| "https://api.starknet.extended.exchange/api/v1".to_string())
             .trim()
             .trim_end_matches('/')
             .to_string();
 
         let extended_ws_url = std::env::var("EXTENDED_WS_URL")
-            .unwrap_or_else(|_| crate::ws_shared::EXTENDED_WS_BASE_URL.to_string())
+            .unwrap_or_else(|_| {
+                "wss://api.starknet.extended.exchange/stream.extended.exchange/v1".to_string()
+            })
             .trim()
             .trim_end_matches('/')
             .to_string();
 
         let lighter_rest_base_url = std::env::var("LIGHTER_REST_BASE_URL")
-            .unwrap_or_else(|_| {
-                crate::exchanges::lighterxyz::DEFAULT_LIGHTER_REST_BASE_URL.to_string()
-            })
+            .unwrap_or_else(|_| "https://mainnet.zklighter.elliot.ai".to_string())
             .trim()
             .trim_end_matches('/')
             .to_string();
 
-        let lighter_markets_url = std::env::var("LIGHTER_MARKETS_URL")
-            .unwrap_or_else(|_| {
-                crate::exchanges::lighterxyz::DEFAULT_LIGHTER_MARKETS_URL.to_string()
-            })
-            .trim()
-            .to_string();
-
         let lighter_ws_url = std::env::var("LIGHTER_WS_URL")
-            .unwrap_or_else(|_| crate::exchanges::lighterxyz::DEFAULT_LIGHTER_WS_URL.to_string())
+            .unwrap_or_else(|_| "wss://mainnet.zklighter.elliot.ai/stream".to_string())
             .trim()
             .to_string();
 
-        let lighter_market_catalog_refresh_ms =
-            match std::env::var("LIGHTER_MARKET_CATALOG_REFRESH_MS") {
-                Ok(value) => value.trim().parse::<u64>().with_context(|| {
-                    format!("invalid LIGHTER_MARKET_CATALOG_REFRESH_MS value: {value}")
-                })?,
-                Err(_) => crate::exchanges::lighterxyz::DEFAULT_LIGHTER_MARKET_CATALOG_REFRESH_MS,
-            };
         let binance_base_url = std::env::var("BINANCE_BASE_URL")
             .unwrap_or_else(|_| "https://fapi.binance.com".to_string())
             .trim()
@@ -106,28 +85,6 @@ impl Config {
             Err(_) => 10_000,
         };
 
-        let trade_cache_capacity_per_coin = match std::env::var("TRADE_CACHE_CAPACITY_PER_COIN") {
-            Ok(value) => value
-                .trim()
-                .parse::<usize>()
-                .with_context(|| format!("invalid TRADE_CACHE_CAPACITY_PER_COIN value: {value}"))?,
-            Err(_) => 5_000,
-        };
-
-        let trade_cache_retention_ms = match std::env::var("TRADE_CACHE_RETENTION_MS") {
-            Ok(value) => value
-                .trim()
-                .parse::<u64>()
-                .with_context(|| format!("invalid TRADE_CACHE_RETENTION_MS value: {value}"))?,
-            Err(_) => 86_400_000,
-        };
-
-        let trade_collector_enabled = match std::env::var("TRADE_COLLECTOR_ENABLED") {
-            Ok(value) => parse_bool(&value)
-                .ok_or_else(|| anyhow!("invalid TRADE_COLLECTOR_ENABLED value: {value}"))?,
-            Err(_) => true,
-        };
-
         Ok(Self {
             host,
             port,
@@ -135,24 +92,11 @@ impl Config {
             extended_rest_base_url,
             extended_ws_url,
             lighter_rest_base_url,
-            lighter_markets_url,
             lighter_ws_url,
-            lighter_market_catalog_refresh_ms,
             binance_base_url,
             bybit_base_url,
             aster_base_url,
             request_timeout_ms,
-            trade_cache_capacity_per_coin,
-            trade_cache_retention_ms,
-            trade_collector_enabled,
         })
-    }
-}
-
-fn parse_bool(value: &str) -> Option<bool> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "y" | "on" => Some(true),
-        "0" | "false" | "no" | "n" | "off" => Some(false),
-        _ => None,
     }
 }

@@ -316,9 +316,10 @@ mod tests {
     fn source(rows: Vec<MarketStatsRow>) -> MarketStatsSourceSnapshot {
         MarketStatsSourceSnapshot {
             rows,
-            perp_catalog_known: true,
-            perp_enumeration_complete: true,
-            spot_enumeration_complete: true,
+            catalog_known: true,
+            complete_catalogs: [UnifiedMarketType::Perp, UnifiedMarketType::Spot]
+                .into_iter()
+                .collect(),
             contexts_valid: true,
             received_at: Some(Instant::now()),
             field_received_at: Default::default(),
@@ -569,7 +570,7 @@ mod tests {
         consumer.assert_matches(&topic, &latest);
 
         // A later failure does not remove membership or restore the cleared rate.
-        latest.perp_enumeration_complete = false;
+        latest.complete_catalogs.remove(&UnifiedMarketType::Perp);
         latest.source_failures.push(MarketStatsSourceFailure {
             source: "hyperliquid:primary:metaAndAssetCtxs".into(),
             reason: "upstream-failure".into(),

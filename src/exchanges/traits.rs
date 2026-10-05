@@ -11,6 +11,8 @@ use crate::models::{
 pub enum ExchangeError {
     #[error("bad symbol: {0}")]
     BadSymbol(String),
+    #[error("unsupported feature: {0}")]
+    UnsupportedFeature(String),
     #[error("upstream request failed: {0}")]
     UpstreamRequest(String),
     #[error("upstream response invalid: {0}")]
@@ -27,6 +29,13 @@ pub trait MarketStatsSource: Send + Sync {
         &self,
         params: FetchMarketStatsParams,
     ) -> Result<MarketStatsSourceSnapshot, ExchangeError>;
+
+    /// Optional maintained source; the receiver owns its upstream demand lease.
+    async fn subscribe_market_stats(
+        &self,
+    ) -> Result<Option<crate::realtime::RealtimeSubscription>, ExchangeError> {
+        Ok(None)
+    }
 }
 
 #[async_trait]

@@ -24,7 +24,7 @@ use tokio::{
     sync::{
         broadcast,
         mpsc::{channel, error::TrySendError, Sender},
-        Mutex, Notify, RwLock,
+        watch, Mutex, Notify, RwLock,
     },
     task::JoinHandle,
 };
@@ -41,10 +41,7 @@ use crate::{
         FetchTradesRequest, HealthResponse, MarketStatsCapabilities, MarketStatsSnapshot,
         MarketStatsTopic,
     },
-    realtime::{
-        OhlcvTopic, OhlcvTopicManager, OrderBookTopic, OrderBookTopicManager, TradesTopic,
-        TradesTopicManager,
-    },
+    realtime::{RealtimeChannel, RealtimeReceiver, RealtimeService, RealtimeTopic, RealtimeUpdate},
 };
 
 mod market_stats_stream;
@@ -53,32 +50,53 @@ use market_stats_stream::spawn_market_stats_forwarder;
 #[derive(Clone)]
 pub struct AppState {
     exchange_registry: Arc<ExchangeRegistry>,
-    trades_topic_manager: TradesTopicManager,
-    order_book_topic_manager: OrderBookTopicManager,
-    ohlcv_topic_manager: OhlcvTopicManager,
+    realtime: RealtimeService,
     markets_cache: MarketsCache,
     market_stats: MarketStatsCoordinator,
+    sockets: watch::Sender<SocketLifecycle>,
 }
 
 impl AppState {
-    pub fn new(
-        exchange_registry: Arc<ExchangeRegistry>,
-        trades_topic_manager: TradesTopicManager,
-        order_book_topic_manager: OrderBookTopicManager,
-        ohlcv_topic_manager: OhlcvTopicManager,
-    ) -> Self {
+    pub fn new(exchange_registry: Arc<ExchangeRegistry>, realtime: RealtimeService) -> Self {
         Self {
             market_stats: MarketStatsCoordinator::new(exchange_registry.clone()),
             exchange_registry,
-            trades_topic_manager,
-            order_book_topic_manager,
-            ohlcv_topic_manager,
+            realtime,
             markets_cache: MarketsCache::new(Duration::from_secs(30)),
+            sockets: watch::channel(SocketLifecycle::default()).0,
         }
     }
 
     pub async fn shutdown_market_stats(&self) {
         self.market_stats.shutdown().await;
+    }
+
+    pub async fn shutdown_realtime(&self) -> Result<(), ExchangeError> {
+        self.realtime.shutdown().await
+    }
+
+    /// Reject new upgrades, cancel pending commands, and join client forwarders/writers.
+    pub async fn shutdown_websockets(&self) {
+        self.sockets.send_modify(|state| state.stopping = true);
+        let _ = self
+            .sockets
+            .subscribe()
+            .wait_for(|state| state.active == 0)
+            .await;
+    }
+}
+
+#[derive(Default)]
+struct SocketLifecycle {
+    stopping: bool,
+    active: usize,
+}
+
+struct SocketLease(watch::Sender<SocketLifecycle>);
+
+impl Drop for SocketLease {
+    fn drop(&mut self) {
+        self.0.send_modify(|state| state.active -= 1);
     }
 }
 
@@ -196,6 +214,9 @@ impl IntoResponse for FetchMarketsApiError {
             FetchMarketsApiError::Exchange(exchange_error) => match exchange_error {
                 ExchangeError::BadSymbol(message) => {
                     (StatusCode::BAD_REQUEST, "BAD_SYMBOL", message)
+                }
+                ExchangeError::UnsupportedFeature(message) => {
+                    (StatusCode::NOT_IMPLEMENTED, "UNSUPPORTED_FEATURE", message)
                 }
                 ExchangeError::UpstreamRequest(message) => {
                     (StatusCode::BAD_GATEWAY, "UPSTREAM_REQUEST_FAILED", message)
@@ -489,47 +510,21 @@ struct ClientStreamCommand {
 enum ParsedStreamCommand {
     Subscribe {
         channel: RealtimeChannel,
-        topic: TradesTopic,
+        topic: RealtimeTopic,
     },
     Unsubscribe {
         channel: RealtimeChannel,
-        topic: TradesTopic,
+        topic: RealtimeTopic,
     },
     SubscribeMarketStats(FetchMarketStatsRequest),
     UnsubscribeMarketStats(FetchMarketStatsRequest),
     Ping,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RealtimeChannel {
-    Trades,
-    OrderBook,
-    Ohlcv,
-}
-
-impl RealtimeChannel {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Trades => "trades",
-            Self::OrderBook => "orderbook",
-            Self::Ohlcv => "ohlcv",
-        }
-    }
-
-    fn from_client_value(value: &str) -> Option<Self> {
-        match value {
-            "trades" => Some(Self::Trades),
-            "orderbook" | "order_book" => Some(Self::OrderBook),
-            "ohlcv" | "candles" | "kline" | "klines" => Some(Self::Ohlcv),
-            _ => None,
-        }
-    }
-}
-
 struct ClientSubscription {
     channel: RealtimeChannel,
-    upstream_key: String,
-    topic: TradesTopic,
+    topic: RealtimeTopic,
+    request_topic: RealtimeTopic,
     forward_task: JoinHandle<()>,
 }
 
@@ -562,7 +557,7 @@ struct WsAckMessage<'a, T: Serialize> {
 struct WsTradesUpdate<'a> {
     #[serde(rename = "type")]
     message_type: &'static str,
-    topic: &'a TradesTopic,
+    topic: &'a RealtimeTopic,
     data: &'a [CcxtTrade],
 }
 
@@ -571,8 +566,19 @@ struct WsTradesUpdate<'a> {
 struct WsOrderBookUpdate<'a> {
     #[serde(rename = "type")]
     message_type: &'static str,
-    topic: &'a TradesTopic,
-    data: &'a CcxtOrderBook,
+    topic: &'a RealtimeTopic,
+    data: WsOrderBookView<'a>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WsOrderBookView<'a> {
+    asks: &'a [(f64, f64)],
+    bids: &'a [(f64, f64)],
+    datetime: Option<&'a str>,
+    timestamp: Option<u64>,
+    nonce: Option<u64>,
+    symbol: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -580,7 +586,7 @@ struct WsOrderBookUpdate<'a> {
 struct WsOhlcvUpdate<'a> {
     #[serde(rename = "type")]
     message_type: &'static str,
-    topic: &'a TradesTopic,
+    topic: &'a RealtimeTopic,
     data: &'a [CcxtOhlcv],
 }
 
@@ -591,7 +597,7 @@ struct WsLagWarning<'a> {
     message_type: &'static str,
     code: &'static str,
     message: String,
-    topic: &'a TradesTopic,
+    topic: &'a RealtimeTopic,
     dropped_messages: u64,
 }
 
@@ -602,6 +608,7 @@ struct WsPongMessage {
 }
 
 const CLIENT_OUTGOING_QUEUE_CAPACITY: usize = 256;
+const CLIENT_REALTIME_SUBSCRIPTION_LIMIT: usize = 200;
 
 pub async fn trades_stream_ws(
     ws: WebSocketUpgrade,
@@ -611,13 +618,24 @@ pub async fn trades_stream_ws(
 }
 
 async fn handle_trades_stream_socket(socket: WebSocket, state: AppState) {
+    if !state.sockets.send_if_modified(|lifecycle| {
+        if lifecycle.stopping {
+            return false;
+        }
+        lifecycle.active += 1;
+        true
+    }) {
+        return;
+    }
+    let _lease = SocketLease(state.sockets.clone());
+    let mut stopping = state.sockets.subscribe();
     let (mut ws_sender, mut ws_receiver) = socket.split();
     let (outgoing_sender, mut outgoing_receiver) =
         channel::<Message>(CLIENT_OUTGOING_QUEUE_CAPACITY);
     let close_signal = Arc::new(Notify::new());
     let force_close = Arc::new(AtomicBool::new(false));
 
-    let writer_task = tokio::spawn(async move {
+    let mut writer_task = tokio::spawn(async move {
         while let Some(message) = outgoing_receiver.recv().await {
             if ws_sender.send(message).await.is_err() {
                 break;
@@ -630,7 +648,12 @@ async fn handle_trades_stream_socket(socket: WebSocket, state: AppState) {
 
     loop {
         let next_message = tokio::select! {
+            _ = stopping.wait_for(|state| state.stopping) => {
+                force_close.store(true, Ordering::Release);
+                break;
+            }
             _ = close_signal.notified() => {
+                force_close.store(true, Ordering::Release);
                 warn!("closing websocket client after forwarder backpressure");
                 break;
             }
@@ -652,6 +675,7 @@ async fn handle_trades_stream_socket(socket: WebSocket, state: AppState) {
         match message {
             Message::Ping(payload) => {
                 if outgoing_sender.try_send(Message::Pong(payload)).is_err() {
+                    force_close.store(true, Ordering::Release);
                     break;
                 }
             }
@@ -664,6 +688,7 @@ async fn handle_trades_stream_socket(socket: WebSocket, state: AppState) {
                     Ok(None) => continue,
                     Err(err) => {
                         if !send_ws_error(&outgoing_sender, "INVALID_MESSAGE", err) {
+                            force_close.store(true, Ordering::Release);
                             break;
                         }
                         continue;
@@ -674,23 +699,27 @@ async fn handle_trades_stream_socket(socket: WebSocket, state: AppState) {
                     Ok(command) => command,
                     Err(err) => {
                         if !send_ws_error(&outgoing_sender, "INVALID_COMMAND", err) {
+                            force_close.store(true, Ordering::Release);
                             break;
                         }
                         continue;
                     }
                 };
 
-                let keep_open = handle_stream_command(
-                    &state,
-                    command,
-                    &outgoing_sender,
-                    &close_signal,
-                    &mut subscriptions,
-                    &mut stats_subscriptions,
-                    &force_close,
-                )
-                .await;
+                let keep_open = tokio::select! {
+                    _ = stopping.wait_for(|state| state.stopping) => false,
+                    keep_open = handle_stream_command(
+                        &state,
+                        command,
+                        &outgoing_sender,
+                        &close_signal,
+                        &mut subscriptions,
+                        &mut stats_subscriptions,
+                        &force_close,
+                    ) => keep_open,
+                };
                 if !keep_open {
+                    force_close.store(true, Ordering::Release);
                     break;
                 }
             }
@@ -699,7 +728,7 @@ async fn handle_trades_stream_socket(socket: WebSocket, state: AppState) {
 
     for (_key, subscription) in subscriptions {
         subscription.forward_task.abort();
-        unsubscribe_channel(&state, subscription.channel, &subscription.upstream_key).await;
+        let _ = subscription.forward_task.await;
     }
     for (_, subscription) in stats_subscriptions {
         subscription.forward_task.abort();
@@ -714,7 +743,13 @@ async fn handle_trades_stream_socket(socket: WebSocket, state: AppState) {
     if force_close.load(Ordering::Acquire) {
         writer_task.abort();
     }
-    let _ = writer_task.await;
+    tokio::select! {
+        _ = &mut writer_task => {},
+        _ = async { let _ = stopping.wait_for(|state| state.stopping).await; } => {
+            writer_task.abort();
+            let _ = writer_task.await;
+        },
+    }
 }
 
 async fn handle_stream_command(
@@ -830,15 +865,25 @@ async fn handle_stream_command(
             },
         ),
         ParsedStreamCommand::Subscribe { channel, topic } => {
-            let topic_key = match resolve_topic_key_by_channel(state, channel, topic.clone()).await
-            {
-                Ok(topic_key) => topic_key,
-                Err(err) => return send_ws_error(outgoing_sender, "INVALID_TOPIC", err),
+            let request_topic = topic.clone();
+
+            // Resolve owned metadata/policy once, then attach without resolving
+            // twice. Cancellation during either wait leaves no orphaned demand:
+            // the RAII receiver only exists once a subscription is owned.
+            let prepared = tokio::select! {
+                _ = close_signal.notified() => return false,
+                result = state.realtime.prepare(channel, topic) => result,
+            };
+            let prepared = match prepared {
+                Ok(prepared) => prepared,
+                Err(err) => {
+                    return send_ws_error(outgoing_sender, "INVALID_TOPIC", err.to_string());
+                }
             };
 
-            let local_key = to_local_subscription_key(channel, &topic_key);
+            let client_key = prepared.client_key.clone();
 
-            if let Some(existing) = subscriptions.get(&local_key) {
+            if let Some(existing) = subscriptions.get(&client_key) {
                 return send_ws_json(
                     outgoing_sender,
                     &WsAckMessage {
@@ -848,129 +893,75 @@ async fn handle_stream_command(
                     },
                 );
             }
-
-            match channel {
-                RealtimeChannel::Trades => {
-                    let subscription = match state.trades_topic_manager.subscribe(topic).await {
-                        Ok(subscription) => subscription,
-                        Err(err) => {
-                            return send_ws_error(outgoing_sender, "SUBSCRIBE_FAILED", err);
-                        }
-                    };
-
-                    let topic = subscription.topic.clone();
-                    let forward_task = spawn_trades_topic_forwarder(
-                        topic.clone(),
-                        subscription.receiver,
-                        outgoing_sender.clone(),
-                        close_signal.clone(),
-                    );
-
-                    subscriptions.insert(
-                        local_key,
-                        ClientSubscription {
-                            channel,
-                            upstream_key: subscription.key,
-                            topic: topic.clone(),
-                            forward_task,
-                        },
-                    );
-
-                    send_ws_json(
-                        outgoing_sender,
-                        &WsAckMessage {
-                            message_type: "subscribed",
-                            op: "subscribe",
-                            topic: &topic,
-                        },
-                    )
-                }
-                RealtimeChannel::OrderBook => {
-                    let subscription = match state
-                        .order_book_topic_manager
-                        .subscribe(topic.clone())
-                        .await
-                    {
-                        Ok(subscription) => subscription,
-                        Err(err) => {
-                            return send_ws_error(outgoing_sender, "SUBSCRIBE_FAILED", err);
-                        }
-                    };
-
-                    let topic = subscription.topic.clone();
-                    let forward_task = spawn_orderbook_topic_forwarder(
-                        topic.clone(),
-                        subscription.levels_limit,
-                        subscription.receiver,
-                        outgoing_sender.clone(),
-                        close_signal.clone(),
-                    );
-
-                    subscriptions.insert(
-                        local_key,
-                        ClientSubscription {
-                            channel,
-                            upstream_key: subscription.key,
-                            topic: topic.clone(),
-                            forward_task,
-                        },
-                    );
-
-                    send_ws_json(
-                        outgoing_sender,
-                        &WsAckMessage {
-                            message_type: "subscribed",
-                            op: "subscribe",
-                            topic: &topic,
-                        },
-                    )
-                }
-                RealtimeChannel::Ohlcv => {
-                    let subscription = match state.ohlcv_topic_manager.subscribe(topic).await {
-                        Ok(subscription) => subscription,
-                        Err(err) => {
-                            return send_ws_error(outgoing_sender, "SUBSCRIBE_FAILED", err);
-                        }
-                    };
-
-                    let topic = subscription.topic.clone();
-                    let forward_task = spawn_ohlcv_topic_forwarder(
-                        topic.clone(),
-                        subscription.receiver,
-                        outgoing_sender.clone(),
-                        close_signal.clone(),
-                    );
-
-                    subscriptions.insert(
-                        local_key,
-                        ClientSubscription {
-                            channel,
-                            upstream_key: subscription.key,
-                            topic: topic.clone(),
-                            forward_task,
-                        },
-                    );
-
-                    send_ws_json(
-                        outgoing_sender,
-                        &WsAckMessage {
-                            message_type: "subscribed",
-                            op: "subscribe",
-                            topic: &topic,
-                        },
-                    )
-                }
+            if subscriptions.len() >= CLIENT_REALTIME_SUBSCRIPTION_LIMIT {
+                return send_ws_error(
+                    outgoing_sender,
+                    "SUBSCRIPTION_LIMIT",
+                    "at most 200 realtime subscriptions are allowed per connection",
+                );
             }
-        }
-        ParsedStreamCommand::Unsubscribe { channel, topic } => {
-            let topic_key = match resolve_topic_key_by_channel(state, channel, topic.clone()).await
-            {
-                Ok(topic_key) => topic_key,
-                Err(err) => return send_ws_error(outgoing_sender, "INVALID_TOPIC", err),
+
+            let subscription = tokio::select! {
+                _ = close_signal.notified() => return false,
+                result = state.realtime.subscribe_prepared(prepared) => result,
+            };
+            let subscription = match subscription {
+                Ok(subscription) => subscription,
+                Err(err) => {
+                    return send_ws_error(outgoing_sender, "SUBSCRIBE_FAILED", err.to_string());
+                }
             };
 
-            let local_key = to_local_subscription_key(channel, &topic_key);
-            let Some(existing) = subscriptions.remove(&local_key) else {
+            let key = subscription.key;
+            let topic = subscription.topic;
+            let levels_limit = subscription.levels_limit;
+            let receiver = subscription.receiver;
+
+            // Enqueue the acknowledgement before the forwarder exists: it is the
+            // first frame in the queue, so the first update can never overtake
+            // `subscribed` for this topic.
+            if !send_ws_json(
+                outgoing_sender,
+                &WsAckMessage {
+                    message_type: "subscribed",
+                    op: "subscribe",
+                    topic: &topic,
+                },
+            ) {
+                // Returning drops the still-owned receiver, releasing demand.
+                force_close.store(true, Ordering::Release);
+                close_signal.notify_one();
+                return false;
+            }
+
+            let forward_task = spawn_realtime_forwarder(
+                topic.clone(),
+                levels_limit,
+                receiver,
+                outgoing_sender.clone(),
+                close_signal.clone(),
+            );
+
+            subscriptions.insert(
+                key,
+                ClientSubscription {
+                    channel,
+                    topic,
+                    request_topic,
+                    forward_task,
+                },
+            );
+
+            true
+        }
+        ParsedStreamCommand::Unsubscribe { channel, topic } => {
+            let client_key =
+                match client_key_for_unsubscribe(state, channel, &topic, subscriptions).await {
+                    Ok(client_key) => client_key,
+                    Err(err) => return send_ws_error(outgoing_sender, "INVALID_TOPIC", err),
+                };
+
+            let Some(existing) = subscriptions.remove(&client_key) else {
                 return send_ws_error(
                     outgoing_sender,
                     "NOT_SUBSCRIBED",
@@ -978,8 +969,10 @@ async fn handle_stream_command(
                 );
             };
 
+            // Abort+await releases the receiver (and thus this viewer's demand)
+            // before acknowledging, without any network unsubscribe round trip.
             existing.forward_task.abort();
-            unsubscribe_channel(state, channel, &topic_key).await;
+            let _ = existing.forward_task.await;
 
             send_ws_json(
                 outgoing_sender,
@@ -993,45 +986,64 @@ async fn handle_stream_command(
     }
 }
 
-async fn resolve_topic_key_by_channel(
+/// Canonical client key for an unsubscribe. The exact original request topic or
+/// the previously canonicalized topic already held on this connection is matched
+/// locally, so releasing a known subscription never needs metadata/network (it
+/// still works during a metadata outage). Unmatched aliases fall back to
+/// `prepare`, which canonicalizes them exactly like subscribe does.
+async fn client_key_for_unsubscribe(
     state: &AppState,
     channel: RealtimeChannel,
-    topic: TradesTopic,
+    topic: &RealtimeTopic,
+    subscriptions: &HashMap<String, ClientSubscription>,
 ) -> Result<String, String> {
-    match channel {
-        RealtimeChannel::Trades => state.trades_topic_manager.resolve_topic_key(topic).await,
-        RealtimeChannel::OrderBook => {
-            state
-                .order_book_topic_manager
-                .resolve_topic_key(topic)
-                .await
+    for (client_key, existing) in subscriptions {
+        if existing.channel == channel
+            && (topics_equal(&existing.request_topic, topic)
+                || topics_equal(&existing.topic, topic))
+        {
+            return Ok(client_key.clone());
         }
-        RealtimeChannel::Ohlcv => state.ohlcv_topic_manager.resolve_topic_key(topic).await,
+    }
+
+    state
+        .realtime
+        .prepare(channel, topic.clone())
+        .await
+        .map(|prepared| prepared.client_key)
+        .map_err(|err| err.to_string())
+}
+
+fn topics_equal(left: &RealtimeTopic, right: &RealtimeTopic) -> bool {
+    left.exchange == right.exchange && left.symbol == right.symbol && left.params == right.params
+}
+
+/// Serializes a borrowed top-N view of the owned shared book. The forwarder
+/// never clones the full-depth vectors merely to truncate them per client.
+fn orderbook_view(orderbook: &CcxtOrderBook, levels_limit: usize) -> WsOrderBookView<'_> {
+    WsOrderBookView {
+        asks: &orderbook.asks[..orderbook.asks.len().min(levels_limit)],
+        bids: &orderbook.bids[..orderbook.bids.len().min(levels_limit)],
+        datetime: orderbook.datetime.as_deref(),
+        timestamp: orderbook.timestamp,
+        nonce: orderbook.nonce,
+        symbol: orderbook.symbol.as_deref(),
     }
 }
 
-async fn unsubscribe_channel(state: &AppState, channel: RealtimeChannel, key: &str) {
-    match channel {
-        RealtimeChannel::Trades => state.trades_topic_manager.unsubscribe_by_key(key).await,
-        RealtimeChannel::OrderBook => state.order_book_topic_manager.unsubscribe_by_key(key).await,
-        RealtimeChannel::Ohlcv => state.ohlcv_topic_manager.unsubscribe_by_key(key).await,
-    }
-}
-
-fn to_local_subscription_key(channel: RealtimeChannel, key: &str) -> String {
-    format!("{}|{key}", channel.as_str())
-}
-
-fn spawn_trades_topic_forwarder(
-    topic: TradesTopic,
-    mut receiver: broadcast::Receiver<Arc<Vec<CcxtTrade>>>,
+/// One forwarder over the RAII receiver: it owns this viewer's demand, and
+/// dropping it (abort/unsubscribe/disconnect) removes exactly this viewer.
+fn spawn_realtime_forwarder(
+    topic: RealtimeTopic,
+    levels_limit: usize,
+    mut receiver: RealtimeReceiver,
     outgoing_sender: Sender<Message>,
     close_signal: Arc<Notify>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             match receiver.recv().await {
-                Ok(trades) => {
+                Ok(RealtimeUpdate::Trades(trades)) => {
                     if !send_ws_json(
                         &outgoing_sender,
                         &WsTradesUpdate {
@@ -1044,88 +1056,20 @@ fn spawn_trades_topic_forwarder(
                         return;
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    if !send_ws_json(
-                        &outgoing_sender,
-                        &WsLagWarning {
-                            message_type: "warning",
-                            code: "CLIENT_LAGGED",
-                            message: "client lagged behind realtime stream".to_string(),
-                            topic: &topic,
-                            dropped_messages: skipped,
-                        },
-                    ) {
-                        close_signal.notify_one();
-                        return;
-                    }
-                }
-                Err(broadcast::error::RecvError::Closed) => {
-                    return;
-                }
-            }
-        }
-    })
-}
-
-fn spawn_orderbook_topic_forwarder(
-    topic: OrderBookTopic,
-    levels_limit: usize,
-    mut receiver: broadcast::Receiver<Arc<CcxtOrderBook>>,
-    outgoing_sender: Sender<Message>,
-    close_signal: Arc<Notify>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            match receiver.recv().await {
-                Ok(orderbook) => {
-                    let mut orderbook = orderbook.as_ref().clone();
-                    orderbook.bids.truncate(levels_limit);
-                    orderbook.asks.truncate(levels_limit);
+                Ok(RealtimeUpdate::OrderBook(orderbook)) => {
                     if !send_ws_json(
                         &outgoing_sender,
                         &WsOrderBookUpdate {
                             message_type: "orderbook",
                             topic: &topic,
-                            data: &orderbook,
+                            data: orderbook_view(&orderbook, levels_limit),
                         },
                     ) {
                         close_signal.notify_one();
                         return;
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    if !send_ws_json(
-                        &outgoing_sender,
-                        &WsLagWarning {
-                            message_type: "warning",
-                            code: "CLIENT_LAGGED",
-                            message: "client lagged behind realtime stream".to_string(),
-                            topic: &topic,
-                            dropped_messages: skipped,
-                        },
-                    ) {
-                        close_signal.notify_one();
-                        return;
-                    }
-                }
-                Err(broadcast::error::RecvError::Closed) => {
-                    return;
-                }
-            }
-        }
-    })
-}
-
-fn spawn_ohlcv_topic_forwarder(
-    topic: OhlcvTopic,
-    mut receiver: broadcast::Receiver<Arc<Vec<CcxtOhlcv>>>,
-    outgoing_sender: Sender<Message>,
-    close_signal: Arc<Notify>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            match receiver.recv().await {
-                Ok(candles) => {
+                Ok(RealtimeUpdate::Ohlcv(candles)) => {
                     if !send_ws_json(
                         &outgoing_sender,
                         &WsOhlcvUpdate {
@@ -1134,6 +1078,17 @@ fn spawn_ohlcv_topic_forwarder(
                             data: candles.as_ref(),
                         },
                     ) {
+                        close_signal.notify_one();
+                        return;
+                    }
+                }
+                // Internal ticker acquisition is projected by the revisioned
+                // statistics forwarder, never emitted as a public realtime topic.
+                Ok(RealtimeUpdate::Statistics(_)) => unreachable!("statistics demand is internal"),
+                // Source lifecycle error: surface it as a WS error envelope and
+                // never invent a successful update.
+                Ok(RealtimeUpdate::Error(error)) => {
+                    if !send_ws_error(&outgoing_sender, "UPSTREAM_ERROR", error.to_string()) {
                         close_signal.notify_one();
                         return;
                     }
@@ -1208,8 +1163,11 @@ fn parse_stream_command(payload: &str) -> Result<ParsedStreamCommand, String> {
                 ));
             };
 
-            let topic =
-                TradesTopic::from_client_request(command.exchange, command.symbol, command.params)?;
+            let topic = RealtimeTopic::from_client_request(
+                command.exchange,
+                command.symbol,
+                command.params,
+            )?;
 
             if op == "subscribe" {
                 Ok(ParsedStreamCommand::Subscribe { channel, topic })
@@ -1279,65 +1237,13 @@ fn send_ws_json<T: Serialize>(outgoing_sender: &Sender<Message>, payload: &T) ->
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use serde_json::json;
-    use tokio::time::timeout;
 
     use super::*;
 
-    fn sample_trade() -> CcxtTrade {
-        CcxtTrade {
-            info: json!({"tid": 1}),
-            amount: Some(0.1),
-            datetime: Some("2026-01-01T00:00:00.000Z".to_string()),
-            id: Some("1".to_string()),
-            order: None,
-            price: Some(100.0),
-            timestamp: Some(1),
-            trade_type: None,
-            side: Some("buy".to_string()),
-            symbol: Some("BTC/USDC:USDC".to_string()),
-            taker_or_maker: None,
-            cost: Some(10.0),
-            fee: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn topic_forwarder_signals_close_when_outgoing_queue_is_full() {
-        let topic = TradesTopic::from_client_request(
-            Some("hyperliquid".to_string()),
-            Some("BTC/USDC:USDC".to_string()),
-            Value::Null,
-        )
-        .expect("topic should be valid");
-
-        let (broadcast_sender, receiver) = broadcast::channel::<Arc<Vec<CcxtTrade>>>(8);
-        let (outgoing_sender, _outgoing_receiver) = channel::<Message>(1);
-        outgoing_sender
-            .try_send(Message::Text("filled".to_string().into()))
-            .expect("queue preload should succeed");
-
-        let close_signal = Arc::new(Notify::new());
-        let forwarder =
-            spawn_trades_topic_forwarder(topic, receiver, outgoing_sender, close_signal.clone());
-
-        let _ = broadcast_sender
-            .send(Arc::new(vec![sample_trade()]))
-            .expect("broadcast should succeed");
-
-        timeout(Duration::from_secs(1), close_signal.notified())
-            .await
-            .expect("close signal should be notified");
-
-        let _ = timeout(Duration::from_secs(1), forwarder)
-            .await
-            .expect("forwarder task should complete");
-    }
-    #[tokio::test]
-    async fn orderbook_forwarder_truncates_shared_book_per_subscriber() {
-        let topic = TradesTopic::from_client_request(
+    #[test]
+    fn orderbook_view_serializes_borrowed_top_n_without_cloning() {
+        let topic = RealtimeTopic::from_client_request(
             Some("binance".to_string()),
             Some("BTC/USDT:USDT".to_string()),
             json!({"levels": 21}),
@@ -1354,31 +1260,26 @@ mod tests {
             nonce: Some(123),
             symbol: Some("BTC/USDT:USDT".to_string()),
         });
-        let (broadcast_sender, receiver) = broadcast::channel::<Arc<CcxtOrderBook>>(8);
-        let (outgoing_sender, mut outgoing_receiver) = channel::<Message>(8);
-        let close_signal = Arc::new(Notify::new());
-        let forwarder =
-            spawn_orderbook_topic_forwarder(topic, 21, receiver, outgoing_sender, close_signal);
-        broadcast_sender
-            .send(source.clone())
-            .expect("broadcast should succeed");
-        let Message::Text(payload) = timeout(Duration::from_secs(1), outgoing_receiver.recv())
-            .await
-            .expect("forwarder should send")
-            .expect("outgoing message should exist")
-        else {
-            panic!("expected text message");
-        };
-        let value: Value = serde_json::from_str(&payload).expect("forwarded JSON should parse");
+
+        let view = orderbook_view(&source, 21);
+        assert_eq!(view.bids.len(), 21);
+        assert_eq!(view.asks.len(), 21);
+
+        let value = serde_json::to_value(WsOrderBookUpdate {
+            message_type: "orderbook",
+            topic: &topic,
+            data: view,
+        })
+        .expect("update should serialize");
         assert_eq!(value["type"], "orderbook");
         assert_eq!(value["topic"]["exchange"], "binance");
         assert_eq!(value["data"]["bids"].as_array().unwrap().len(), 21);
         assert_eq!(value["data"]["asks"].as_array().unwrap().len(), 21);
         assert_eq!(value["data"]["nonce"], 123);
         assert_eq!(value["data"]["symbol"], "BTC/USDT:USDT");
+        // The owned source book stays full-depth; only the view is truncated.
         assert_eq!(source.bids.len(), 30);
         assert_eq!(source.asks.len(), 30);
-        forwarder.abort();
     }
 
     #[test]
