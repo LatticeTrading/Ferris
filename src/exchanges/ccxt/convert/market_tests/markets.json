@@ -1,0 +1,45 @@
+{
+  "binance": {
+    "id": "BTCUSDT", "symbol": "BTC/USDT:USDT", "base": "BTC", "quote": "USDT",
+    "settle": "USDT", "type": "swap", "swap": true, "contract": true,
+    "linear": true, "inverse": false, "active": true, "contractSize": 1,
+    "precision": {"price": 0.1}, "limits": {"amount": {"min": 0.001}},
+    "info": {"marginAsset": "USDT", "contractType": "PERPETUAL"}
+  },
+  "bybit": {
+    "id": "BTCUSDT", "symbol": "BTC/USDT:USDT", "base": "BTC", "quote": "USDT",
+    "settle": "USDT", "type": "swap", "swap": true, "contract": true,
+    "linear": true, "inverse": false, "active": true, "contractSize": 1,
+    "precision": {"price": 0.1}, "limits": {"amount": {"min": 0.001}},
+    "info": {"settleCoin": "USDT", "contractType": "LinearPerpetual"}
+  },
+  "aster": {
+    "id": "BTCUSDT", "symbol": "BTC/USDT:USDT", "base": "BTC", "quote": "USDT",
+    "settle": "USDT", "type": "swap", "swap": true, "contract": true,
+    "linear": true, "inverse": false, "active": true, "contractSize": 1,
+    "precision": {"price": 0.1}, "limits": {"amount": {"min": 0.001}},
+    "info": {"marginAsset": "USDT", "contractType": "PERPETUAL"}
+  },
+  "hyperliquid": {
+    "id": "0", "symbol": "BTC/USDC:USDC", "base": "BTC", "quote": "USDC",
+    "settle": "USDC", "type": "swap", "swap": true, "contract": true,
+    "linear": true, "inverse": false, "active": true, "contractSize": 1,
+    "precision": {"price": 0.1}, "limits": {"amount": {"min": null}},
+    "info": {"name": "BTC", "szDecimals": 4}
+  },
+  "extended": {
+    "id": "BTC-USD", "symbol": "BTC/USDC:USDC", "base": "BTC", "quote": "USDC",
+    "baseId": "BTC", "quoteId": "USD", "settle": "USDC",
+    "type": "swap", "swap": true, "contract": true,
+    "linear": true, "inverse": false, "active": true, "contractSize": 1,
+    "precision": {"price": 0.1}, "limits": {"amount": {"min": 0.001}},
+    "info": {"name": "BTC-USD", "collateralAssetName": "USD", "l2Config": {"collateralId": "0x123"}}
+  },
+  "lighterxyz": {
+    "id": "7", "symbol": "BTC/USDC:USDC", "base": "BTC", "quote": "USDC",
+    "settle": "USDC", "type": "swap", "swap": true, "contract": true,
+    "linear": true, "inverse": false, "active": true, "contractSize": 1,
+    "precision": {"price": 0.1}, "limits": {"amount": {"min": 0.001}},
+    "info": {"symbol": "BTC", "quote_asset_id": 3}
+  }
+}

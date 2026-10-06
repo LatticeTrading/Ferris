@@ -11,6 +11,7 @@ mod statistics;
 pub(crate) mod statistics_profile;
 mod stream;
 mod venue;
+mod venues;
 
 pub use catalog::{Catalog, CatalogMarket};
 pub use owner::{CatalogSnapshot, CcxtService};
@@ -116,10 +117,6 @@ impl MarketStatsSource for CcxtExchange {
     async fn subscribe_market_stats(
         &self,
     ) -> Result<Option<crate::realtime::RealtimeSubscription>, ExchangeError> {
-        if self.venue == Venue::Lighter {
-            self.service.subscribe_lighter_statistics().await.map(Some)
-        } else {
-            Ok(None)
-        }
+        self.service.subscribe_statistics(self.venue).await
     }
 }

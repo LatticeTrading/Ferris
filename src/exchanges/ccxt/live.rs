@@ -12,7 +12,6 @@ use tokio::sync::{broadcast, oneshot, watch, Notify};
 
 use crate::{
     exchanges::traits::ExchangeError,
-    models::UnifiedMarketType,
     realtime::{
         DeliveryState, Publication, RealtimeChannel, RealtimeReceiver, RealtimeSubscription,
         RealtimeUpdate, StatisticsRowUpdate, StatisticsUpdate,
@@ -22,7 +21,7 @@ use crate::{
 use super::{
     convert::{convert_book, convert_candles, convert_trades},
     owner::CatalogSnapshot,
-    stream::{LiveChannel, LiveProvider, LiveSpec, PreparedTopic},
+    stream::{statistics::StatisticsFeed, LiveChannel, LiveProvider, LiveSpec, PreparedTopic},
     venue::Venue,
 };
 
@@ -667,7 +666,8 @@ async fn run_session(
         let statistics_key = active
             .iter()
             .find(|(_, current)| {
-                current.feed.spec.channel == LiveChannel::Statistics && lighter_ticker_frame(&raw)
+                current.feed.spec.channel == LiveChannel::Statistics
+                    && current.feed.spec.statistics_feed().recognizes(&raw)
             })
             .map(|(key, _)| key.clone());
         let key = if let Some(id) = cache_id {
@@ -759,42 +759,6 @@ async fn run_session(
     exit
 }
 
-/// True when a settled frame is a Lighter `market_stats` ticker rather than a
-/// book/trade payload sharing the same URL. Books carry `bids`/`asks`; trades
-/// carry trade keys, not market-statistics keys.
-fn lighter_ticker_frame(raw: &ccxt::Value) -> bool {
-    let Some(fields) = raw.as_map() else {
-        return false;
-    };
-    if fields.contains_key("bids") || fields.contains_key("asks") {
-        return false;
-    }
-    let info = ccxt::value::get_value_k(raw, "info");
-    let Some(info) = info.as_map() else {
-        return false;
-    };
-    info.contains_key("market_id")
-        && [
-            "mark_price",
-            "index_price",
-            "open_interest",
-            "last_trade_price",
-            "current_funding_rate",
-            "daily_base_token_volume",
-        ]
-        .iter()
-        .any(|key| info.contains_key(*key))
-}
-
-fn scalar_key(value: &ccxt::Value) -> Option<String> {
-    match value {
-        ccxt::Value::Str(value) => Some(value.to_string()),
-        ccxt::Value::Int(value) => Some(value.to_string()),
-        ccxt::Value::Float(value) => Some(value.to_string()),
-        _ => None,
-    }
-}
-
 /// Cache identity: unchanged symbols keep the same inner `Arc`, so a pointer
 /// comparison (holding both allocations, no ABA, no unsafe) proves the row did
 /// not change and its prior receipts stay untouched.
@@ -822,8 +786,8 @@ fn refresh_statistics_catalog(
     provider.add_catalog(snapshot.catalog.entries());
     let mut index = HashMap::new();
     for (position, entry) in snapshot.catalog.entries().iter().enumerate() {
-        if let Some(identity) = &entry.market.identity {
-            index.insert(identity.exchange_market_id.clone(), position);
+        if let Some(key) = spec.statistics_feed().catalog_key(entry) {
+            index.insert(key, position);
         }
     }
     current.market_index = index;
@@ -835,6 +799,7 @@ fn refresh_statistics_catalog(
 /// receipts and is not returned, however many frames arrive. A finite frame that
 /// changed several rows returns all of them, so no later frame is required.
 fn changed_tickers<'a>(
+    feed: StatisticsFeed,
     marks: &HashMap<String, ccxt::Value>,
     tickers: &'a ccxt::Value,
 ) -> Vec<(String, &'a ccxt::Value)> {
@@ -843,7 +808,7 @@ fn changed_tickers<'a>(
     };
     tickers
         .iter()
-        .filter(|(_, ticker)| lighter_ticker_frame(ticker))
+        .filter(|(_, ticker)| feed.recognizes(ticker))
         .filter(|(symbol, ticker)| {
             !marks
                 .get(*symbol)
@@ -872,27 +837,24 @@ fn statistics_update(
     let received_at = tokio::time::Instant::now();
     let tickers = provider.cache(spec);
     let mut rows = Vec::new();
-    for (symbol, ticker) in changed_tickers(&current.ticker_marks, &tickers) {
-        let info = ccxt::value::get_value_k(ticker, "info");
-        let Some(market_id) = scalar_key(&ccxt::value::get_value_k(&info, "market_id")) else {
+    let feed = spec.statistics_feed();
+    for (symbol, ticker) in changed_tickers(feed, &current.ticker_marks, &tickers) {
+        let Some(market_id) = feed.row_key(ticker) else {
             continue;
         };
         let Some(position) = current.market_index.get(&market_id) else {
             continue;
         };
         let entry = &entries[*position];
-        // `market_stats/all` is swap-only; a spot market id can never be a
-        // statistics row even though the catalog holds both products.
-        if entry.market.market_type != UnifiedMarketType::Perp {
+        if !feed.accepts_market(entry) {
             continue;
         }
-        let fields =
-            match super::statistics::lighter_ticker_patch(ticker, &entry.raw, received_timestamp) {
-                Ok(fields) => fields,
-                // A single unreadable row is an absent observation, not a reason to
-                // tear down the shared URL and every book/trade feed on it.
-                Err(_) => continue,
-            };
+        let fields = match feed.patch(ticker, entry, received_timestamp) {
+            Ok(fields) => fields,
+            // A single unreadable row is an absent observation, not a reason to
+            // tear down the shared URL and every book/trade feed on it.
+            Err(_) => continue,
+        };
         current.ticker_marks.insert(symbol.clone(), ticker.clone());
         if fields.is_empty() {
             continue;
@@ -940,112 +902,4 @@ fn stopped() -> ExchangeError {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    fn value(input: serde_json::Value) -> ccxt::Value {
-        ccxt::Value::from_json(&input)
-    }
-
-    #[test]
-    fn statistics_frame_is_distinguished_from_book_and_trade() {
-        let ticker = value(json!({
-            "symbol": "ETH/USDC:USDC",
-            "info": {
-                "market_id": 0,
-                "mark_price": "3013.91",
-                "index_price": "3015.56",
-                "last_trade_price": "3013.13",
-                "current_funding_rate": "0.0012",
-                "funding_rate": "0.0012",
-                "daily_base_token_volume": 643235.2763,
-            }
-        }));
-        let book = value(json!({
-            "symbol": "ETH/USDC:USDC",
-            "bids": [[3013.0, 1.0]],
-            "asks": [[3014.0, 1.0]],
-        }));
-        let trade = value(json!({
-            "symbol": "ETH/USDC:USDC",
-            "info": {
-                "market_id": 0,
-                "trade_id": 526801155,
-                "size": "0.0346",
-                "price": "3028.85",
-            }
-        }));
-        let ack = ccxt::Value::Bool(true);
-        let book_with_info = value(json!({
-            "symbol": "ETH/USDC:USDC",
-            "bids": [[3013.0, 1.0]],
-            "asks": [[3014.0, 1.0]],
-            "info": {"market_id": 0, "mark_price": "3013.91"},
-        }));
-        assert!(lighter_ticker_frame(&ticker));
-        assert!(!lighter_ticker_frame(&book));
-        assert!(!lighter_ticker_frame(&book_with_info));
-        assert!(!lighter_ticker_frame(&trade));
-        assert!(!lighter_ticker_frame(&ack));
-    }
-
-    #[test]
-    fn unchanged_rows_keep_their_receipts_across_repeated_frames() {
-        let first = value(json!({
-            "symbol": "ETH/USDC:USDC",
-            "info": {"market_id": 0, "mark_price": "3013.91"},
-        }));
-        let second = value(json!({
-            "symbol": "SOL/USDC:USDC",
-            "info": {"market_id": 1, "mark_price": "1.15954"},
-        }));
-        let book = value(json!({"symbol": "ETH/USDC:USDC", "bids": [], "asks": []}));
-        let mut tickers = value(json!({}));
-        ccxt::set_value(
-            &mut tickers,
-            &ccxt::Value::from("ETH/USDC:USDC"),
-            first.clone(),
-        );
-        ccxt::set_value(
-            &mut tickers,
-            &ccxt::Value::from("SOL/USDC:USDC"),
-            second.clone(),
-        );
-        ccxt::set_value(&mut tickers, &ccxt::Value::from("BTC/USDC:USDC"), book);
-
-        // A finite multi-row frame delivers every changed row at once.
-        let changed = changed_tickers(&HashMap::<String, ccxt::Value>::new(), &tickers);
-        assert_eq!(changed.len(), 2);
-
-        // The held cache values make unchanged rows pointer-identical, so a
-        // later identical frame has nothing new to publish.
-        let marks: HashMap<String, ccxt::Value> = changed
-            .iter()
-            .map(|(symbol, ticker)| (symbol.clone(), (*ticker).clone()))
-            .collect();
-        assert!(changed_tickers(&marks, &tickers).is_empty());
-
-        // Replacing one symbol's cache value (stock re-parse) re-delivers only it.
-        let mut replaced = tickers.clone();
-        ccxt::set_value(
-            &mut replaced,
-            &ccxt::Value::from("ETH/USDC:USDC"),
-            value(json!({
-                "symbol": "ETH/USDC:USDC",
-                "info": {"market_id": 0, "mark_price": "3014.00"},
-            })),
-        );
-        let changed = changed_tickers(&marks, &replaced);
-        assert_eq!(changed.len(), 1);
-        assert_eq!(changed[0].0, "ETH/USDC:USDC");
-    }
-
-    #[test]
-    fn scalar_keys_cover_numeric_and_string_market_ids() {
-        assert_eq!(scalar_key(&ccxt::Value::Int(7)), Some("7".to_string()));
-        assert_eq!(scalar_key(&ccxt::Value::from("7")), Some("7".to_string()));
-        assert_eq!(scalar_key(&ccxt::Value::Null), None);
-        assert_eq!(scalar_key(&ccxt::Value::Bool(true)), None);
-    }
-}
+mod tests;

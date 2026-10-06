@@ -39,6 +39,8 @@ use crate::{
     },
 };
 
+mod policy;
+
 const POLL: Duration = Duration::from_secs(30);
 const SOURCE: &str = "hyperliquid:primary:metaAndAssetCtxs";
 const WALL_ORIGIN: u64 = 1_700_000_000_000;
@@ -46,6 +48,7 @@ const WALL_ORIGIN: u64 = 1_700_000_000_000;
 // The controller supplies the primary receipt independently of completion. This models
 // a primary response arriving before the concurrently acquired spot metadata.
 struct SourceCall {
+    params: FetchMarketStatsParams,
     completion: oneshot::Sender<Result<Instant, ExchangeError>>,
     cancelled: oneshot::Receiver<()>,
 }
@@ -68,6 +71,8 @@ impl SourceCall {
 }
 
 struct FakeExchange {
+    venue: &'static str,
+    live: Option<mpsc::UnboundedSender<policy::LiveCall>>,
     started: mpsc::UnboundedSender<SourceCall>,
     calls: AtomicUsize,
     active: AtomicUsize,
@@ -140,7 +145,7 @@ impl MarketStatsSource for FakeExchange {
 
     async fn fetch_market_stats(
         &self,
-        _params: FetchMarketStatsParams,
+        params: FetchMarketStatsParams,
     ) -> Result<MarketStatsSourceSnapshot, ExchangeError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         assert_eq!(
@@ -156,6 +161,7 @@ impl MarketStatsSource for FakeExchange {
         };
         self.started
             .send(SourceCall {
+                params: params.clone(),
                 completion,
                 cancelled: cancellation,
             })
@@ -165,8 +171,10 @@ impl MarketStatsSource for FakeExchange {
             .expect("source call was neither completed nor cancelled");
         in_flight.cancelled = None;
         result.map(|received_at| MarketStatsSourceSnapshot {
-            rows: source_rows(
+            rows: policy::rows_for(
+                self.venue,
                 WALL_ORIGIN + received_at.duration_since(self.origin).as_millis() as u64,
+                &params,
             ),
             catalog_known: true,
             complete_catalogs: [UnifiedMarketType::Perp, UnifiedMarketType::Spot]
@@ -179,12 +187,24 @@ impl MarketStatsSource for FakeExchange {
             source_failures: Vec::new(),
         })
     }
+
+    async fn subscribe_market_stats(
+        &self,
+    ) -> Result<Option<crate::realtime::RealtimeSubscription>, ExchangeError> {
+        let (reply, response) = oneshot::channel();
+        self.live
+            .as_ref()
+            .expect("unqualified venue started live setup")
+            .send(reply)
+            .unwrap_or_else(|_| panic!("live controller dropped"));
+        response.await.unwrap()
+    }
 }
 
 #[async_trait]
 impl MarketDataExchange for FakeExchange {
     fn id(&self) -> &'static str {
-        "hyperliquid"
+        self.venue
     }
 
     fn market_stats_source(&self) -> Option<&dyn MarketStatsSource> {
@@ -249,6 +269,8 @@ impl SourceController {
 fn fixture() -> (Arc<MarketStatsCoordinator>, SourceController) {
     let (started, receiver) = mpsc::unbounded_channel();
     let exchange = Arc::new(FakeExchange {
+        venue: "hyperliquid",
+        live: None,
         started,
         calls: AtomicUsize::new(0),
         active: AtomicUsize::new(0),

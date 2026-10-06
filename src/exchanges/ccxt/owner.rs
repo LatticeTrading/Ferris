@@ -23,7 +23,7 @@ use super::{
     rest::{fetch_snapshot, SnapshotRequest, SnapshotResponse},
     statistics::fetch_statistics,
     statistics_profile,
-    stream::{live_scope, prepare_lighter_statistics, prepare_live, PreparedTopic},
+    stream::{live_scope, prepare_live, PreparedTopic},
     venue::{exchange_error, CatalogScope, Provider, ProviderConfig, Venue},
 };
 
@@ -84,6 +84,7 @@ enum Command {
         reply: oneshot::Sender<Result<MarketStatsSourceSnapshot, ExchangeError>>,
     },
     PrepareStatistics {
+        scope: CatalogScope,
         reply: oneshot::Sender<Result<PreparedTopic, ExchangeError>>,
     },
 }
@@ -236,19 +237,24 @@ impl CcxtService {
         response.await.map_err(|_| owner_stopped(venue))?
     }
 
-    pub(super) async fn subscribe_lighter_statistics(
+    pub(super) async fn subscribe_statistics(
         &self,
-    ) -> Result<RealtimeSubscription, ExchangeError> {
+        venue: Venue,
+    ) -> Result<Option<RealtimeSubscription>, ExchangeError> {
+        let Some(policy) = statistics_profile::live_statistics(venue) else {
+            return Ok(None);
+        };
         let (reply, response) = oneshot::channel();
-        self.inner.owners[&Venue::Lighter]
+        self.inner.owners[&venue]
             .commands
-            .send(Command::PrepareStatistics { reply })
+            .send(Command::PrepareStatistics {
+                scope: policy.scope,
+                reply,
+            })
             .await
-            .map_err(|_| owner_stopped(Venue::Lighter))?;
-        let prepared = response
-            .await
-            .map_err(|_| owner_stopped(Venue::Lighter))??;
-        self.inner.live.subscribe(prepared).await
+            .map_err(|_| owner_stopped(venue))?;
+        let prepared = response.await.map_err(|_| owner_stopped(venue))??;
+        self.inner.live.subscribe(prepared).await.map(Some)
     }
 
     pub(crate) async fn shutdown_live(&self) -> Result<(), ExchangeError> {
@@ -419,21 +425,23 @@ async fn run_owner(
                 };
                 let _ = reply.send(result);
             }
-            Command::PrepareStatistics { reply } => {
-                let state = catalogs.entry(CatalogScope::Default).or_default();
+            Command::PrepareStatistics { scope, reply } => {
+                let policy =
+                    statistics_profile::live_statistics(venue).expect("qualified statistics feed");
+                let state = catalogs.entry(scope).or_default();
                 let result = tokio::select! {
                     biased;
                     _ = stop.changed() => break,
                     result = std::panic::AssertUnwindSafe(async {
                         let snapshot = if state.provider.is_none() {
-                            load_catalog(venue, CatalogScope::Default, &config, state).await?
+                            load_catalog(venue, scope, &config, state).await?
                         } else {
                             Arc::clone(state.snapshot.as_ref().expect("loaded catalog"))
                         };
                         let watch = state.watch.get_or_insert_with(|| {
                             Arc::new(CatalogWatch::new(Arc::clone(&snapshot)))
                         }).clone();
-                        prepare_lighter_statistics(snapshot, &config, watch).await
+                        policy.feed.prepare(snapshot, &config, watch).await
                     }).catch_unwind() => result.unwrap_or_else(|panic| Err(ExchangeError::UpstreamRequest(panic_message(panic)))),
                 };
                 let _ = reply.send(result);

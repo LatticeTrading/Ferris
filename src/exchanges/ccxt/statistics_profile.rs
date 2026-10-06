@@ -14,7 +14,9 @@ use crate::{
     },
 };
 
-use super::{catalog::catalog_scope, CatalogScope, Venue};
+use super::{
+    catalog::catalog_scope, stream::statistics::StatisticsFeed, venues, CatalogScope, Venue,
+};
 
 pub(super) const FIELDS: [MarketStatsFieldName; 7] = [
     MarketStatsFieldName::Funding,
@@ -28,27 +30,68 @@ pub(super) const FIELDS: [MarketStatsFieldName; 7] = [
 pub(super) const POLL_INTERVAL: Duration = Duration::from_secs(30);
 pub(crate) const STALE_AFTER: Duration = Duration::from_secs(90);
 
+/// Qualified statistics policy. Per-exchange values live next to acquisition.
+pub(in crate::exchanges::ccxt) struct Profile {
+    pub catalog_source: &'static str,
+    pub products: &'static [UnifiedMarketType],
+    pub unsupported: &'static [(MarketStatsFieldName, &'static str)],
+    pub funding_kinds: &'static [FundingKind],
+    pub hourly: bool,
+    pub percent: bool,
+    /// Fields deliberately excluded from perpetual bulk polls, not all live output.
+    pub live_perp_fields: &'static [MarketStatsFieldName],
+    pub live: Option<&'static LiveStatisticsPolicy>,
+    /// Selected OI is the only demand acquisition supported by the request API.
+    /// The value is the venue's validation message when selection is absent.
+    pub selected_open_interest: Option<&'static str>,
+    pub expire_funding_at_payment: bool,
+    pub limitations: &'static [&'static str],
+}
+
+/// Maintenance and failure policy is independent of polling exclusions: a live
+/// feed can also replace bulk observations, which fail only while live-sourced.
+pub(crate) struct LiveStatisticsPolicy {
+    pub(in crate::exchanges::ccxt) feed: StatisticsFeed,
+    pub source: &'static str,
+    pub scope: CatalogScope,
+    /// Only active rows of these products are invalidated on live failure.
+    pub failure_products: &'static [UnifiedMarketType],
+    /// Fail these even before a live receipt, plus any field currently sourced
+    /// from `source`. Neither list is inferred from the polling exclusions.
+    pub failure_fields: &'static [MarketStatsFieldName],
+}
+
+pub(crate) fn live_statistics(venue: Venue) -> Option<&'static LiveStatisticsPolicy> {
+    venues::statistics_profile(venue).live
+}
+
+pub(crate) fn selected_open_interest(venue: Venue) -> Option<&'static str> {
+    venues::statistics_profile(venue).selected_open_interest
+}
+
+pub(crate) fn expire_funding_at_payment(venue: Venue) -> bool {
+    venues::statistics_profile(venue).expire_funding_at_payment
+}
+
+pub(crate) fn selection_matches(
+    venue: Venue,
+    product: UnifiedMarketType,
+    category: Option<&str>,
+    dex: Option<&str>,
+    native_id: &str,
+    params: &Value,
+) -> bool {
+    venues::dispatch!(venue, exchange => exchange::statistics::selection_matches(
+        product, category, dex, native_id, params
+    ))
+}
+
 pub(crate) fn catalog_source(venue: Venue) -> &'static str {
-    match venue {
-        Venue::Binance => "binance:ccxt:loadMarkets",
-        Venue::Bybit => "bybit:ccxt:loadMarkets",
-        Venue::Aster => "aster:ccxt:loadMarkets",
-        Venue::Hyperliquid => "hyperliquid:ccxt:loadMarkets",
-        Venue::Lighter => "lighterxyz:ccxt:loadMarkets",
-        Venue::Extended => "extended:ccxt:loadMarkets",
-    }
+    venues::statistics_profile(venue).catalog_source
 }
 
 pub(crate) fn catalog_products(venue: Venue, scope: CatalogScope) -> &'static [UnifiedMarketType] {
-    use UnifiedMarketType::*;
-    match (venue, scope) {
-        (Venue::Binance | Venue::Bybit, CatalogScope::Spot) => &[Spot],
-        (Venue::Binance | Venue::Bybit, CatalogScope::Option) => &[Option],
-        (Venue::Binance | Venue::Bybit, _) => &[Perp, Future],
-        (Venue::Hyperliquid, CatalogScope::Spot) => &[Spot],
-        (Venue::Hyperliquid, CatalogScope::Linear) | (Venue::Extended, _) => &[Perp],
-        (Venue::Aster | Venue::Lighter | Venue::Hyperliquid, _) => &[Perp, Spot],
-    }
+    venues::dispatch!(venue, exchange => exchange::statistics::catalog_products(scope))
 }
 
 pub(crate) fn field_support(
@@ -64,15 +107,20 @@ pub(crate) fn field_support(
         | (Future | Option, Funding | LastSettledFunding) => {
             (NotApplicable, Some("not-applicable"))
         }
-        (_, LastSettledFunding) if venue != Venue::Lighter => {
-            (Unsupported, Some("last-settlement-not-provided"))
-        }
         (Spot, MarkPrice | IndexPrice) => (NotApplicable, Some("not-applicable")),
-        (_, OpenInterest) if venue == Venue::Aster => {
-            (Unsupported, Some("stock-method-not-supported"))
-        }
-        (_, LastPrice) if venue == Venue::Hyperliquid => {
-            (Unsupported, Some("stock-ticker-last-is-midpoint"))
+        _ if venues::statistics_profile(venue)
+            .unsupported
+            .iter()
+            .any(|(name, _)| *name == field) =>
+        {
+            (
+                Unsupported,
+                venues::statistics_profile(venue)
+                    .unsupported
+                    .iter()
+                    .find(|(name, _)| *name == field)
+                    .map(|(_, reason)| *reason),
+            )
         }
         _ => (Supported, None),
     };
@@ -82,8 +130,6 @@ pub(crate) fn field_support(
     }
 }
 
-/// Normalize only documented product selectors; the catalog parser rejects
-/// conflicts so catalog lookup and statistics cannot disagree about a market.
 pub(crate) fn normalize_params(venue: Venue, input: &Value) -> Result<Value, ExchangeError> {
     let mut selectors = Map::new();
     let mut product = None;
@@ -92,7 +138,8 @@ pub(crate) fn normalize_params(venue: Venue, input: &Value) -> Result<Value, Exc
             ExchangeError::BadSymbol("market statistics params must be an object or null".into())
         })?;
         for (key, value) in input {
-            if key == "dex" && venue == Venue::Hyperliquid && value.as_str() == Some("") {
+            if venues::dispatch!(venue, exchange => exchange::statistics::accepts_noop_param(key, value))
+            {
                 continue;
             }
             if !matches!(key.as_str(), "type" | "category" | "subType") {
@@ -130,41 +177,7 @@ pub(crate) fn normalize_params(venue: Venue, input: &Value) -> Result<Value, Exc
             "unqualified statistics product".into(),
         ));
     }
-    let mut result = match venue {
-        Venue::Binance => match scope {
-            CatalogScope::Linear => json!({}),
-            CatalogScope::Spot => json!({"category":"spot"}),
-            CatalogScope::Inverse => json!({"category":"inverse"}),
-            CatalogScope::Option => json!({"category":"option"}),
-            _ => unreachable!("Binance scope is normalized"),
-        },
-        Venue::Bybit => json!({"category": match scope {
-            CatalogScope::Spot => "spot",
-            CatalogScope::Inverse => "inverse",
-            CatalogScope::Option => "option",
-            _ => "linear",
-        }}),
-        Venue::Hyperliquid => {
-            let mut params = json!({"dex":""});
-            if scope == CatalogScope::Spot {
-                params["type"] = json!("spot");
-            }
-            if scope == CatalogScope::Linear {
-                params["type"] = json!("swap");
-            }
-            params
-        }
-        Venue::Aster | Venue::Lighter => {
-            if product == Some(UnifiedMarketType::Spot)
-                || selectors.get("category").and_then(Value::as_str) == Some("spot")
-            {
-                json!({"type":"spot"})
-            } else {
-                json!({})
-            }
-        }
-        Venue::Extended => json!({}),
-    };
+    let mut result = venues::dispatch!(venue, exchange => exchange::statistics::normalize(scope, product, &selectors));
     if product == Some(UnifiedMarketType::Future) {
         result["type"] = json!("future");
     }
@@ -173,28 +186,11 @@ pub(crate) fn normalize_params(venue: Venue, input: &Value) -> Result<Value, Exc
 
 pub(crate) fn scope(venue: Venue, params: &Value) -> Result<CatalogScope, ExchangeError> {
     let scope = catalog_scope(venue, params)?;
-    Ok(if venue == Venue::Bybit && scope == CatalogScope::Default {
-        CatalogScope::Linear
-    } else {
-        scope
-    })
+    Ok(venue.data_scope(scope))
 }
 
-/// Product selection is a projection; Aster/Lighter always acquire both catalogs.
-/// A futures-only view likewise shares the linear/inverse ticker source.
 pub(crate) fn acquisition_params(venue: Venue, params: &Value) -> Value {
-    match venue {
-        Venue::Aster | Venue::Lighter => json!({}),
-        Venue::Binance | Venue::Bybit => {
-            let mut params = params.clone();
-            params
-                .as_object_mut()
-                .expect("normalized params")
-                .remove("type");
-            params
-        }
-        _ => params.clone(),
-    }
+    venues::dispatch!(venue, exchange => exchange::statistics::acquisition_params(params))
 }
 
 pub(crate) fn all_market_product(params: &Value) -> UnifiedMarketType {
@@ -210,51 +206,23 @@ pub(crate) fn all_market_product(params: &Value) -> UnifiedMarketType {
     }
 }
 
+#[cfg(test)]
+mod tests;
+
 pub(super) fn capabilities(venue: Venue) -> MarketStatsCapabilities {
-    use UnifiedMarketType::*;
-    let products: &[UnifiedMarketType] = match venue {
-        Venue::Binance | Venue::Bybit => &[Spot, Future, Perp, Option],
-        Venue::Extended => &[Perp],
-        _ => &[Spot, Perp],
-    };
-    let hourly = matches!(venue, Venue::Hyperliquid | Venue::Lighter | Venue::Extended);
+    let profile = venues::statistics_profile(venue);
+    let products = profile.products;
+    let hourly = profile.hourly;
     let mut limitations = vec!["receipt-time-freshness".to_string()];
     limitations.push(
-        if venue == Venue::Lighter {
+        if profile.percent {
             "rate-unit-percent"
         } else {
             "rate-unit-decimal-fraction"
         }
         .into(),
     );
-    let extra: &[&str] = match venue {
-        Venue::Binance => &[
-            "open-interest-selected-marketIds-only",
-            "funding-info-exceptions-only",
-            "default-usd-m-perpetuals",
-        ],
-        Venue::Bybit => &[
-            "default-category-linear",
-            "funding-intervals-per-market",
-            "inverse-open-interest-value-is-USD",
-        ],
-        Venue::Aster => &[
-            "funding-intervals-per-market",
-            "open-interest-stock-method-not-supported",
-        ],
-        Venue::Hyperliquid => &[
-            "primary-dex-only",
-            "volume-quote-only",
-            "open-interest-amount-is-base",
-            "stock-ticker-last-is-midpoint",
-        ],
-        Venue::Lighter => &[
-            "funding-prices-via-stock-watchTickers",
-            "open-interest-two-sided-USDC-value-only-via-stock-watchTickers",
-        ],
-        Venue::Extended => &["stock-public-API-availability-limited"],
-    };
-    limitations.extend(extra.iter().map(|value| (*value).to_string()));
+    limitations.extend(profile.limitations.iter().map(|value| (*value).to_string()));
     MarketStatsCapabilities::Supported(MarketStatsSupportedCapabilities {
         scope: MarketStatsScope {
             exchange: venue.public_id().to_string(),
@@ -280,7 +248,7 @@ pub(super) fn capabilities(venue: Venue) -> MarketStatsCapabilities {
                 )
             })
             .collect(),
-        upstream_mode: if venue == Venue::Lighter {
+        upstream_mode: if profile.live.is_some() {
             "sharedPollingAndWebSocket"
         } else {
             "sharedPolling"
@@ -293,11 +261,7 @@ pub(super) fn capabilities(venue: Venue) -> MarketStatsCapabilities {
             delta: true,
             max_subscriptions_per_connection: 16,
         },
-        funding_kinds: match venue {
-            Venue::Binance | Venue::Hyperliquid => vec![FundingKind::CurrentUnclassified],
-            Venue::Lighter => vec![FundingKind::Estimate, FundingKind::Settled],
-            _ => vec![FundingKind::Estimate],
-        },
+        funding_kinds: profile.funding_kinds.to_vec(),
         rate_interval_ms: hourly.then_some(3_600_000),
         payment_interval_ms: hourly.then_some(3_600_000),
         limitations,

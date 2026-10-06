@@ -237,7 +237,7 @@ impl MarketStatsCoordinator {
         let params = statistics_profile::acquisition_params(venue, &topic.params);
         let acquisition_key = serde_json::to_string(&(&topic.exchange, &params))
             .map_err(|error| ApiError::Exchange(ExchangeError::Internal(error.to_string())))?;
-        let interest_ids = if venue == Venue::Binance
+        let interest_ids = if statistics_profile::selected_open_interest(venue).is_some()
             && topic.fields.contains(&MarketStatsFieldName::OpenInterest)
         {
             topic
@@ -520,31 +520,26 @@ fn apply_live(snapshot: &mut MarketStatsSourceSnapshot, pending: &mut LiveFields
     }
 }
 
-const LIGHTER_WATCH_SOURCE: &str = "lighterxyz:ccxt:watchTickers";
-
-fn fail_live(snapshot: &mut MarketStatsSourceSnapshot, message: &str) {
+fn fail_live(
+    snapshot: &mut MarketStatsSourceSnapshot,
+    policy: &statistics_profile::LiveStatisticsPolicy,
+    message: &str,
+) {
     snapshot
         .source_failures
-        .retain(|failure| failure.source != LIGHTER_WATCH_SOURCE);
+        .retain(|failure| failure.source != policy.source);
     snapshot.source_failures.push(MarketStatsSourceFailure {
-        source: LIGHTER_WATCH_SOURCE.into(),
+        source: policy.source.into(),
         reason: "upstream-failure".into(),
         message: message.into(),
     });
     for row in &mut snapshot.rows {
-        if row.market.market_type != UnifiedMarketType::Perp || !row.market.active {
+        if !policy.failure_products.contains(&row.market.market_type) || !row.market.active {
             continue;
         }
         for (name, field) in &mut row.fields {
-            if field.source.as_deref() == Some(LIGHTER_WATCH_SOURCE)
-                || matches!(
-                    name,
-                    MarketStatsFieldName::Funding
-                        | MarketStatsFieldName::LastSettledFunding
-                        | MarketStatsFieldName::MarkPrice
-                        | MarketStatsFieldName::IndexPrice
-                        | MarketStatsFieldName::OpenInterest
-                )
+            if field.source.as_deref() == Some(policy.source)
+                || policy.failure_fields.contains(name)
             {
                 projection::fail_field(field, "upstream-failure");
             }
@@ -563,7 +558,9 @@ async fn run_source(
     let mut shutdown = inner.shutdown.subscribe();
     let mut timer = tokio::time::interval(Duration::from_secs(1));
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let maintained = exchange.id() == "lighterxyz";
+    let live_policy =
+        Venue::from_public_id(exchange.id()).and_then(statistics_profile::live_statistics);
+    let maintained = live_policy.is_some();
     let mut live_setup = maintained.then(|| acquire_live(exchange.clone()));
     let mut live_receiver: Option<RealtimeReceiver> = None;
     let mut live_ready = !maintained;
@@ -619,8 +616,8 @@ async fn run_source(
                     }
                 }
                 apply_live(&mut fresh, &mut live_pending);
-                if let Some(error) = &live_error {
-                    fail_live(&mut fresh, error);
+                if let (Some(policy), Some(error)) = (live_policy, &live_error) {
+                    fail_live(&mut fresh, policy, error);
                 }
                 bulk_ready |= include_bulk;
                 source.latest.send_replace(Arc::new(fresh));
@@ -632,12 +629,14 @@ async fn run_source(
                 if fresh.catalog_known {
                     live_pending.clear();
                 }
-                if let Some(error) = &live_error {
-                    fail_live(&mut fresh, error);
-                } else {
-                    fresh
-                        .source_failures
-                        .retain(|failure| failure.source != LIGHTER_WATCH_SOURCE);
+                if let Some(policy) = live_policy {
+                    if let Some(error) = &live_error {
+                        fail_live(&mut fresh, policy, error);
+                    } else {
+                        fresh
+                            .source_failures
+                            .retain(|failure| failure.source != policy.source);
+                    }
                 }
                 source.latest.send_replace(Arc::new(fresh));
                 live_changed = false;
@@ -749,88 +748,4 @@ async fn run_source(
 }
 
 #[cfg(test)]
-mod tests {
-    use std::collections::HashSet;
-
-    use super::*;
-
-    #[test]
-    fn market_stats_ids_have_exact_catalog_encoding() {
-        assert_eq!(
-            make_market_id(
-                "hyperliquid",
-                UnifiedMarketType::Perp,
-                None,
-                Some(""),
-                "BTC"
-            )
-            .unwrap(),
-            r#"["hyperliquid","perp",null,"","BTC"]"#,
-        );
-        assert_eq!(
-            make_market_id("hyperliquid", UnifiedMarketType::Spot, None, None, "0").unwrap(),
-            r#"["hyperliquid","spot",null,null,"0"]"#,
-        );
-    }
-
-    #[test]
-    fn market_stats_ids_preserve_native_names_and_namespace_boundaries() {
-        let identities = [
-            (
-                "hyperliquid",
-                UnifiedMarketType::Perp,
-                None,
-                Some(""),
-                "A:B",
-            ),
-            ("hyperliquid", UnifiedMarketType::Perp, None, Some("A"), "B"),
-            (
-                "hyperliquid",
-                UnifiedMarketType::Perp,
-                Some(""),
-                None,
-                "A:B",
-            ),
-            ("hyperliquid", UnifiedMarketType::Perp, None, None, "A:B"),
-            ("hyperliquid", UnifiedMarketType::Spot, None, None, "A:B"),
-            ("other", UnifiedMarketType::Perp, None, Some(""), "A:B"),
-            ("hyperliquid", UnifiedMarketType::Perp, None, Some(""), "AB"),
-            (
-                "hyperliquid",
-                UnifiedMarketType::Perp,
-                None,
-                Some(""),
-                "a:b",
-            ),
-            (
-                "hyperliquid",
-                UnifiedMarketType::Perp,
-                None,
-                Some(""),
-                "A\"\\/雪",
-            ),
-        ];
-        let mut ids = HashSet::new();
-        for (exchange, market_type, category, dex, native_id) in identities {
-            let id = make_market_id(exchange, market_type, category, dex, native_id).unwrap();
-            let decoded: (
-                String,
-                UnifiedMarketType,
-                Option<String>,
-                Option<String>,
-                String,
-            ) = serde_json::from_str(&id).unwrap();
-            assert_eq!(
-                decoded,
-                (
-                    exchange.to_string(),
-                    market_type,
-                    category.map(str::to_string),
-                    dex.map(str::to_string),
-                    native_id.to_string(),
-                ),
-            );
-            assert!(ids.insert(id), "distinct native identities collided");
-        }
-    }
-}
+mod tests;
