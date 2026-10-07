@@ -42,6 +42,13 @@
     "precision": {"price": 0.1}, "limits": {"amount": {"min": 0.001}},
     "info": {"name": "BTC-USD", "collateralAssetName": "USD", "l2Config": {"collateralId": "0x123"}}
   },
+  "bitfinex": {
+    "id": "tBTCF0:USTF0", "symbol": "BTC/USDT:USDT", "base": "BTC", "quote": "USDT",
+    "settle": "USDT", "quoteId": "USTF0", "type": "swap", "swap": true, "contract": true,
+    "linear": true, "inverse": false, "active": true, "contractSize": 1,
+    "precision": {"price": 5}, "limits": {"amount": {"min": 0.001}},
+    "info": {"name": "tBTCF0:USTF0", "contractType": "PERPETUAL"}
+  },
   "lighterxyz": {
     "id": "7", "symbol": "BTC/USDC:USDC", "base": "BTC", "quote": "USDC",
     "settle": "USDC", "type": "swap", "swap": true, "contract": true,

@@ -260,7 +260,13 @@ impl UrlOwner {
         control
             .feeds
             .retain(|_, feed| feed.delivery.viewers.load(Ordering::Acquire) != 0);
-        if control.feeds.len() >= MAX_SHARED_FEEDS {
+        // Bitfinex's public connection limit is 30 native subscriptions.
+        let maximum = if spec.venue == Venue::Bitfinex {
+            30
+        } else {
+            MAX_SHARED_FEEDS
+        };
+        if control.feeds.len() >= maximum {
             return Err(capacity("shared live URL subscription limit reached"));
         }
         if control
@@ -591,6 +597,12 @@ async fn run_session(
                 LiveProvider::unsubscribe_mode(&feed.spec) == UnsubscribeMode::Reconnect
             }) {
                 break SessionExit::Reconfigure(feed.spec.venue);
+            }
+            // A retiring Bitfinex channel still occupies a server slot.
+            if first.spec.venue == Venue::Bitfinex
+                && desired.len() + retiring.len() + removed.len() > 30
+            {
+                break SessionExit::Reconfigure(Venue::Bitfinex);
             }
             if retiring.len() + removed.len() > MAX_SHARED_FEEDS {
                 break SessionExit::Reconnect(capacity("pending unsubscribe limit reached"));

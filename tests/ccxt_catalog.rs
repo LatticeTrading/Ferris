@@ -55,6 +55,8 @@ impl Source {
             bybit_base_url: base_url.clone(),
             apex_rest_base_url: format!("{base_url}/api"),
             apex_ws_url: "ws://127.0.0.1/unused".into(),
+            bitfinex_rest_base_url: base_url.clone(),
+            bitfinex_ws_url: "ws://127.0.0.1/unused".into(),
             aster_base_url: base_url,
             request_timeout_ms: 30_000,
         };

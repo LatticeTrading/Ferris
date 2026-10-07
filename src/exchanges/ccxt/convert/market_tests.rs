@@ -87,6 +87,17 @@ fn existing_alias_sets_and_native_metadata_are_unchanged() {
             None,
             "BTC",
         ),
+        (
+            Venue::Bitfinex,
+            vec!["BTC/USDT", "BTC/USDT:USDT", "tBTCF0:USTF0", "BTCF0:USTF0"],
+            "tBTCF0:USTF0",
+            "USDT",
+            Some("USTF0"),
+            None,
+            None,
+            Some("PERPETUAL"),
+            "tBTCF0:USTF0",
+        ),
     ] {
         let mut raw = fixture(venue);
         // Even when present, id2 must NOT become a new public alias by default.

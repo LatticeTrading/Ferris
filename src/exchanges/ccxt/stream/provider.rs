@@ -31,6 +31,7 @@ pub(in crate::exchanges::ccxt) enum LiveProvider {
     Aster(ccxt_pro::pro::aster::AsterCore),
     Extended(ccxt_pro::pro::extended::ExtendedCore),
     Apex(venues::apex::stream::Provider),
+    Bitfinex(venues::bitfinex::stream::Provider),
 }
 
 macro_rules! dispatch {
@@ -43,6 +44,7 @@ macro_rules! dispatch {
             LiveProvider::Aster($core) => $body,
             LiveProvider::Extended($core) => $body,
             LiveProvider::Apex($core) => $body,
+            LiveProvider::Bitfinex($core) => $body,
         }
     };
 }
@@ -82,6 +84,7 @@ impl LiveProvider {
             Venue::Lighter => Self::Lighter(ccxt_pro::pro::lighter::LighterCore::new(config)),
             Venue::Aster => Self::Aster(ccxt_pro::pro::aster::AsterCore::new(config)),
             Venue::Apex => Self::Apex(venues::apex::stream::provider(config)),
+            Venue::Bitfinex => Self::Bitfinex(venues::bitfinex::stream::provider(config)),
             Venue::Extended => {
                 Self::Extended(super::super::venues::extended::stream::provider(config))
             }
@@ -101,6 +104,7 @@ impl LiveProvider {
             Self::Lighter(core) => super::super::venues::lighter::stream::url(core, spec).await?,
             Self::Aster(core) => super::super::venues::aster::stream::url(core, spec).await?,
             Self::Apex(core) => venues::apex::stream::url(&mut core.core, spec).await?,
+            Self::Bitfinex(core) => venues::bitfinex::stream::url(&mut core.core, spec).await?,
             Self::Extended(core) => super::super::venues::extended::stream::url(core, spec).await?,
         };
         url.as_str()
@@ -112,6 +116,9 @@ impl LiveProvider {
     /// Bind every stock watch to the actual session URL, including its fresh
     /// connection timestamp. Owner/preparation identity stays timestamp-free.
     pub(in crate::exchanges::ccxt) fn bind_url(&mut self, url: &str) {
+        if let Self::Bitfinex(core) = self {
+            core.bind_url(url);
+        }
         if let Self::Apex(core) = self {
             core.bind_url(url);
             ccxt::set_value(
@@ -189,6 +196,12 @@ impl LiveProvider {
             }
             core.subscribe(spec)?;
         }
+        if let Self::Bitfinex(core) = self {
+            if unwatch {
+                return core.unsubscribe(spec);
+            }
+            core.subscribe(spec)?;
+        }
         let symbol = Value::from(spec.symbol.as_str());
         let params = Value::from_json(&spec.params);
         if spec.channel == LiveChannel::Statistics {
@@ -238,6 +251,7 @@ impl LiveProvider {
             if let Self::Apex(core) = self {
                 return core.next(url, hashes).await;
             }
+            if let Self::Bitfinex(core) = self { return core.next(url, hashes).await; }
             Ok(LiveEvent::Data(dispatch!(self, core => core.ws_run(url.to_string(), hashes.to_vec(), Value::Null, Vec::new(), Value::Null).await)))
         }).catch_unwind().await.map_err(panic_error)?
     }

@@ -14,6 +14,8 @@ pub struct Config {
     pub aster_base_url: String,
     pub apex_rest_base_url: String,
     pub apex_ws_url: String,
+    pub bitfinex_rest_base_url: String,
+    pub bitfinex_ws_url: String,
     pub request_timeout_ms: u64,
 }
 
@@ -89,6 +91,16 @@ impl Config {
             .trim()
             .to_string();
 
+        let bitfinex_rest_base_url = std::env::var("BITFINEX_REST_BASE_URL")
+            .unwrap_or_else(|_| "https://api-pub.bitfinex.com".to_string())
+            .trim()
+            .trim_end_matches('/')
+            .to_string();
+        let bitfinex_ws_url = std::env::var("BITFINEX_WS_URL")
+            .unwrap_or_else(|_| "wss://api-pub.bitfinex.com/ws/2".to_string())
+            .trim()
+            .to_string();
+
         let request_timeout_ms = match std::env::var("REQUEST_TIMEOUT_MS") {
             Ok(value) => value
                 .trim()
@@ -110,6 +122,8 @@ impl Config {
             aster_base_url,
             apex_rest_base_url,
             apex_ws_url,
+            bitfinex_rest_base_url,
+            bitfinex_ws_url,
             request_timeout_ms,
         })
     }

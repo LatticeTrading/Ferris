@@ -11,10 +11,11 @@ pub enum Venue {
     Aster,
     Extended,
     Apex,
+    Bitfinex,
 }
 
 impl Venue {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Binance,
         Self::Bybit,
         Self::Hyperliquid,
@@ -22,6 +23,7 @@ impl Venue {
         Self::Aster,
         Self::Extended,
         Self::Apex,
+        Self::Bitfinex,
     ];
 
     pub fn public_id(self) -> &'static str {
@@ -33,6 +35,7 @@ impl Venue {
             Self::Aster => "aster",
             Self::Extended => "extended",
             Self::Apex => "apex",
+            Self::Bitfinex => "bitfinex",
         }
     }
 

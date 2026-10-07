@@ -214,14 +214,16 @@ pub(super) fn capabilities(venue: Venue) -> MarketStatsCapabilities {
     let products = profile.products;
     let hourly = profile.hourly;
     let mut limitations = vec!["receipt-time-freshness".to_string()];
-    limitations.push(
-        if profile.percent {
-            "rate-unit-percent"
-        } else {
-            "rate-unit-decimal-fraction"
-        }
-        .into(),
-    );
+    if !profile.funding_kinds.is_empty() {
+        limitations.push(
+            if profile.percent {
+                "rate-unit-percent"
+            } else {
+                "rate-unit-decimal-fraction"
+            }
+            .into(),
+        );
+    }
     limitations.extend(profile.limitations.iter().map(|value| (*value).to_string()));
     MarketStatsCapabilities::Supported(MarketStatsSupportedCapabilities {
         scope: MarketStatsScope {

@@ -234,6 +234,11 @@ pub(super) fn catalog_scope(
 ) -> Result<super::CatalogScope, ExchangeError> {
     use super::CatalogScope;
     let filter = ProductFilter::parse(params)?;
+    if venue == Venue::Bitfinex && filter.market_type == Some(UnifiedMarketType::Future) {
+        return Err(ExchangeError::BadSymbol(
+            "bitfinex has no qualified dated futures".into(),
+        ));
+    }
     let scope = match (
         filter.market_type,
         filter.category.as_deref(),

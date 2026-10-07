@@ -7,8 +7,8 @@ is selected **per channel** by `venues/<venue>/stream.rs::unsubscribe_mode`.
 | Mode | Behavior | Current use |
 | --- | --- | --- |
 | `Stock` | Existing stock unwatch, cleanup and late-ack repair | Binance, Bybit, Hyperliquid, Aster, Lighter (supported channels) |
-| `Native` | Small venue control protocol wrapped around the stock driver | Apex trades, books, candles |
-| `Reconnect` | Rebuild URL from current demand without calling missing methods | Extended; reserved for unsupported Apex WS statistics (statistics remain REST-only) |
+| `Native` | Small venue control protocol wrapped around the stock driver | Apex and Bitfinex trades, books, candles |
+| `Reconnect` | Rebuild URL from current demand without calling missing methods | Extended; reserved for unsupported Apex/Bitfinex WS statistics (statistics remain REST-only) |
 
 Removing one viewer of a shared acquisition does not retire it. No remaining
 demand closes the URL immediately. Reconnect-only demand changes invalidate
@@ -74,7 +74,33 @@ before reusing `Controlled`; choose `Reconnect` or implement ID-aware control
 when topic-only ordering is unsafe. Apex stock book sequence-gap validation is
 still absent and outside this change.
 
+## Bitfinex channel-ID protocol
+
+Bitfinex extends this same wrapper with optional server-assigned channel routes
+(`Protocol::CHANNEL_IDS`), not a competing reader. Stock handles successful
+subscribe ACKs and all market-data parsing; Ferris records the assigned ID and
+intercepts unsubscribe ACKs to clean routing/reverse aliases before shared owner
+cache/settlement cleanup. Removal before assignment waits for the subscribe ACK
+and uses the deferred send queue. A fresh book snapshot is required on re-add.
+
+Retired-ID data and unmatched/duplicate retirement ACKs are discarded. Data
+before assignment, conflicting assignments, control errors, restart/maintenance,
+rejected/unsent unsubscribe and the existing 10-second deadline reconnect.
+**A public probe observed immediate ID reuse.** Reuse after retirement is also
+ambiguous, so the driver never accepts an ID twice in a session: it reconnects
+with continuity errors instead. Seen-ID history is bounded at 4096. No promise
+is made that every re-add preserves sibling continuity. Bitfinex admission is
+30 distinct feeds, including retiring channels during demand transitions; all
+viewers of a feed share one slot. See [Bitfinex support](bitfinex.md) for stock
+unwatch defects, checksum limits, tests and public-smoke evidence.
+
 ## Verification
+
+- `tests/bitfinex.rs` / `tests/bitfinex/`: stock loopback REST, mixed/shared feeds,
+  all channel retirements, deferred assignment, ACK failure/timeout, ID reuse,
+  late data, fresh snapshots, transport/control and checksum recovery, downstream
+  `/v1/ws` errors and viewer-depth projection. Controller tests verify channel
+  route cleanup and bounded ID history.
 
 - `tests/apex.rs` / `tests/apex/`: actual stock methods over loopback transport;
   mixed feeds, shared viewers/depths, all three unsubscribe topics, mapped
@@ -84,7 +110,7 @@ still absent and outside this change.
 - `stream/control/tests.rs`: per-channel policy, topic-only state transitions,
   batched acknowledgments, and send failure. `src/realtime/tests.rs` checks that
   slow readers cannot silently miss reconnect errors due to epoch changes.
-- Full `cargo test --locked`: **159 passed**, 5 opt-in live tests ignored.
+- Apex integration baseline `cargo test --locked`: **159 passed**, 5 opt-in live tests ignored.
   Formatting and locked build pass; Clippy completes with baseline warnings.
 - Public backend check: trades/books/candles received; repeated unsubscribe and
   re-add for all three channels, plus immediate book re-add, retained the same

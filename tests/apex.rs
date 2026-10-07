@@ -204,6 +204,8 @@ impl Harness {
             aster_base_url: "http://127.0.0.1:1".into(),
             apex_rest_base_url: format!("http://{addr}/api"),
             apex_ws_url: format!("ws://{addr}/realtime_public?v=2"),
+            bitfinex_rest_base_url: "http://127.0.0.1:1".into(),
+            bitfinex_ws_url: "ws://127.0.0.1:1".into(),
         };
         let service = CcxtService::start(&config).unwrap();
         let realtime = RealtimeService::new(service.clone());

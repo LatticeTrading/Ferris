@@ -14,6 +14,7 @@ pub(in crate::exchanges::ccxt) enum Provider {
     Aster(ccxt::Aster),
     Extended(ccxt::Extended),
     Apex(ccxt::Apex),
+    Bitfinex(ccxt::Bitfinex),
 }
 
 macro_rules! dispatch {
@@ -26,6 +27,7 @@ macro_rules! dispatch {
             Provider::Aster($exchange) => $body,
             Provider::Extended($exchange) => $body,
             Provider::Apex($exchange) => $body,
+            Provider::Bitfinex($exchange) => $body,
         }
     };
 }
@@ -44,6 +46,7 @@ impl Provider {
             Venue::Lighter => Self::Lighter(ccxt::Lighter::new(config)),
             Venue::Aster => Self::Aster(ccxt::Aster::new(config)),
             Venue::Apex => Self::Apex(ccxt::Apex::new(config)),
+            Venue::Bitfinex => Self::Bitfinex(ccxt::Bitfinex::new(config)),
             Venue::Extended => {
                 Self::Extended(super::super::venues::extended::rest_provider(config))
             }

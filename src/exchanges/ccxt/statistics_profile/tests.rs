@@ -46,6 +46,8 @@ async fn unqualified_venues_never_prepare_or_subscribe_statistics() {
         aster_base_url: "http://127.0.0.1:1".into(),
         apex_rest_base_url: "http://127.0.0.1:1/api".into(),
         apex_ws_url: "ws://127.0.0.1:1".into(),
+        bitfinex_rest_base_url: "http://127.0.0.1:1".into(),
+        bitfinex_ws_url: "ws://127.0.0.1:1".into(),
     };
     let service = CcxtService::start(&config).unwrap();
     service.shutdown().await.unwrap();
