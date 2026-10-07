@@ -1,4 +1,11 @@
 {
+  "apex": {
+    "id": "BTC-USDT", "id2": "BTCUSDT", "symbol": "BTC/USDT:USDT", "base": "BTC", "quote": "USDT",
+    "settle": "USDT", "type": "swap", "swap": true, "contract": true,
+    "linear": true, "inverse": false, "active": true, "contractSize": 0.001,
+    "precision": {"price": 0.1}, "limits": {"amount": {"min": 0.001}},
+    "info": {"symbol": "BTC-USDT", "crossSymbolName": "BTCUSDT", "settleAssetId": "USDT", "isPrelaunch": false}
+  },
   "binance": {
     "id": "BTCUSDT", "symbol": "BTC/USDT:USDT", "base": "BTC", "quote": "USDT",
     "settle": "USDT", "type": "swap", "swap": true, "contract": true,

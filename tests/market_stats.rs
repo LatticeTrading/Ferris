@@ -207,6 +207,8 @@ fn disabled_config(timeout_ms: u64) -> Config {
         binance_base_url: "http://127.0.0.1:1".into(),
         bybit_base_url: "http://127.0.0.1:1".into(),
         aster_base_url: "http://127.0.0.1:1".into(),
+        apex_rest_base_url: "http://127.0.0.1:1/api".into(),
+        apex_ws_url: "ws://127.0.0.1:1".into(),
         request_timeout_ms: timeout_ms,
     }
 }
@@ -233,6 +235,10 @@ fn ccxt_service(venue: Venue, base: &str, timeout_ms: u64) -> CcxtService {
         Venue::Binance => config.binance_base_url = base.to_string(),
         Venue::Bybit => config.bybit_base_url = base.to_string(),
         Venue::Aster => config.aster_base_url = base.to_string(),
+        Venue::Apex => {
+            config.apex_rest_base_url = format!("{base}/api");
+            config.apex_ws_url = format!("{}/realtime_public?v=2", ws_base(base));
+        }
     }
     CcxtService::start(&config).unwrap()
 }
@@ -367,6 +373,7 @@ async fn market_stats_http_capabilities_bounds_and_catalog_proof() {
             .map(|entry| entry["exchange"].as_str().unwrap())
             .collect::<Vec<_>>(),
         vec![
+            "apex",
             "aster",
             "binance",
             "bybit",
@@ -417,12 +424,19 @@ async fn market_stats_http_capabilities_bounds_and_catalog_proof() {
                 );
                 assert_eq!(stats["fields"]["spot"]["volume24h"]["state"], "supported");
             }
-            "extended" => {
+            "extended" | "apex" => {
                 assert_eq!(stats["upstreamMode"], "sharedPolling");
                 assert_eq!(stats["scope"]["params"], json!({}));
                 assert_eq!(stats["rateIntervalMs"], 3_600_000);
                 assert_eq!(stats["paymentIntervalMs"], 3_600_000);
-                assert_eq!(stats["fundingKinds"], json!(["estimate"]));
+                assert_eq!(
+                    stats["fundingKinds"],
+                    if exchange["exchange"] == "apex" {
+                        json!(["currentUnclassified"])
+                    } else {
+                        json!(["estimate"])
+                    }
+                );
                 assert_eq!(stats["allMarkets"]["types"], json!(["perp"]));
                 assert_eq!(stats["selectedMarkets"]["types"], json!(["perp"]));
                 for field in [

@@ -7,6 +7,7 @@ use super::{
 use crate::exchanges::traits::ExchangeError;
 use serde_json::Value as JsonValue;
 
+pub(super) mod apex;
 pub(super) mod aster;
 pub(super) mod binance;
 pub(super) mod bybit;
@@ -17,6 +18,10 @@ pub(super) mod lighter;
 macro_rules! dispatch {
     ($venue:expr, $exchange:ident => $body:expr) => {
         match $venue {
+            $crate::exchanges::ccxt::Venue::Apex => {
+                use $crate::exchanges::ccxt::venues::apex as $exchange;
+                $body
+            }
             $crate::exchanges::ccxt::Venue::Binance => {
                 use $crate::exchanges::ccxt::venues::binance as $exchange;
                 $body

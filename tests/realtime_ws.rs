@@ -406,6 +406,8 @@ fn config(base: &str) -> Config {
         binance_base_url: "http://127.0.0.1:1".into(),
         bybit_base_url: "http://127.0.0.1:1".into(),
         aster_base_url: "http://127.0.0.1:1".into(),
+        apex_rest_base_url: "http://127.0.0.1:1/api".into(),
+        apex_ws_url: "ws://127.0.0.1:1".into(),
         request_timeout_ms: 5_000,
     }
 }

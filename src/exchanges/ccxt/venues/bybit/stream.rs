@@ -15,6 +15,8 @@ use crate::{
     realtime::RealtimeChannel,
 };
 
+pub(in crate::exchanges::ccxt) use crate::exchanges::ccxt::stream::control::stock_unsubscribe as unsubscribe_mode;
+
 const VENUE: Venue = Venue::Bybit;
 pub(in crate::exchanges::ccxt) const CANDLES: bool = true;
 pub(in crate::exchanges::ccxt) const UNWATCH_BOOK_LIMIT: bool = true;

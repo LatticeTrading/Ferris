@@ -43,6 +43,8 @@ async fn maintained_feed_refreshes_identity_without_freshening_held_rows() {
         binance_base_url: "http://127.0.0.1:1".into(),
         bybit_base_url: "http://127.0.0.1:1".into(),
         aster_base_url: "http://127.0.0.1:1".into(),
+        apex_rest_base_url: "http://127.0.0.1:1/api".into(),
+        apex_ws_url: "ws://127.0.0.1:1".into(),
     };
     let config = ProviderConfig::new(Venue::Lighter, &config).unwrap();
     let watch = Arc::new(CatalogWatch::new(snapshot(1, &[0])));

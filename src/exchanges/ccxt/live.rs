@@ -21,7 +21,11 @@ use crate::{
 use super::{
     convert::{convert_book, convert_candles, convert_trades},
     owner::CatalogSnapshot,
-    stream::{statistics::StatisticsFeed, LiveChannel, LiveProvider, LiveSpec, PreparedTopic},
+    stream::{
+        control::{LiveEvent, UnsubscribeMode},
+        statistics::StatisticsFeed,
+        LiveChannel, LiveProvider, LiveSpec, PreparedTopic,
+    },
     venue::Venue,
 };
 
@@ -401,6 +405,7 @@ struct RetiringFeed {
 enum SessionExit {
     Stop,
     Reconnect(ExchangeError),
+    Reconfigure(Venue),
 }
 
 fn desired_feeds(control: &Mutex<Control>) -> Vec<Arc<Feed>> {
@@ -431,7 +436,14 @@ async fn run_url(
         if *stop.borrow() {
             break;
         }
-        let worker_url = url.to_string();
+        // Apex's URL timestamp belongs to a connection, not a catalog or feed.
+        // Reserve/share the stable base URL, but drive and clean up the actual
+        // timestamped stock client on every reconnect.
+        let worker_url = if first.spec.venue == Venue::Apex {
+            super::venues::apex::stream::session_url(url)
+        } else {
+            url.to_string()
+        };
         let worker_control = Arc::clone(&control);
         let worker_changed = Arc::clone(&changed);
         let mut worker_stop = stop.clone();
@@ -499,6 +511,17 @@ async fn run_url(
         }
         match exit {
             SessionExit::Stop => break,
+            SessionExit::Reconfigure(venue) => {
+                for feed in desired_feeds(&control) {
+                    publish_error(
+                        &feed,
+                        format!("{}: restarting shared stream after feed removal (reconnect-only policy)", venue.public_id()),
+                    );
+                }
+                // Normal demand changes are not transport failures. Invalidate
+                // continuity but do not accumulate exponential reconnect delay.
+                delay = INITIAL_RECONNECT;
+            }
             SessionExit::Reconnect(error) => {
                 for feed in desired_feeds(&control) {
                     publish_error(&feed, error.to_string());
@@ -537,12 +560,13 @@ async fn run_session(
         return SessionExit::Stop;
     };
     let mut provider = LiveProvider::new(&first.spec, slot);
+    provider.bind_url(url);
     let mut active: HashMap<String, ActiveFeed> = HashMap::new();
     let mut retiring: HashMap<String, RetiringFeed> = HashMap::new();
     let mut cache_routes: HashMap<i64, String> = HashMap::new();
     let mut hashes = Vec::new();
     let mut reconcile = true;
-    let exit = loop {
+    let exit = 'session: loop {
         if *stop.borrow() {
             break SessionExit::Stop;
         }
@@ -563,12 +587,22 @@ async fn run_session(
                 })
                 .map(|(key, _)| key.clone())
                 .collect();
+            if let Some(feed) = removed.iter().map(|key| &active[key].feed).find(|feed| {
+                LiveProvider::unsubscribe_mode(&feed.spec) == UnsubscribeMode::Reconnect
+            }) {
+                break SessionExit::Reconfigure(feed.spec.venue);
+            }
+            if retiring.len() + removed.len() > MAX_SHARED_FEEDS {
+                break SessionExit::Reconnect(capacity("pending unsubscribe limit reached"));
+            }
             for key in removed {
                 let mut old = active.remove(&key).expect("active key");
                 old.invalidate();
                 provider.clear_retained(old.retained.take());
                 provider.clear_feed(&old.feed.spec);
-                provider.enqueue(&old.feed.spec, true);
+                if let Err(error) = provider.enqueue(&old.feed.spec, true) {
+                    break 'session SessionExit::Reconnect(error);
+                }
                 retiring.insert(
                     key,
                     RetiringFeed {
@@ -582,11 +616,21 @@ async fn run_session(
                     current.epoch = feed.delivery.epoch.load(Ordering::Acquire);
                     continue;
                 }
+                // A native retirement cannot be cancelled locally: the peer
+                // may already have processed it. Serialize re-add behind ACK,
+                // while all unrelated hashes continue to run on this socket.
+                if retiring.get(&feed.spec.key).is_some_and(|retired| {
+                    LiveProvider::unsubscribe_mode(&retired.spec) == UnsubscribeMode::Native
+                }) {
+                    continue;
+                }
                 if let Some(retired) = retiring.remove(&feed.spec.key) {
                     provider.expire_unsubscribe(url, &retired.spec);
                 }
                 provider.add_market(&feed.spec);
-                provider.enqueue(&feed.spec, false);
+                if let Err(error) = provider.enqueue(&feed.spec, false) {
+                    break 'session SessionExit::Reconnect(error);
+                }
                 active.insert(feed.spec.key.clone(), ActiveFeed::new(feed));
             }
             cache_routes.retain(|_, key| active.contains_key(key));
@@ -606,6 +650,12 @@ async fn run_session(
             } => {
                 let expired: Vec<_> = retiring.iter().filter(|(_, feed)| feed.deadline <= tokio::time::Instant::now()).map(|(key, _)| key.clone()).collect();
                 for key in expired {
+                    let retired = &retiring[&key];
+                    if LiveProvider::unsubscribe_mode(&retired.spec) == UnsubscribeMode::Native {
+                        break 'session SessionExit::Reconnect(ExchangeError::UpstreamRequest(
+                            format!("{}: native unsubscribe acknowledgement timed out", retired.spec.venue.public_id()),
+                        ));
+                    }
                     let retired = retiring.remove(&key).expect("expired retirement");
                     provider.expire_unsubscribe(url, &retired.spec);
                     provider.clear_feed(&retired.spec);
@@ -616,7 +666,20 @@ async fn run_session(
             result = provider.next(url, &hashes) => result,
         };
         let result = match result {
-            Ok(result) => result,
+            Ok(LiveEvent::Data(result)) => result,
+            Ok(LiveEvent::Unsubscribed(hash)) => {
+                let key = retiring
+                    .iter()
+                    .find(|(_, retired)| retired.spec.hash == hash)
+                    .map(|(key, _)| key.clone());
+                if let Some(key) = key {
+                    let retired = retiring.remove(&key).expect("acknowledged retirement");
+                    provider.expire_unsubscribe(url, &retired.spec);
+                    provider.clear_feed(&retired.spec);
+                    reconcile = true;
+                }
+                continue;
+            }
             Err(ExchangeError::UpstreamRequest(message))
                 if message.contains("[UnsubscribeError]") =>
             {
@@ -630,18 +693,23 @@ async fn run_session(
             // invalidating its epoch without stopping another maintained hash.
             if let Some(client) = ccxt_pro::pro::ws_client::get_client(url) {
                 for current in active.values_mut() {
-                    if !client.is_subscribed(&current.feed.spec.hash) {
+                    if LiveProvider::unsubscribe_mode(&current.feed.spec) == UnsubscribeMode::Stock
+                        && !client.is_subscribed(&current.feed.spec.hash)
+                    {
                         current.invalidate();
                         provider.clear_retained(current.retained.take());
                         provider.clear_feed(&current.feed.spec);
                         provider.expire_unsubscribe(url, &current.feed.spec);
-                        provider.enqueue(&current.feed.spec, false);
+                        if let Err(error) = provider.enqueue(&current.feed.spec, false) {
+                            break 'session SessionExit::Reconnect(error);
+                        }
                     }
                 }
                 let completed: Vec<_> = retiring
                     .iter()
                     .filter(|(_, retired)| {
-                        !client.is_subscribed(&retired.spec.hash)
+                        LiveProvider::unsubscribe_mode(&retired.spec) == UnsubscribeMode::Stock
+                            && !client.is_subscribed(&retired.spec.hash)
                             && !client.is_subscribed(&retired.spec.unsubscribe_hash())
                     })
                     .map(|(key, _)| key.clone())
@@ -725,7 +793,7 @@ async fn run_session(
             }
             LiveChannel::Client(RealtimeChannel::Trades) => provider
                 .incremental(&spec, raw)
-                .and_then(|rows| convert_trades(rows, &spec.symbol))
+                .and_then(|rows| convert_trades(spec.venue, rows, &spec.symbol))
                 .map(|rows| (!rows.is_empty()).then(|| RealtimeUpdate::Trades(Arc::new(rows)))),
             LiveChannel::Client(RealtimeChannel::Ohlcv) => provider
                 .incremental(&spec, raw)
@@ -883,11 +951,15 @@ fn rebuild_hashes(
     hashes.clear();
     for current in active.values() {
         hashes.push(current.feed.spec.hash.clone());
-        hashes.push(current.feed.spec.unsubscribe_hash());
+        if LiveProvider::unsubscribe_mode(&current.feed.spec) == UnsubscribeMode::Stock {
+            hashes.push(current.feed.spec.unsubscribe_hash());
+        }
     }
     for retired in retiring.values() {
         hashes.push(retired.spec.hash.clone());
-        hashes.push(retired.spec.unsubscribe_hash());
+        if LiveProvider::unsubscribe_mode(&retired.spec) == UnsubscribeMode::Stock {
+            hashes.push(retired.spec.unsubscribe_hash());
+        }
     }
     hashes.sort_unstable();
     hashes.dedup();

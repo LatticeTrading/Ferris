@@ -16,6 +16,12 @@ use crate::{
 };
 
 const VENUE: Venue = Venue::Extended;
+
+pub(in crate::exchanges::ccxt) fn unsubscribe_mode(
+    _channel: LiveChannel,
+) -> crate::exchanges::ccxt::stream::control::UnsubscribeMode {
+    crate::exchanges::ccxt::stream::control::UnsubscribeMode::Reconnect
+}
 pub(in crate::exchanges::ccxt) const CANDLES: bool = true;
 pub(in crate::exchanges::ccxt) const UNWATCH_BOOK_LIMIT: bool = false;
 

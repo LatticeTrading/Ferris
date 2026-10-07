@@ -23,6 +23,8 @@ use crate::{
     realtime::{RealtimeChannel, RealtimeTopic},
 };
 
+pub(in crate::exchanges::ccxt) use crate::exchanges::ccxt::stream::control::stock_unsubscribe as unsubscribe_mode;
+
 const VENUE: Venue = Venue::Lighter;
 pub(in crate::exchanges::ccxt) const CANDLES: bool = false;
 pub(in crate::exchanges::ccxt) const UNWATCH_BOOK_LIMIT: bool = false;

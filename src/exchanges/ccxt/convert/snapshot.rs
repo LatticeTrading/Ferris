@@ -8,6 +8,7 @@ use crate::{
 // Use the stock unified Values rather than the pin's lossy typed candle/book
 // wrappers: those fill missing OHLCV cells with zero or drop malformed levels.
 pub(in crate::exchanges::ccxt) fn convert_trades(
+    venue: super::Venue,
     value: ccxt::Value,
     symbol: &str,
 ) -> Result<Vec<CcxtTrade>, ExchangeError> {
@@ -43,7 +44,14 @@ pub(in crate::exchanges::ccxt) fn convert_trades(
                 side: snapshot_string(row, "side")?,
                 symbol: snapshot_symbol(row, symbol)?,
                 taker_or_maker: snapshot_string(row, "takerOrMaker")?,
-                cost: snapshot_number(row, "cost")?,
+                // Apex does not publish cost. Stock safe_trade invents it using
+                // minOrderSize as contractSize, yielding a wrong notional. Keep
+                // the optional field absent rather than publish or recompute it.
+                cost: if venue == super::Venue::Apex {
+                    None
+                } else {
+                    snapshot_number(row, "cost")?
+                },
                 fee,
             })
         })

@@ -13,6 +13,7 @@ pub(in crate::exchanges::ccxt) enum Provider {
     Lighter(ccxt::Lighter),
     Aster(ccxt::Aster),
     Extended(ccxt::Extended),
+    Apex(ccxt::Apex),
 }
 
 macro_rules! dispatch {
@@ -24,6 +25,7 @@ macro_rules! dispatch {
             Provider::Lighter($exchange) => $body,
             Provider::Aster($exchange) => $body,
             Provider::Extended($exchange) => $body,
+            Provider::Apex($exchange) => $body,
         }
     };
 }
@@ -41,6 +43,7 @@ impl Provider {
             Venue::Hyperliquid => Self::Hyperliquid(ccxt::Hyperliquid::new(config)),
             Venue::Lighter => Self::Lighter(ccxt::Lighter::new(config)),
             Venue::Aster => Self::Aster(ccxt::Aster::new(config)),
+            Venue::Apex => Self::Apex(ccxt::Apex::new(config)),
             Venue::Extended => {
                 Self::Extended(super::super::venues::extended::rest_provider(config))
             }

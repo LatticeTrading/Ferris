@@ -573,6 +573,7 @@ dependencies = [
  "axum",
  "ccxt",
  "ccxt-pro",
+ "chrono",
  "futures-util",
  "parking_lot",
  "reqwest",

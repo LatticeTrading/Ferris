@@ -15,6 +15,7 @@ use crate::{
 };
 
 use super::{
+    control::{LiveEvent, UnsubscribeMode},
     panic_error,
     params::field,
     spec::{LiveChannel, LiveSpec},
@@ -29,6 +30,7 @@ pub(in crate::exchanges::ccxt) enum LiveProvider {
     Lighter(ccxt_pro::pro::lighter::LighterCore),
     Aster(ccxt_pro::pro::aster::AsterCore),
     Extended(ccxt_pro::pro::extended::ExtendedCore),
+    Apex(venues::apex::stream::Provider),
 }
 
 macro_rules! dispatch {
@@ -40,6 +42,7 @@ macro_rules! dispatch {
             LiveProvider::Lighter($core) => $body,
             LiveProvider::Aster($core) => $body,
             LiveProvider::Extended($core) => $body,
+            LiveProvider::Apex($core) => $body,
         }
     };
 }
@@ -78,6 +81,7 @@ impl LiveProvider {
             }
             Venue::Lighter => Self::Lighter(ccxt_pro::pro::lighter::LighterCore::new(config)),
             Venue::Aster => Self::Aster(ccxt_pro::pro::aster::AsterCore::new(config)),
+            Venue::Apex => Self::Apex(venues::apex::stream::provider(config)),
             Venue::Extended => {
                 Self::Extended(super::super::venues::extended::stream::provider(config))
             }
@@ -96,12 +100,26 @@ impl LiveProvider {
             }
             Self::Lighter(core) => super::super::venues::lighter::stream::url(core, spec).await?,
             Self::Aster(core) => super::super::venues::aster::stream::url(core, spec).await?,
+            Self::Apex(core) => venues::apex::stream::url(&mut core.core, spec).await?,
             Self::Extended(core) => super::super::venues::extended::stream::url(core, spec).await?,
         };
         url.as_str()
             .filter(|s| s.starts_with("ws://") || s.starts_with("wss://"))
             .map(str::to_string)
             .ok_or_else(|| ExchangeError::UpstreamData("invalid stock websocket URL".into()))
+    }
+
+    /// Bind every stock watch to the actual session URL, including its fresh
+    /// connection timestamp. Owner/preparation identity stays timestamp-free.
+    pub(in crate::exchanges::ccxt) fn bind_url(&mut self, url: &str) {
+        if let Self::Apex(core) = self {
+            core.bind_url(url);
+            ccxt::set_value(
+                &mut core.options,
+                &Value::from("wsPublicUrl"),
+                Value::from(url),
+            );
+        }
     }
 
     pub(super) fn slots(&self, spec: &LiveSpec) -> Result<Option<usize>, ExchangeError> {
@@ -123,6 +141,9 @@ impl LiveProvider {
                 core.set_markets(markets, &[]);
             }
         });
+        if let Self::Apex(core) = self {
+            venues::apex::stream::index_market_ids(&mut core.core);
+        }
     }
 
     /// Merge catalog rows the live core has not seen yet. The statistics feed
@@ -148,12 +169,31 @@ impl LiveProvider {
         });
     }
 
-    pub(in crate::exchanges::ccxt) fn enqueue(&self, spec: &LiveSpec, unwatch: bool) {
+    pub(in crate::exchanges::ccxt) fn unsubscribe_mode(spec: &LiveSpec) -> UnsubscribeMode {
+        venues::dispatch!(spec.venue, exchange => exchange::stream::unsubscribe_mode(spec.channel))
+    }
+
+    pub(in crate::exchanges::ccxt) fn enqueue(
+        &mut self,
+        spec: &LiveSpec,
+        unwatch: bool,
+    ) -> Result<(), ExchangeError> {
+        if unwatch && Self::unsubscribe_mode(spec) == UnsubscribeMode::Reconnect {
+            return Err(ExchangeError::Internal(
+                "reconnect-only feed cannot unwatch".into(),
+            ));
+        }
+        if let Self::Apex(core) = self {
+            if unwatch {
+                return core.unsubscribe(spec);
+            }
+            core.subscribe(spec)?;
+        }
         let symbol = Value::from(spec.symbol.as_str());
         let params = Value::from_json(&spec.params);
         if spec.channel == LiveChannel::Statistics {
             spec.statistics_feed().enqueue(spec, unwatch);
-            return;
+            return Ok(());
         }
         let limit = spec
             .depth
@@ -186,16 +226,20 @@ impl LiveProvider {
         // stock frames and return via its same-URL nested branch. They must not
         // be awaited sequentially on quiet per-channel futures.
         ccxt::exchange_stubs::enqueue_spawn(method, args);
+        Ok(())
     }
 
     pub(in crate::exchanges::ccxt) async fn next(
         &mut self,
         url: &str,
         hashes: &[String],
-    ) -> Result<Value, ExchangeError> {
+    ) -> Result<LiveEvent, ExchangeError> {
         std::panic::AssertUnwindSafe(async {
-            dispatch!(self, core => core.ws_run(url.to_string(), hashes.to_vec(), Value::Null, Vec::new(), Value::Null).await)
-        }).catch_unwind().await.map_err(panic_error)
+            if let Self::Apex(core) = self {
+                return core.next(url, hashes).await;
+            }
+            Ok(LiveEvent::Data(dispatch!(self, core => core.ws_run(url.to_string(), hashes.to_vec(), Value::Null, Vec::new(), Value::Null).await)))
+        }).catch_unwind().await.map_err(panic_error)?
     }
 
     pub(in crate::exchanges::ccxt) fn cache(&self, spec: &LiveSpec) -> Value {

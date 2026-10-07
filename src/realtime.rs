@@ -201,7 +201,13 @@ impl RealtimeReceiver {
     pub async fn recv(&mut self) -> Result<RealtimeUpdate, broadcast::error::RecvError> {
         loop {
             let publication = self.receiver.recv().await?;
-            if publication.epoch == self.state.epoch.load(Ordering::Acquire) {
+            // Continuity errors concern this receiver's existing lease even
+            // when a replacement session has already advanced the data epoch.
+            // Only stale market data is suppressible; otherwise a slow reader
+            // can silently miss the reconnect boundary before fresh updates.
+            if matches!(&publication.update, RealtimeUpdate::Error(_))
+                || publication.epoch == self.state.epoch.load(Ordering::Acquire)
+            {
                 return Ok(publication.update);
             }
         }
@@ -222,6 +228,9 @@ pub(crate) struct DeliveryState {
     pub viewers: AtomicUsize,
     pub epoch: AtomicU64,
 }
+
+#[cfg(test)]
+mod tests;
 
 #[derive(Clone)]
 pub(crate) struct Publication {

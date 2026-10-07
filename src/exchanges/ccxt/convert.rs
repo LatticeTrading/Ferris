@@ -6,7 +6,7 @@
 //! loaded stock metadata (including each market's original `info` block), never
 //! from ticker text or a row's array position.
 //!
-//! Precision is interpreted by the caller-supplied CCXT precision mode. All six
+//! Precision is interpreted by the caller-supplied CCXT precision mode. All built-in
 //! target venues ship `TICK_SIZE`, but a decimal-places or significant-digits
 //! mode is handled truthfully rather than relabeled a fixed tick.
 
@@ -49,7 +49,7 @@ pub(super) fn convert_market(
     let identity = build_identity(venue, market, market_type, &raw_info)?;
 
     // Policies interpret loaded metadata, but cannot patch identity or bypass
-    // shared numeric validation. All built-in venues use the same defaults.
+    // shared numeric validation. Apex suppresses stock's order-minimum multiplier.
     let metadata =
         super::venues::dispatch!(venue, exchange => exchange::trading_metadata(market, raw_info));
     let min_order_size = nonnegative(market.limits.amount.min, "minimum order size")?;

@@ -12,6 +12,8 @@ pub struct Config {
     pub binance_base_url: String,
     pub bybit_base_url: String,
     pub aster_base_url: String,
+    pub apex_rest_base_url: String,
+    pub apex_ws_url: String,
     pub request_timeout_ms: u64,
 }
 
@@ -77,6 +79,16 @@ impl Config {
             .trim_end_matches('/')
             .to_string();
 
+        let apex_rest_base_url = std::env::var("APEX_REST_BASE_URL")
+            .unwrap_or_else(|_| "https://omni.apex.exchange/api".to_string())
+            .trim()
+            .trim_end_matches('/')
+            .to_string();
+        let apex_ws_url = std::env::var("APEX_WS_URL")
+            .unwrap_or_else(|_| "wss://quote.omni.apex.exchange/realtime_public?v=2".to_string())
+            .trim()
+            .to_string();
+
         let request_timeout_ms = match std::env::var("REQUEST_TIMEOUT_MS") {
             Ok(value) => value
                 .trim()
@@ -96,6 +108,8 @@ impl Config {
             binance_base_url,
             bybit_base_url,
             aster_base_url,
+            apex_rest_base_url,
+            apex_ws_url,
             request_timeout_ms,
         })
     }

@@ -16,6 +16,7 @@ use super::{
     venues,
 };
 
+pub(in crate::exchanges::ccxt) mod control;
 pub(in crate::exchanges::ccxt) mod params;
 mod provider;
 mod spec;

@@ -12,7 +12,7 @@ response shapes, partial-statistics rendering, chart bootstrap, and current limi
 - unified endpoint shapes (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`, `fetchMarkets`, `fetchMarketStats`)
 - backend websocket fanout for realtime channels (`GET /v1/ws`)
 - stock CCXT / CCXT Pro `4.5.85` snapshots, statistics, and realtime acquisition behind isolated Rust owners
-- market-data support for `hyperliquid`, `binance`, `bybit`, `aster`, `extended`, and `lighterxyz`, with product-specific capabilities
+- market-data support for `hyperliquid`, `binance`, `bybit`, `aster`, `extended`, `lighterxyz`, and `apex`, with product-specific capabilities
 - shared upstream websocket topics for trades/books/candles; shared 30-second stock statistics polling plus maintained Lighter Pro `watchTickers`
 - Hyperliquid public trades use the stock recent-trade window; no additional history collector/cache
 
@@ -42,15 +42,15 @@ Frontend apps (including Electron and web frontends) often cannot directly use s
   - `POST /v1/fetchOHLCV`
   - `POST /v1/fetchOrderBook`
   - `POST /v1/fetchMarkets`
-- `POST /v1/fetchMarketStats` (all six venues; qualified products and numeric metric units below)
+- `POST /v1/fetchMarketStats` (all seven venues; qualified products and numeric metric units below)
 - Capability discovery: `GET /v1/capabilities` (no upstream acquisition)
 - Realtime endpoint:
   - `GET /v1/ws` (channels `trades`, `orderbook`, `ohlcv`, `marketstats`)
 - Realtime channel support:
-  - `trades`: `hyperliquid`, `binance`, `bybit`, `aster`, `extended`, `lighterxyz`
-  - `orderbook`: `hyperliquid`, `binance`, `bybit`, `aster`, `extended`, `lighterxyz`
-  - `ohlcv`: `hyperliquid`, `binance`, `bybit`, `aster`, `extended`
-  - `marketstats`: `hyperliquid`, `binance`, `bybit`, `extended`, `aster` (`sharedPolling`), `lighterxyz` (`sharedPollingAndWebSocket`)
+  - `trades`: `hyperliquid`, `binance`, `bybit`, `aster`, `extended`, `lighterxyz`, `apex`
+  - `orderbook`: `hyperliquid`, `binance`, `bybit`, `aster`, `extended`, `lighterxyz`, `apex`
+  - `ohlcv`: `hyperliquid`, `binance`, `bybit`, `aster`, `extended`, `apex`
+  - `marketstats`: `hyperliquid`, `binance`, `bybit`, `extended`, `aster`, `apex` (`sharedPolling`), `lighterxyz` (`sharedPollingAndWebSocket`)
 - exchange supported:
   - `hyperliquid` (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`, `fetchMarkets`, `fetchMarketStats`)
   - `binance` (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`, `fetchMarkets`, `fetchMarketStats`)
@@ -58,6 +58,7 @@ Frontend apps (including Electron and web frontends) often cannot directly use s
   - `bybit` (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`, `fetchMarkets`, `fetchMarketStats`)
   - `aster` (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`, `fetchMarkets`, `fetchMarketStats`)
   - `extended` perpetual public market data: all five snapshot endpoints plus realtime trades, order books, OHLCV, and marketstats
+  - `apex` Omni perpetuals: all five snapshot endpoints and all four realtime channels; see [Apex support](#apex-omni-support)
 - Extended accepts `BASE-USD`, `BASE/USD`, and `BASE/USD:USD`. REST and realtime trade/book symbols now use stock `BASE/USDC:USDC`; the catalog display pair remains `BASE/USD`.
 - Extended's standard websocket order book is indicative, not the RFQ real-book stream. Spot, private trading/account, funding history, and account streams are not supported.
 - Extended REST and websocket URLs are configurable for testnet deployments.
@@ -65,9 +66,9 @@ Frontend apps (including Electron and web frontends) often cannot directly use s
 
 ## CCXT REST snapshot contract
 
-All five snapshot endpoints use stock CCXT for the six registered venues. HTTP envelopes remain Ferris-owned. Trades/books/candles on `/v1/ws` use CCXT Pro; statistics use shared stock polling and Lighter Pro `watchTickers` with Ferris snapshot/revisioned-delta delivery.
+All five snapshot endpoints use stock CCXT for the seven registered venues. HTTP envelopes remain Ferris-owned. Trades/books/candles on `/v1/ws` use CCXT Pro; statistics use shared stock polling and Lighter Pro `watchTickers` with Ferris snapshot/revisioned-delta delivery.
 
-Real HTTP snapshots were exercised for all six venues. Extended's missing-User-Agent HTTP 403 is fixed by an Extended-only `Ferris/1.0` header on stock HTTP clients; live catalog, statistics, trades, candles, and book snapshots passed. Its stock WebSocket connector still omits headers and receives 403; see [CCXT-004](CCXT_KNOWN_ISSUES.md#ccxt-004). There is no native REST fallback.
+Real HTTP snapshots were exercised for the original six venues and subsequently for Apex. Extended's missing-User-Agent HTTP 403 is fixed by an Extended-only `Ferris/1.0` header on stock HTTP clients; live catalog, statistics, trades, candles, and book snapshots passed. Its stock WebSocket connector still omits headers and receives 403; see [CCXT-004](CCXT_KNOWN_ISSUES.md#ccxt-004). There is no native REST fallback.
 
 ### Selection and response differences
 
@@ -82,9 +83,9 @@ Real HTTP snapshots were exercised for all six venues. Extended's missing-User-A
 
 ### Limits and optional sources
 
-Defaults remain 100 trades and 200 candles. Positive trade/candle limits are capped: Binance/Bybit 1,000; Aster trades 1,000 and candles 1,500; Hyperliquid 5,000 (actual trades limited to the upstream window); Lighter trades 100 and candles 500; Extended trades 1,000 and candles 10,000. Bybit spot trades are capped at 60. Zero limits are rejected.
+Defaults remain 100 trades and 200 candles. Positive trade/candle limits are capped: Binance/Bybit 1,000; Aster trades 1,000 and candles 1,500; Hyperliquid 5,000 (actual trades limited to the upstream window); Lighter trades 100 and candles 500; Extended trades 1,000 and candles 10,000; Apex trades 1,000 and candles 200. Bybit spot trades are capped at 60. Zero limits are rejected.
 
-Book display depth uses top-level `limit`, then `params.levels`, `depth`, `limit`. Default 100, except Hyperliquid 20 and Bybit options 25. Maxima: Hyperliquid 20, Lighter 100, Binance/Aster/Extended 1,000 (Binance spot 5,000), Bybit 10,000 (options 25). Over-depth requests return 501 instead of silently clamping. Bybit spot above 200 and contracts above 1,000 use stock's full-book endpoint. Binance contract depth is rounded up to a supported source limit before top-N projection.
+Book display depth uses top-level `limit`, then `params.levels`, `depth`, `limit`. Default 100, except Hyperliquid 20 and Bybit options 25. Maxima: Hyperliquid 20, Lighter 100, Apex 200, Binance/Aster/Extended 1,000 (Binance spot 5,000), Bybit 10,000 (options 25). Over-depth requests return 501 instead of silently clamping. Bybit spot above 200 and contracts above 1,000 use stock's full-book endpoint. Binance contract depth is rounded up to a supported source limit before top-N projection.
 
 - Candle timeframe precedence: top-level `timeframe`, then `params.timeframe`, `interval`, then `1m`. Stock-supported native timeframe aliases are accepted. Unsupported intervals and Bybit option candles return 501.
 - `params.until` precedes `endTime`, except Extended prefers `endTime`; Lighter also accepts `endTimestamp`/`end_timestamp` after `until`. For Hyperliquid/Lighter/Extended candles, `since` without an end bound requests a window of `limit` intervals from `since`.
@@ -99,7 +100,7 @@ Book display depth uses top-level `limit`, then `params.levels`, `depth`, `limit
 
 ### Channels and book depth
 
-Trades/books are enabled for all six venues; candles for all except Lighter. Hyperliquid candles are newly enabled. Stock Binance/Bybit product profiles are selectable through `type`, `category`, `subType`, and `settle`; Bybit option candles are unsupported. The focused live checks covered BTC perpetuals, not every spot, option, expiry, settlement, or optional source. A later integrated pass exercised mixed trades/books/candles over `/v1/ws` for the five public venues (Lighter candles intentionally unsupported) and all three channels plus a finite two-burst-then-silence case against a local Extended fixture.
+Trades/books are enabled for all seven venues; candles for all except Lighter. Hyperliquid candles are newly enabled. Stock Binance/Bybit product profiles are selectable through `type`, `category`, `subType`, and `settle`; Bybit option candles are unsupported. The focused live checks covered BTC perpetuals, not every spot, option, expiry, settlement, or optional source. A later integrated pass exercised mixed trades/books/candles over `/v1/ws` for the five public venues (Lighter candles intentionally unsupported) and all three channels plus a finite two-burst-then-silence case against a local Extended fixture.
 
 Book display depth uses `params.levels`, then `depth`, then `limit`. Zero is invalid; requests above the supported maximum are rejected, not clamped. Depth is a view of the owned stock book, not an upstream topic identity:
 
@@ -111,6 +112,7 @@ Book display depth uses `params.levels`, then `depth`, then `limit`. Zero is inv
 | Aster | 20 / 20 | Stock partial-depth 20 stream; the former deep diff-book path is removed |
 | Lighter (`lighterxyz`) | 20 / all retained source levels | Stock full book; nonce is `offset`, not the old native `nonce` |
 | Extended | 20 / 1,000 | Stock standard indicative book; not RFQ liquidity; depth 1 is a view, not a different endpoint |
+| Apex | 25 / 200 | Fixed `orderBook200` topic; all display depths share the same backing book |
 
 Binance linear books accept `rpi: true`; Binance trades accept `name: trade | aggTrade`. Candle timeframe precedence is `params.timeframe`, then `interval`, then `1m`; stock timeframe aliases are accepted. Binance contract candles accept `price: mark | index`; Extended accepts `candleType: trades | mark-prices | index-prices`, which takes precedence over `price: mark | index`. REST-only price sources and limits do not imply WS support. Candle volume remains `null` when absent, including Extended mark/index candles; updates replace the candle at the same timestamp.
 
@@ -118,7 +120,8 @@ Binance linear books accept `rpi: true`; Binance trades accept `name: trade | ag
 
 - One coherent owner drives all result hashes at each actual stock URL. Viewers share maintained feeds; attaching a viewer does not reload metadata or seed a book. No saved snapshot is replayed on join: the viewer waits for the next source update.
 - Trades use stock incremental cache cursors, not repeated rolling windows. This is not historical storage or a cross-reconnect exactly-once guarantee. Reconnect invalidates the prior ownership epoch; clients must treat `UPSTREAM_ERROR` as loss of trusted continuity until fresh data arrives.
-- `subscribed` precedes updates. Duplicate requests return `alreadySubscribed`; removing one viewer leaves the others running. Final removal releases the source. Late/missing unsubscribe acknowledgements do not block unrelated maintained feeds. Extended uses stock per-channel URLs and closes their owner runtimes rather than inventing an unwatch method.
+- `subscribed` precedes updates. Duplicate requests return `alreadySubscribed`; removing one viewer leaves the others running. Final removal releases the source. Unsubscribe policy is per channel: stock unwatch, native compatibility control, or reconnect-only. Extended uses stock per-channel URLs and closes their owner runtimes rather than inventing an unwatch method.
+- Apex supports native unsubscribe, but pinned CCXT omits it. A small control adapter uses CCXT’s existing single-reader driver and stock market-data parsers: removing a feed normally leaves unrelated streams connected. Re-adding a retiring feed waits for its acknowledgment; books require a fresh snapshot. Rejected/unsent unsubscribe or a missing acknowledgment after 10 seconds triggers a shared reconnect and `UPSTREAM_ERROR` for remaining viewers. Pending retirements are bounded; removing all demand closes the connection immediately. See [streaming control boundaries](docs/streaming-control-boundaries.md).
 - Book updates are complete top-N views, not patches. Forwarders serialize borrowed slices of the shared owned book; they do not copy a full deep book for each viewer. Timestamp/nonce meanings follow stock output and need not match REST; Binance event time is stock `E`, Bybit book nonce is stock `u`, and Extended WS uses event `ts`/`seq`.
 - Each client has a 256-message outgoing queue and at most 200 realtime subscriptions (separate from 16 statistics subscriptions). A duplicate at capacity is still acknowledged; exceeding demand returns `SUBSCRIPTION_LIMIT`. Slow/full outgoing queues close the client; broadcast lag emits `CLIENT_LAGGED`. Reconnect/resubscribe after closure.
 - Live ownership is capped at 128 actual URLs and 200 feeds per shared URL, with only stock Binance URL slots. Binance workers reserve 8 MiB stacks; other live workers 2 MiB. These are admission limits, not a 400-user or 20,000-topic capacity result. Stock rate limiting stays enabled per core; combined IP quotas across owners/replicas and long-duration stock pool memory are not load-qualified. No throughput/latency SLA is claimed.
@@ -337,7 +340,7 @@ Server order book update:
 
 ### Realtime OHLCV Stream (WebSocket)
 
-Supported exchanges: `hyperliquid`, `binance`, `bybit`, `aster`, `extended`. Lighter has no stock Pro candle watcher.
+Supported exchanges: `hyperliquid`, `binance`, `bybit`, `aster`, `extended`, `apex`. Lighter has no stock Pro candle watcher.
 
 Aster supports these futures intervals: `1m`, `3m`, `5m`, `15m`, `30m`, `1h`, `2h`, `4h`, `6h`, `8h`, `12h`, `1d`, `3d`, `1w`, and `1M`.
 
@@ -550,9 +553,33 @@ Stock `fetchFundingRates` and `fetchFundingIntervals` supply decimal-fraction `e
 
 Stock `fetchTickers` adds last price and numeric rolling volume. Perpetual/spot views share bulk acquisition. Mark/index/last values retain native strings and catalog base/quote assets, separately from settlement. Open interest is `unsupported` / `stock-method-not-supported`; last-settled funding and history are also unsupported. Shared polling/freshness remains 30/90 seconds. `ASTER_BASE_URL` defaults to `https://fapi.asterdex.com`.
 
+### Apex Omni support
+
+Apex (`exchange: "apex"`) supports the stock perpetual catalog, REST trades/books/candles, live trades/books/candles, and bulk statistics through the existing HTTP and WebSocket endpoints. Spot, tokenized-stock, prediction, and prelaunch product catalogs are not included.
+
+```json
+{"exchange":"apex","symbol":"BTCUSDT","timeframe":"1m","limit":200}
+```
+
+Use that request with `/v1/fetchOHLCV`. Symbols also resolve as `BTC`, `BTC-USDT`, `BTC/USDT`, or `BTC/USDT:USDT`. Native identity is `BTCUSDT` (`id2`), with opaque market ID `["apex","perp",null,null,"BTCUSDT"]`; `info.exchangeSymbol` retains config ID `BTC-USDT`. The incorrect stock `contractSize = minOrderSize` is omitted from the catalog, and the incorrectly derived trade `cost` is null. Amounts are not scaled by the order minimum. Prelaunch rows are inactive; hidden/reduce-only rows remain active if trading is enabled.
+
+- REST trades are newest-N only (maximum 1,000); `since`/`until` filter this recent window, not historical coverage.
+- REST candles support historical bounds and up to 200 rows per call. Live candles are available. Timeframes: `1m`, `5m`, `15m`, `30m`, `1h`, `2h`, `4h`, `6h`, `12h`, `1d`, `1w`, `1M` (native alias `M`). Mark/index/premium candles are unsupported.
+- REST books default to 100, maximum 200 levels per side. Live books default to 25 displayed levels, maximum 200, from one fixed 200-level topic. Stock WS book nonce is absent; stock does not validate update-sequence continuity. REST nonce is native `u`; REST time is receipt time. Native unsubscribe preserves sibling feeds; failed/timed-out control operations retain the shared reconnect fallback described above.
+
+```json
+{"exchange":"apex","fields":["funding","markPrice","indexPrice","lastPrice","volume24h","openInterest"],"params":{}}
+```
+
+Use this with `/v1/fetchMarketStats`, or add `"op":"subscribe","channel":"marketstats"` for `/v1/ws`. One bulk `fetchTickers` call supplies all six fields, including **bulk open interest**, with no per-market fanout. Statistics use shared 30-second polling and 90-second freshness, not hundreds of per-symbol ticker subscriptions. Non-catalog ticker rows are ignored. Last-settled funding and funding history are not exposed.
+
+Funding preserves `fundingRate` as an hourly decimal fraction, `currentUnclassified` (not the separate `predictedFundingRate`, and not settled). The [venue's Funding Fee documentation](https://api-docs.omni.apex.exchange/) declares hourly payments and a multiplicative rate. Complete ISO-8601 `nextFundingTime` values are parsed; time-only values remain unknown. OI is base-asset quantity with null notional; volume carries base and quote amounts. Bulk ticker exchange timestamps are absent, so freshness uses receipt time.
+
+Verification: public Apex HTTP snapshots and mixed live trades/books/candles/statistics passed, including statistics snapshot→delta delivery. A subsequent public unsubscribe/re-add check kept sibling feeds live without continuity errors. Deterministic `tests/apex.rs` and `tests/apex/` cover shared depths, finite bursts, reconnects, native feed retirement, acknowledgment races/failures/timeouts, pre-ack snapshots, aliases, limits, and bulk request counts. This is not a long-duration or load qualification. Detailed findings and integration decisions: [docs/pending exchange/apex.md](docs/pending%20exchange/apex.md).
+
 ### Market Statistics and Capabilities
 
-`GET /v1/capabilities` enumerates registered adapters without fetching upstream data. Hyperliquid, Binance, Bybit, Extended, Aster, and Lighter advertise statistics support; funding history remains unsupported everywhere. Runtime failures do not change capabilities.
+`GET /v1/capabilities` enumerates registered adapters without fetching upstream data. Hyperliquid, Binance, Bybit, Extended, Aster, Lighter, and Apex advertise statistics support; funding history remains unsupported everywhere. Runtime failures do not change capabilities.
 
 `POST /v1/fetchMarketStats`:
 
@@ -560,9 +587,9 @@ Stock `fetchTickers` adds last price and numeric rolling volume. Perpetual/spot 
 {"exchange":"hyperliquid","fields":["funding","markPrice","indexPrice"],"params":{"dex":""}}
 ```
 
-All six venues use stock CCXT acquisition; an integrated HTTP pass exercised `fetchMarketStats` on all six and returned the documented field states, including the numeric volume/open-interest value objects. Hyperliquid uses primary-DEX `fetchTickers` contexts: hourly decimal-fraction `currentUnclassified` funding, mark/oracle prices, quote-only volume and base-unit OI. `lastPrice` is unsupported because stock ticker `last` is a midpoint. A synthetic next-hour timestamp is not published as an exchange payment schedule. Price assets now follow the CCXT catalog rather than the retired oracle-quote special case.
+All seven venues use stock CCXT acquisition; the original six-venue integrated HTTP pass exercised `fetchMarketStats` on all six and returned the documented field states, including the numeric volume/open-interest value objects. Hyperliquid uses primary-DEX `fetchTickers` contexts: hourly decimal-fraction `currentUnclassified` funding, mark/oracle prices, quote-only volume and base-unit OI. `lastPrice` is unsupported because stock ticker `last` is a midpoint. A synthetic next-hour timestamp is not published as an exchange payment schedule. Price assets now follow the CCXT catalog rather than the retired oracle-quote special case.
 
-Omitted/null `marketIds` selects active perpetuals by default, or active spot/future/option markets when that product is explicitly selected. Selected requests accept 1–100 exact catalog-issued ID strings; IDs are case-sensitive, sorted and deduplicated. Omitted/null `fields` means `["funding"]`; empty lists are invalid. Supported selectors are `type`, `category`, and `subType`, plus Hyperliquid's primary `dex: ""`; conflicting or unqualified products fail validation. Binance/Bybit support spot, linear/inverse contracts, and options; Aster/Hyperliquid/Lighter support perpetuals and spot; Extended supports perpetuals. Unknown IDs need a complete matching catalog: incomplete identity proof yields 502, not a fabricated 400. REST rejects unknown top-level keys, including `symbol`.
+Omitted/null `marketIds` selects active perpetuals by default, or active spot/future/option markets when that product is explicitly selected. Selected requests accept 1–100 exact catalog-issued ID strings; IDs are case-sensitive, sorted and deduplicated. Omitted/null `fields` means `["funding"]`; empty lists are invalid. Supported selectors are `type`, `category`, and `subType`, plus Hyperliquid's primary `dex: ""`; conflicting or unqualified products fail validation. Binance/Bybit support spot, linear/inverse contracts, and options; Aster/Hyperliquid/Lighter support perpetuals and spot; Extended and Apex support perpetuals. Unknown IDs need a complete matching catalog: incomplete identity proof yields 502, not a fabricated 400. REST rejects unknown top-level keys, including `symbol`.
 
 Response: `{timestamp, scope, markets, coverage}`. Scope contains canonical exchange/product params. Rows flatten catalog identity and add only requested `fields`. Coverage is `{expectedMarkets, returnedMarkets, enumerationComplete, sourceFailures}`. Cold all-market upstream failure returns HTTP 200 with no rows, null expected count, incomplete enumeration and explicit failures. Known membership survives failed/incomplete catalog loads. An adapter without statistics support returns 501 / `UNSUPPORTED_FEATURE`; ordinary errors use flat `{code,message}`.
 
@@ -595,7 +622,7 @@ Delivery contract:
 4. Each update includes catalog identity/display columns. Present field objects replace prior objects atomically (including null value); absent fields are unchanged. New rows and identity/active changes include all requested fields. Remove only IDs in `removedMarketIds`.
 5. Complete source states coalesce before delta construction, at most once per second. Coverage and new receipt timestamps are changes even if rates are unchanged. Slow-client queue failure closes the connection; reconnect/resubscribe starts a new generation/full snapshot. There is no durable replay.
 
-An integrated pass exercised `marketstats` over `/v1/ws` for all six venues and observed ordered snapshot→delta delivery, including a zero/null numeric update at revision 2. Phase acceptance and exercised verification are recorded in [FERRIS_V2_PLAN.md](FERRIS_V2_PLAN.md#phase-tracker). No frontend implementation or funding-history endpoint is included.
+The original integrated pass exercised `marketstats` over `/v1/ws` for all six original venues and observed ordered snapshot→delta delivery, including a zero/null numeric update at revision 2. Phase acceptance and exercised verification are recorded in [FERRIS_V2_PLAN.md](FERRIS_V2_PLAN.md#phase-tracker). No frontend implementation or funding-history endpoint is included.
 
 ### Numeric Statistics Units
 
@@ -667,6 +694,8 @@ Defaults:
 - `BINANCE_BASE_URL` (default: `https://fapi.binance.com`; default leaves other stock product hosts intact, custom gateways override all public product paths)
 - `BYBIT_BASE_URL` (default: `https://api.bybit.com`)
 - `ASTER_BASE_URL` (default: `https://fapi.asterdex.com`)
+- `APEX_REST_BASE_URL` (default: `https://omni.apex.exchange/api`; includes `/api`)
+- `APEX_WS_URL` (default: `wss://quote.omni.apex.exchange/realtime_public?v=2`; omit the connection timestamp, which Ferris generates per session)
 - `EXTENDED_REST_BASE_URL` (default: `https://api.starknet.extended.exchange/api/v1`; must end in `/api/v1` for stock signing)
 - `EXTENDED_WS_URL` (default: `wss://api.starknet.extended.exchange/stream.extended.exchange/v1`)
 - `REQUEST_TIMEOUT_MS` (default: `10000`)
@@ -774,7 +803,7 @@ cargo test --test realtime_ws
 
 ## Release builds and Docker
 
-The release artifact is built from the committed `Cargo.lock`; dependencies are pinned to stock `ccxt`/`ccxt-pro` `4.5.85` with only the six registered venue features enabled and default features disabled.
+The release artifact is built from the committed `Cargo.lock`; dependencies are pinned to stock `ccxt`/`ccxt-pro` `4.5.85` with only the seven registered venue features enabled and default features disabled.
 
 Local release build:
 
@@ -895,7 +924,7 @@ it was backed up and disabled to leave only the Lattice service as the boot owne
 
 ## Exchange maintenance
 
-The CCXT migration targets only the six registered venues. All REST snapshots, realtime streams, and statistics are acquired in `src/exchanges/ccxt` through stock `ccxt`/`ccxt-pro` `4.5.85`; use stock methods and the shared Ferris DTO/catalog boundary rather than add another handwritten HTTP adapter or raw stream parser. No native exchange module, synchronizer, terminal tool, or fallback path remains in the target backend. Additional venues require separate scope approval.
+The backend supports the seven registered venues, including the subsequent Apex Omni integration. All REST snapshots, realtime streams, and statistics are acquired in `src/exchanges/ccxt` through stock `ccxt`/`ccxt-pro` `4.5.85`; use stock methods and the shared Ferris DTO/catalog boundary rather than add another handwritten HTTP adapter or raw stream parser. No native exchange module, synchronizer, terminal tool, or fallback path remains in the target backend. Additional venues require separate scope approval.
 
 ## Notes on Hyperliquid public trades
 

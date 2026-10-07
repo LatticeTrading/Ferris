@@ -166,7 +166,7 @@ pub(super) async fn fetch_snapshot(
             check_time_range(since, until)?;
             let params = venues::dispatch!(venue, exchange => exchange::rest::trade_params(until));
             let raw = venues::dispatch!(venue, exchange => exchange::rest::trades(provider, market, since, limit as i64, params).await)?;
-            let mut trades = convert_trades(raw, &market.ccxt_symbol)?;
+            let mut trades = convert_trades(venue, raw, &market.ccxt_symbol)?;
             trades.retain(|trade| within(trade.timestamp, since, until));
             trades.sort_unstable_by(|a, b| b.timestamp.cmp(&a.timestamp));
             trades.truncate(limit);

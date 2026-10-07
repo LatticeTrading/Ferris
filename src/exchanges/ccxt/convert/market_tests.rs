@@ -180,8 +180,9 @@ fn active_flags_keep_historical_semantics_for_every_venue_and_product() {
                 raw["active"] = json!(active);
                 raw["info"]["isPreListing"] = prelisting;
                 raw["info"]["active"] = info_active;
-                // These upcoming flags intentionally have NO effect today.
-                raw["info"]["isPrelaunch"] = json!(true);
+                // Only Apex qualifies isPrelaunch; the older venues retain
+                // their historical behavior even when the flag is present.
+                raw["info"]["isPrelaunch"] = json!(venue != Venue::Apex);
                 raw["info"]["enableTrade"] = json!(false);
                 raw["info"]["enableDisplay"] = json!(false);
                 raw["info"]["enableOpenPosition"] = json!(false);
@@ -207,7 +208,8 @@ fn active_flags_keep_historical_semantics_for_every_venue_and_product() {
 
 #[test]
 fn contract_size_preserves_stock_number_semantics_without_derivation() {
-    for venue in Venue::ALL {
+    // Apex explicitly suppresses stock's minOrderSize-derived multiplier.
+    for venue in Venue::ALL.into_iter().filter(|venue| *venue != Venue::Apex) {
         for (value, expected) in [
             (None, None),
             (Some(json!(null)), None),
@@ -329,6 +331,31 @@ fn every_venue_rejects_missing_or_invalid_core_identity_and_product() {
                 "{venue:?}, {product}"
             );
         }
+    }
+}
+
+#[test]
+fn apex_native_ids_and_prelaunch_policy_do_not_invent_contract_multipliers() {
+    for (prelaunch, active) in [(false, true), (true, false)] {
+        let mut raw = fixture(Venue::Apex);
+        raw["info"]["isPrelaunch"] = json!(prelaunch);
+        raw["info"]["enableOpenPosition"] = json!(false);
+        raw["info"]["enableDisplay"] = json!(false);
+        let (entry, aliases) = convert_market(Venue::Apex, &market(raw), TICK_SIZE).unwrap();
+        assert_eq!(entry.market.active, active);
+        assert_eq!(entry.market.contract_size, None);
+        assert_eq!(entry.market.min_order_size, Some(0.001));
+        let identity = entry.market.identity.as_ref().unwrap();
+        assert_eq!(identity.exchange_market_id, "BTCUSDT");
+        assert_eq!(identity.settlement_asset_id.as_deref(), Some("USDT"));
+        for alias in ["BTC", "BTCUSDT", "BTC-USDT", "BTC/USDT", "BTC/USDT:USDT"] {
+            assert!(aliases.contains(&alias.to_string()), "{alias}");
+        }
+    }
+    for id in [json!(null), json!("")] {
+        let mut raw = fixture(Venue::Apex);
+        raw["id2"] = id;
+        assert!(convert_market(Venue::Apex, &market(raw), TICK_SIZE).is_err());
     }
 }
 
