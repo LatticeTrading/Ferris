@@ -7,6 +7,7 @@ use serde_json::json;
 
 struct TestProtocol;
 impl Protocol for TestProtocol {
+    type Core = ccxt::exchange::BaseCore;
     fn subscription(_: &LiveSpec, _: &Value) -> Result<Subscription, ExchangeError> {
         unreachable!()
     }
@@ -35,6 +36,22 @@ impl Protocol for TestProtocol {
     }
 }
 type Driver = Controlled<ccxt::exchange::BaseCore, TestProtocol>;
+
+struct ReplayProtocol;
+impl Protocol for ReplayProtocol {
+    type Core = ccxt::exchange::BaseCore;
+    const REPLAY_BOOK_DELTAS: bool = true;
+    fn subscription(_: &LiveSpec, _: &Value) -> Result<Subscription, ExchangeError> {
+        unreachable!()
+    }
+    fn unsubscribe(_: &str) -> Value {
+        Value::Null
+    }
+    fn incoming(_: &Value) -> Incoming {
+        Incoming::Other
+    }
+}
+
 fn driver() -> Driver {
     Controlled::new(ccxt::exchange::BaseCore::new(Exchange::new(None)))
 }
@@ -68,7 +85,8 @@ fn unsubscribe_policy_is_per_channel_and_preserves_stock_defaults() {
             let actual =
                 venues::dispatch!(venue, exchange => exchange::stream::unsubscribe_mode(channel));
             let expected = match (venue, channel) {
-                (Venue::Extended, _) | (Venue::Apex | Venue::Bitfinex, LiveChannel::Statistics) => {
+                (Venue::Extended, _)
+                | (Venue::Apex | Venue::Bitfinex | Venue::Kucoin, LiveChannel::Statistics) => {
                     UnsubscribeMode::Reconnect
                 }
                 (Venue::Apex | Venue::Bitfinex, _) => UnsubscribeMode::Native,
@@ -132,7 +150,7 @@ fn bitfinex_channel_ids_fence_retirement_and_cleanup_stock_routes() {
     let url = "ws://bitfinex-control-test.invalid/cleanup";
     ccxt_pro::pro::ws_client::mock_setup(url);
     let mut driver: Controlled<_, BitfinexControl> =
-        Controlled::new(ccxt::exchange::BaseCore::new(Exchange::new(None)));
+        Controlled::new(ccxt_pro::pro::bitfinex::BitfinexCore::new(None));
     driver.bind_url(url);
     driver
         .held
@@ -183,12 +201,12 @@ fn bitfinex_invalid_assignments_control_errors_and_bounded_history_reconnect() {
         json!({"event":"info","platform":{"status":0}}),
     ] {
         let mut driver: Controlled<_, BitfinexControl> =
-            Controlled::new(ccxt::exchange::BaseCore::new(Exchange::new(None)));
+            Controlled::new(ccxt_pro::pro::bitfinex::BitfinexCore::new(None));
         assert!(driver.intercept(&input(message)));
         assert!(matches!(driver.events.pop_front(), Some(Err(_))));
     }
     let mut driver: Controlled<_, BitfinexControl> =
-        Controlled::new(ccxt::exchange::BaseCore::new(Exchange::new(None)));
+        Controlled::new(ccxt_pro::pro::bitfinex::BitfinexCore::new(None));
     driver
         .held
         .insert("book:tBTCUSD".into(), held("book:tBTCUSD"));
@@ -198,6 +216,113 @@ fn bitfinex_invalid_assignments_control_errors_and_bounded_history_reconnect() {
     )));
     assert!(matches!(driver.events.pop_front(), Some(Err(_))));
     assert_eq!(driver.seen_ids.len(), 4096);
+}
+
+#[tokio::test]
+async fn malformed_replay_arguments_are_safe() {
+    let mut driver: Controlled<_, ReplayProtocol> =
+        Controlled::new(ccxt::exchange::BaseCore::new(Exchange::new(None)));
+    assert_eq!(
+        driver.call_dynamic("handle_deltas", Vec::new()).await,
+        Value::Null
+    );
+    assert_eq!(
+        driver
+            .call_dynamic("handle_deltas", vec![Value::Null, Value::Null])
+            .await,
+        Value::Null
+    );
+}
+
+#[tokio::test]
+#[should_panic(expected = "buffered book replay has no stock delta dispatcher")]
+async fn opted_in_replay_cannot_silently_miss_dispatch() {
+    let mut driver: Controlled<_, ReplayProtocol> =
+        Controlled::new(ccxt::exchange::BaseCore::new(Exchange::new(None)));
+    driver
+        .call_dynamic("handle_deltas", vec![input(json!({})), input(json!([{}]))])
+        .await;
+}
+
+#[tokio::test]
+async fn kucoin_replay_uses_stock_handles_order_and_cache_selection() {
+    use venues::kucoin::stream::KucoinControl;
+    let mut driver: Controlled<_, KucoinControl> =
+        Controlled::new(ccxt_pro::pro::kucoin::KucoinCore::new(None));
+    let mut book = driver.core.order_book(&[]);
+    book.reset(input(json!({"nonce":1,"bids":[[100,1]],"asks":[[101,1]]})));
+    let deltas = input(json!([
+        {"sequence":"2", "change":"100,buy,4", "timestamp":1700000000000u64},
+        {"sequence":3, "change":"100,buy,9", "timestamp":1700000000001u64}
+    ]));
+    assert_eq!(
+        driver
+            .call_dynamic("get_cache_index", vec![book.clone(), deltas.clone()])
+            .await,
+        Value::Int(0)
+    );
+    let before = book.clone();
+    driver
+        .call_dynamic("handle_deltas", vec![book.clone(), deltas])
+        .await;
+    assert_eq!(
+        ccxt::get_value(&before, &Value::from("nonce")),
+        Value::Int(3)
+    );
+    let bids = ccxt::get_value(&before, &Value::from("bids"));
+    assert_eq!(
+        ccxt::get_value(&ccxt::get_value(&bids, &Value::Int(0)), &Value::Int(1)).as_f64(),
+        Some(9.0)
+    );
+    for deltas in [
+        json!([]),
+        json!([null]),
+        json!([{"sequence":2}, null, {"sequence":4}]),
+    ] {
+        let deltas = input(deltas);
+        assert_eq!(
+            driver
+                .call_dynamic("get_cache_index", vec![book.clone(), deltas.clone()])
+                .await,
+            driver.core.get_cache_index(book.clone(), deltas)
+        );
+    }
+    for args in [
+        vec![],
+        vec![book.clone()],
+        vec![Value::Null, input(json!([]))],
+        vec![book.clone(), Value::Null],
+        vec![book, input(json!([]))],
+    ] {
+        assert_eq!(
+            driver.call_dynamic("handle_deltas", args).await,
+            Value::Null
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn kucoin_stock_json_heartbeat_is_correlated_and_times_out() {
+    use venues::kucoin::stream::KucoinControl;
+    let url = "ws://kucoin-heartbeat.invalid";
+    ccxt_pro::pro::ws_client::mock_setup(url);
+    let mut driver: Controlled<_, KucoinControl> =
+        Controlled::new(ccxt_pro::pro::kucoin::KucoinCore::new(None));
+    driver.bind_url(url);
+    driver.send_heartbeat().unwrap();
+    let first = driver.pending_ping.clone().unwrap();
+    driver.intercept(&input(json!({"type":"pong","id":"wrong"})));
+    assert_eq!(driver.pending_ping.as_deref(), Some(first.as_str()));
+    driver.intercept(&input(json!({"type":"pong","id":first})));
+    assert!(driver.pending_ping.is_none());
+    driver.send_heartbeat().unwrap();
+    assert_ne!(driver.pending_ping.as_deref(), Some(first.as_str()));
+    assert!(driver
+        .send_heartbeat()
+        .unwrap_err()
+        .to_string()
+        .contains("timed out"));
+    ccxt_pro::pro::ws_client::drop_client(url);
 }
 
 #[tokio::test]

@@ -12,10 +12,11 @@ pub enum Venue {
     Extended,
     Apex,
     Bitfinex,
+    Kucoin,
 }
 
 impl Venue {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Binance,
         Self::Bybit,
         Self::Hyperliquid,
@@ -24,6 +25,7 @@ impl Venue {
         Self::Extended,
         Self::Apex,
         Self::Bitfinex,
+        Self::Kucoin,
     ];
 
     pub fn public_id(self) -> &'static str {
@@ -36,6 +38,7 @@ impl Venue {
             Self::Extended => "extended",
             Self::Apex => "apex",
             Self::Bitfinex => "bitfinex",
+            Self::Kucoin => "kucoin",
         }
     }
 
@@ -104,7 +107,10 @@ impl ProviderConfig {
         let mut value = self.value.clone();
         let types = super::venues::dispatch!(venue, exchange => exchange::market_types(scope));
         if let Some(types) = types {
-            value["options"]["fetchMarkets"] = json!({"types": types});
+            if !value["options"]["fetchMarkets"].is_object() {
+                value["options"]["fetchMarkets"] = json!({});
+            }
+            value["options"]["fetchMarkets"]["types"] = json!(types);
         }
         if scope == Spot {
             value["options"]["defaultType"] = json!("spot");

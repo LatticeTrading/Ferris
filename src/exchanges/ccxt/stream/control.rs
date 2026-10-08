@@ -6,6 +6,7 @@ use std::{
     future::Future,
     ops::{Deref, DerefMut},
     pin::Pin,
+    time::Duration,
 };
 
 use ccxt::{
@@ -74,10 +75,35 @@ pub(in crate::exchanges::ccxt) enum Incoming {
 /// distinguished; protocols lacking ordered unsubscribe semantics must use
 /// Reconnect (or a future request-ID-aware adapter), not this implementation.
 pub(in crate::exchanges::ccxt) trait Protocol: Send {
+    type Core: ExchangeBase;
     const CHANNEL_IDS: bool = false;
+    /// Optional application heartbeat for ports whose transport only sends
+    /// protocol-level Ping. No extra socket or reader is introduced.
+    const HEARTBEAT: Option<Duration> = None;
+    fn ping(_core: &mut Self::Core) -> Value {
+        panic!("heartbeat has no stock ping dispatcher");
+    }
+    fn pong(_message: &Value) -> Option<String> {
+        None
+    }
     fn subscription(spec: &LiveSpec, timeframes: &Value) -> Result<Subscription, ExchangeError>;
     fn unsubscribe(topic: &str) -> Value;
     fn incoming(message: &Value) -> Incoming;
+    /// Optional override for the incremental-book snapshot replay index. The
+    /// default keeps the stock behavior unchanged.
+    fn get_cache_index(_core: &Self::Core, _orderbook: &Value, _deltas: &Value) -> Option<Value> {
+        None
+    }
+
+    /// Opt in only when stock's snapshot driver cannot dispatch `handle_deltas`.
+    /// Selection, reset, cache clearing and resolution remain in stock ws_run.
+    const REPLAY_BOOK_DELTAS: bool = false;
+
+    /// Dispatch one cached delta to the stock parser. A protocol opting in must
+    /// supply a verified dispatch arm; a missing implementation fails loudly.
+    fn replay_book_delta(_core: &mut Self::Core, _orderbook: Value, _delta: Value) {
+        panic!("buffered book replay has no stock delta dispatcher");
+    }
 }
 
 struct Held {
@@ -91,14 +117,15 @@ struct Held {
 
 const CONTROL_HASH: &str = "ferris:native-control";
 const UNSUBSCRIBE: &str = "ferris_native_unsubscribe";
+const HEARTBEAT: &str = "ferris_application_heartbeat";
 
 #[cfg(test)]
 mod tests;
 
 /// Used ONLY as the outer ws_run driver. Every dynamic method, including all
-/// stock watches/parsers, delegates to the original core except handle_message
-/// and our queued control send. Nested stock ws_run calls use the same-URL
-/// registration branch and never become competing readers.
+/// stock watches/parsers, delegates to the original core except handle_message,
+/// optional snapshot hooks, and queued control/heartbeat sends. Nested stock
+/// ws_run calls use the same-URL branch and never become competing readers.
 pub(in crate::exchanges::ccxt) struct Controlled<C, P> {
     pub core: C,
     held: HashMap<String, Held>,
@@ -106,10 +133,11 @@ pub(in crate::exchanges::ccxt) struct Controlled<C, P> {
     seen_ids: HashSet<String>,
     events: VecDeque<Result<LiveEvent, ExchangeError>>,
     url: String,
+    pending_ping: Option<String>,
     protocol: std::marker::PhantomData<P>,
 }
 
-impl<C: ExchangeBase, P: Protocol> Controlled<C, P> {
+impl<C: ExchangeBase, P: Protocol<Core = C>> Controlled<C, P> {
     pub fn new(core: C) -> Self {
         Self {
             core,
@@ -118,12 +146,15 @@ impl<C: ExchangeBase, P: Protocol> Controlled<C, P> {
             seen_ids: HashSet::new(),
             events: VecDeque::new(),
             url: String::new(),
+            pending_ping: None,
             protocol: std::marker::PhantomData,
         }
     }
 
     pub fn bind_url(&mut self, url: &str) {
         self.url = url.to_string();
+        self.pending_ping = None;
+        self.schedule_heartbeat();
     }
 
     pub fn subscribe(&mut self, spec: &LiveSpec) -> Result<(), ExchangeError> {
@@ -184,7 +215,42 @@ impl<C: ExchangeBase, P: Protocol> Controlled<C, P> {
         }
     }
 
+    fn schedule_heartbeat(&self) {
+        if let Some(period) = P::HEARTBEAT {
+            // Use the stock drive-loop timer queue, not a select that could
+            // cancel a snapshot fetch halfway through draining stock work.
+            ccxt::exchange_stubs::enqueue_spawn_after(HEARTBEAT, vec![], period.as_millis() as i64);
+        }
+    }
+
+    fn send_heartbeat(&mut self) -> Result<(), ExchangeError> {
+        if self.pending_ping.is_some() {
+            return Err(ExchangeError::UpstreamRequest(
+                "application heartbeat timed out".into(),
+            ));
+        }
+        let ping = P::ping(&mut self.core);
+        let id = ccxt::value::get_value_k(&ping, "id")
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| ExchangeError::Internal("stock ping has no request id".into()))?;
+        let client = ccxt_pro::pro::ws_client::get_client(&self.url);
+        if !client.is_some_and(|client| client.send_text(ping.to_json().to_string())) {
+            return Err(ExchangeError::UpstreamRequest(
+                "application heartbeat send failed".into(),
+            ));
+        }
+        self.pending_ping = Some(id);
+        self.schedule_heartbeat();
+        Ok(())
+    }
+
     fn intercept(&mut self, message: &Value) -> bool {
+        if let Some(id) = P::pong(message) {
+            if self.pending_ping.as_deref() == Some(&id) {
+                self.pending_ping = None;
+            }
+        }
         match P::incoming(message) {
             Incoming::Other => false,
             Incoming::Failure(message) => {
@@ -332,26 +398,32 @@ impl<C: ExchangeBase, P: Protocol> Controlled<C, P> {
     }
 }
 
-impl<C: ExchangeBase, P: Protocol> Deref for Controlled<C, P> {
+impl<C: ExchangeBase, P: Protocol<Core = C>> Deref for Controlled<C, P> {
     type Target = Exchange;
     fn deref(&self) -> &Exchange {
         &self.core
     }
 }
-impl<C: ExchangeBase, P: Protocol> DerefMut for Controlled<C, P> {
+impl<C: ExchangeBase, P: Protocol<Core = C>> DerefMut for Controlled<C, P> {
     fn deref_mut(&mut self) -> &mut Exchange {
         &mut self.core
     }
 }
 // No parser runs on this wrapper: call_dynamic forwards to the original core.
-impl<C: ExchangeBase, P: Protocol> DerivedExchange for Controlled<C, P> {}
-impl<C: ExchangeBase, P: Protocol> ExchangeBase for Controlled<C, P> {
+impl<C: ExchangeBase, P: Protocol<Core = C>> DerivedExchange for Controlled<C, P> {}
+impl<C: ExchangeBase, P: Protocol<Core = C>> ExchangeBase for Controlled<C, P> {
     fn call_dynamic<'a>(
         &'a mut self,
         method: &'a str,
         args: Vec<Value>,
     ) -> Pin<Box<dyn Future<Output = Value> + Send + 'a>> {
         Box::pin(async move {
+            if method == HEARTBEAT && P::HEARTBEAT.is_some() {
+                if let Err(error) = self.send_heartbeat() {
+                    self.fail(error.to_string());
+                }
+                return Value::Null;
+            }
             if method == UNSUBSCRIBE {
                 let topic = args[0].as_str().expect("internal native topic");
                 let mut identity = topic.to_string();
@@ -383,6 +455,31 @@ impl<C: ExchangeBase, P: Protocol> ExchangeBase for Controlled<C, P> {
             if method == "handle_message"
                 && args.get(1).is_some_and(|message| self.intercept(message))
             {
+                return Value::Null;
+            }
+            if method == "get_cache_index" {
+                if let (Some(orderbook), Some(deltas)) = (args.first(), args.get(1)) {
+                    if let Some(value) = P::get_cache_index(&self.core, orderbook, deltas) {
+                        return value;
+                    }
+                }
+            }
+            if method == "handle_deltas" && P::REPLAY_BOOK_DELTAS {
+                let (Some(orderbook), Some(deltas)) = (args.first(), args.get(1)) else {
+                    return Value::Null;
+                };
+                let Some(deltas) = deltas.as_array() else {
+                    return Value::Null;
+                };
+                if orderbook.as_map().is_none() {
+                    return Value::Null;
+                }
+                // Match stock handle_book_deltas: clone the same Value handle
+                // for each delta, in order. Never serialize/rebuild the book:
+                // __book_id and book-side handles carry shared mutation state.
+                for delta in deltas {
+                    P::replay_book_delta(&mut self.core, orderbook.clone(), delta.clone());
+                }
                 return Value::Null;
             }
             self.core.call_dynamic(method, args).await

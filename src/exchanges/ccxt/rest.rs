@@ -183,6 +183,12 @@ pub(super) async fn fetch_snapshot(
             let limit = bounded_limit(request.limit, 200, max)?;
             let since = timestamp(request.since, "since")?;
             let timeframe = request.timeframe.as_deref().expect("prepared timeframe");
+            if !provider.has_market_timeframe(market, timeframe) {
+                return Err(unsupported(
+                    venue,
+                    &format!("unsupported market timeframe `{timeframe}`"),
+                ));
+            }
             let mut until = end_time(venue, &request.params)?;
             if until.is_none()
                 && venues::dispatch!(venue, exchange => exchange::rest::BOUND_CANDLES)

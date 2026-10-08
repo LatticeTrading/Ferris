@@ -81,6 +81,7 @@ pub(in crate::exchanges::ccxt) fn unsubscribe_mode(channel: LiveChannel) -> Unsu
 
 pub(in crate::exchanges::ccxt) struct ApexControl;
 impl Protocol for ApexControl {
+    type Core = ccxt_pro::pro::apex::ApexCore;
     fn subscription(spec: &LiveSpec, timeframes: &Value) -> Result<Subscription, ExchangeError> {
         let id = spec.market["id2"]
             .as_str()

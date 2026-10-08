@@ -206,6 +206,10 @@ impl Harness {
             apex_ws_url: format!("ws://{addr}/realtime_public?v=2"),
             bitfinex_rest_base_url: "http://127.0.0.1:1".into(),
             bitfinex_ws_url: "ws://127.0.0.1:1".into(),
+            kucoin_rest_base_url: "http://127.0.0.1:1".into(),
+            kucoin_futures_rest_base_url: "http://127.0.0.1:1".into(),
+            kucoin_ws_url: "ws://127.0.0.1:1".into(),
+            kucoin_futures_ws_url: "ws://127.0.0.1:1".into(),
         };
         let service = CcxtService::start(&config).unwrap();
         let realtime = RealtimeService::new(service.clone());

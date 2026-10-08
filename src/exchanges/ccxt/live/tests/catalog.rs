@@ -47,6 +47,10 @@ async fn maintained_feed_refreshes_identity_without_freshening_held_rows() {
         apex_ws_url: "ws://127.0.0.1:1".into(),
         bitfinex_rest_base_url: "http://127.0.0.1:1".into(),
         bitfinex_ws_url: "ws://127.0.0.1:1".into(),
+        kucoin_rest_base_url: "http://127.0.0.1:1".into(),
+        kucoin_futures_rest_base_url: "http://127.0.0.1:1".into(),
+        kucoin_ws_url: "ws://127.0.0.1:1".into(),
+        kucoin_futures_ws_url: "ws://127.0.0.1:1".into(),
     };
     let config = ProviderConfig::new(Venue::Lighter, &config).unwrap();
     let watch = Arc::new(CatalogWatch::new(snapshot(1, &[0])));

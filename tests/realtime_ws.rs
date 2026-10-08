@@ -410,6 +410,10 @@ fn config(base: &str) -> Config {
         apex_ws_url: "ws://127.0.0.1:1".into(),
         bitfinex_rest_base_url: "http://127.0.0.1:1".into(),
         bitfinex_ws_url: "ws://127.0.0.1:1".into(),
+        kucoin_rest_base_url: "http://127.0.0.1:1".into(),
+        kucoin_futures_rest_base_url: "http://127.0.0.1:1".into(),
+        kucoin_ws_url: "ws://127.0.0.1:1".into(),
+        kucoin_futures_ws_url: "ws://127.0.0.1:1".into(),
         request_timeout_ms: 5_000,
     }
 }

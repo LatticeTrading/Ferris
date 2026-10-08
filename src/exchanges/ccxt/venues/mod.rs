@@ -14,6 +14,7 @@ pub(super) mod bitfinex;
 pub(super) mod bybit;
 pub(super) mod extended;
 pub(super) mod hyperliquid;
+pub(super) mod kucoin;
 pub(super) mod lighter;
 
 macro_rules! dispatch {
@@ -49,6 +50,10 @@ macro_rules! dispatch {
             }
             $crate::exchanges::ccxt::Venue::Lighter => {
                 use $crate::exchanges::ccxt::venues::lighter as $exchange;
+                $body
+            }
+            $crate::exchanges::ccxt::Venue::Kucoin => {
+                use $crate::exchanges::ccxt::venues::kucoin as $exchange;
                 $body
             }
         }

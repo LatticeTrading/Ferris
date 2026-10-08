@@ -224,8 +224,8 @@ fn payment_expiry_is_opt_in_and_uses_original_per_field_source_clock() {
                 );
                 assert!(expire_snapshot(&baseline, now + Duration::from_millis(999)).is_none());
                 let expired = expire_snapshot(&baseline, now + Duration::from_secs(1));
-                let enabled =
-                    matches!(venue, Venue::Aster | Venue::Bybit) && kind == FundingKind::Estimate;
+                let enabled = matches!(venue, Venue::Aster | Venue::Bybit | Venue::Kucoin)
+                    && kind == FundingKind::Estimate;
                 assert_eq!(expired.is_some(), enabled, "{venue:?} {kind:?}");
                 if let Some(expired) = expired {
                     let field = &expired.rows[0].fields[&MarketStatsFieldName::Funding];

@@ -78,6 +78,7 @@ pub(in crate::exchanges::ccxt) fn unsubscribe_mode(channel: LiveChannel) -> Unsu
 }
 pub(in crate::exchanges::ccxt) struct BitfinexControl;
 impl Protocol for BitfinexControl {
+    type Core = ccxt_pro::pro::bitfinex::BitfinexCore;
     const CHANNEL_IDS: bool = true;
     fn subscription(spec: &LiveSpec, _: &Value) -> Result<Subscription, ExchangeError> {
         Ok(Subscription {

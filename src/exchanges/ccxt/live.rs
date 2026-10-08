@@ -444,8 +444,10 @@ async fn run_url(
         }
         // Apex's URL timestamp belongs to a connection, not a catalog or feed.
         // Reserve/share the stable base URL, but drive and clean up the actual
-        // timestamped stock client on every reconnect.
-        let worker_url = if first.spec.venue == Venue::Apex {
+        // timestamped stock client on every reconnect. KuCoin's public URL is
+        // likewise minted per connection from a REST negotiation with an
+        // expiring token, so renegotiate it for every session.
+        let mut worker_url = if first.spec.venue == Venue::Apex {
             super::venues::apex::stream::session_url(url)
         } else {
             url.to_string()
@@ -461,11 +463,14 @@ async fn run_url(
             .name(format!("ccxt-{}-live", first.spec.venue.public_id()))
             // Stock Binance's dev-profile dynamic dispatcher uses ~1.2 MiB
             // per nested poll; registration/seed dispatch exceeds 2 MiB.
-            .stack_size(if first.spec.venue == Venue::Binance {
-                8 * 1024 * 1024
-            } else {
-                2 * 1024 * 1024
-            })
+            // KuCoin's larger unified dispatcher needs the same headroom.
+            .stack_size(
+                if matches!(first.spec.venue, Venue::Binance | Venue::Kucoin) {
+                    8 * 1024 * 1024
+                } else {
+                    2 * 1024 * 1024
+                },
+            )
             .spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     match tokio::runtime::Builder::new_current_thread()
@@ -474,7 +479,7 @@ async fn run_url(
                     {
                         Ok(runtime) => {
                             let exit = runtime.block_on(run_session(
-                                &worker_url,
+                                &mut worker_url,
                                 slot,
                                 &worker_control,
                                 &worker_changed,
@@ -555,7 +560,7 @@ fn publish_error(feed: &Feed, message: String) {
 }
 
 async fn run_session(
-    url: &str,
+    url: &mut String,
     slot: Option<usize>,
     control: &Mutex<Control>,
     changed: &Notify,
@@ -565,7 +570,25 @@ async fn run_session(
     let Some(first) = desired.first() else {
         return SessionExit::Stop;
     };
+    if *stop.borrow() {
+        return SessionExit::Stop;
+    }
     let mut provider = LiveProvider::new(&first.spec, slot);
+    if first.spec.venue == Venue::Kucoin {
+        // Negotiate on the same isolated worker as the stock driver. Shutdown
+        // can cancel HTTP; once negotiated, the worker always cleans up the
+        // actual tokenized registry key, including on panic.
+        let negotiated = tokio::select! {
+            biased;
+            _ = stop.changed() => return SessionExit::Stop,
+            result = provider.session_url(&first.spec) => result,
+        };
+        match negotiated {
+            Ok(session) => *url = session,
+            Err(error) => return SessionExit::Reconnect(error),
+        }
+    }
+    let url = url.as_str();
     provider.bind_url(url);
     let mut active: HashMap<String, ActiveFeed> = HashMap::new();
     let mut retiring: HashMap<String, RetiringFeed> = HashMap::new();

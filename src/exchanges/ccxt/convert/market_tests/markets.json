@@ -55,5 +55,12 @@
     "linear": true, "inverse": false, "active": true, "contractSize": 1,
     "precision": {"price": 0.1}, "limits": {"amount": {"min": 0.001}},
     "info": {"symbol": "BTC", "quote_asset_id": 3}
+  },
+  "kucoin": {
+    "id": "XBTUSDTM", "symbol": "BTC/USDT:USDT", "base": "BTC", "quote": "USDT",
+    "settle": "USDT", "type": "swap", "swap": true, "contract": true,
+    "linear": true, "inverse": false, "active": true, "contractSize": 0.001,
+    "precision": {"price": 0.1}, "limits": {"amount": {"min": 0.001}},
+    "info": {"symbol": "XBTUSDTM", "baseCurrency": "XBT", "quoteCurrency": "USDT", "settleCurrency": "USDT", "multiplier": 0.001, "isInverse": false}
   }
 }

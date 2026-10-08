@@ -117,6 +117,12 @@ pub(super) async fn prepare_live(
                     unsupported(venue, &format!("unsupported candle timeframe `{input}`"))
                 })?
             };
+            if !provider.has_market_timeframe(market, &normalized) {
+                return Err(unsupported(
+                    venue,
+                    &format!("unsupported market timeframe `{normalized}`"),
+                ));
+            }
             timeframe = Some(normalized);
             venues::dispatch!(venue, exchange => exchange::stream::candle_params(market, &topic.params, &mut params))?;
         }

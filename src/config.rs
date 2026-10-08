@@ -16,6 +16,10 @@ pub struct Config {
     pub apex_ws_url: String,
     pub bitfinex_rest_base_url: String,
     pub bitfinex_ws_url: String,
+    pub kucoin_rest_base_url: String,
+    pub kucoin_futures_rest_base_url: String,
+    pub kucoin_ws_url: String,
+    pub kucoin_futures_ws_url: String,
     pub request_timeout_ms: u64,
 }
 
@@ -101,6 +105,27 @@ impl Config {
             .trim()
             .to_string();
 
+        // KuCoin's public WebSocket endpoint is minted by a REST negotiation;
+        // these values are stable owner identities, not the connected URL.
+        let kucoin_rest_base_url = std::env::var("KUCOIN_REST_BASE_URL")
+            .unwrap_or_else(|_| "https://api.kucoin.com".to_string())
+            .trim()
+            .trim_end_matches('/')
+            .to_string();
+        let kucoin_futures_rest_base_url = std::env::var("KUCOIN_FUTURES_REST_BASE_URL")
+            .unwrap_or_else(|_| "https://api-futures.kucoin.com".to_string())
+            .trim()
+            .trim_end_matches('/')
+            .to_string();
+        let kucoin_ws_url = std::env::var("KUCOIN_WS_URL")
+            .unwrap_or_else(|_| "wss://x-push-spot.kucoin.com".to_string())
+            .trim()
+            .to_string();
+        let kucoin_futures_ws_url = std::env::var("KUCOIN_FUTURES_WS_URL")
+            .unwrap_or_else(|_| "wss://x-push-futures.kucoin.com".to_string())
+            .trim()
+            .to_string();
+
         let request_timeout_ms = match std::env::var("REQUEST_TIMEOUT_MS") {
             Ok(value) => value
                 .trim()
@@ -124,6 +149,10 @@ impl Config {
             apex_ws_url,
             bitfinex_rest_base_url,
             bitfinex_ws_url,
+            kucoin_rest_base_url,
+            kucoin_futures_rest_base_url,
+            kucoin_ws_url,
+            kucoin_futures_ws_url,
             request_timeout_ms,
         })
     }

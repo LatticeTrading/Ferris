@@ -15,6 +15,7 @@ pub(in crate::exchanges::ccxt) enum Provider {
     Extended(ccxt::Extended),
     Apex(ccxt::Apex),
     Bitfinex(ccxt::Bitfinex),
+    Kucoin(ccxt::Kucoin),
 }
 
 macro_rules! dispatch {
@@ -28,6 +29,7 @@ macro_rules! dispatch {
             Provider::Extended($exchange) => $body,
             Provider::Apex($exchange) => $body,
             Provider::Bitfinex($exchange) => $body,
+            Provider::Kucoin($exchange) => $body,
         }
     };
 }
@@ -47,6 +49,7 @@ impl Provider {
             Venue::Aster => Self::Aster(ccxt::Aster::new(config)),
             Venue::Apex => Self::Apex(ccxt::Apex::new(config)),
             Venue::Bitfinex => Self::Bitfinex(ccxt::Bitfinex::new(config)),
+            Venue::Kucoin => Self::Kucoin(ccxt::Kucoin::new(config)),
             Venue::Extended => {
                 Self::Extended(super::super::venues::extended::rest_provider(config))
             }
@@ -75,6 +78,26 @@ impl Provider {
 
     pub(in crate::exchanges::ccxt) fn has_timeframe(&self, timeframe: &str) -> bool {
         dispatch!(self, exchange => exchange.timeframes.as_map().is_some_and(|map| map.contains_key(timeframe)))
+    }
+
+    /// Product-specific restrictions must be checked after resolving the market
+    /// and normalizing aliases. KuCoin's top-level map includes spot-only keys.
+    pub(in crate::exchanges::ccxt) fn has_market_timeframe(
+        &self,
+        market: &super::super::catalog::CatalogMarket,
+        timeframe: &str,
+    ) -> bool {
+        if let Self::Kucoin(exchange) = self {
+            if market.raw["contract"] == true {
+                return super::super::stream::params::field(
+                    &exchange.options,
+                    &["timeframes", "swap", timeframe],
+                )
+                .as_i64()
+                .is_some_and(|minutes| minutes > 0);
+            }
+        }
+        self.has_timeframe(timeframe)
     }
 
     pub(in crate::exchanges::ccxt) fn timeframe_alias(&self, alias: &str) -> Option<String> {

@@ -211,6 +211,10 @@ fn disabled_config(timeout_ms: u64) -> Config {
         apex_ws_url: "ws://127.0.0.1:1".into(),
         bitfinex_rest_base_url: "http://127.0.0.1:1".into(),
         bitfinex_ws_url: "ws://127.0.0.1:1".into(),
+        kucoin_rest_base_url: "http://127.0.0.1:1".into(),
+        kucoin_futures_rest_base_url: "http://127.0.0.1:1".into(),
+        kucoin_ws_url: "ws://127.0.0.1:1".into(),
+        kucoin_futures_ws_url: "ws://127.0.0.1:1".into(),
         request_timeout_ms: timeout_ms,
     }
 }
@@ -244,6 +248,12 @@ fn ccxt_service(venue: Venue, base: &str, timeout_ms: u64) -> CcxtService {
         Venue::Apex => {
             config.apex_rest_base_url = format!("{base}/api");
             config.apex_ws_url = format!("{}/realtime_public?v=2", ws_base(base));
+        }
+        Venue::Kucoin => {
+            config.kucoin_rest_base_url = base.into();
+            config.kucoin_futures_rest_base_url = base.into();
+            config.kucoin_ws_url = format!("{}/spot", ws_base(base));
+            config.kucoin_futures_ws_url = format!("{}/futures", ws_base(base));
         }
     }
     CcxtService::start(&config).unwrap()
@@ -386,6 +396,7 @@ async fn market_stats_http_capabilities_bounds_and_catalog_proof() {
             "bybit",
             "extended",
             "hyperliquid",
+            "kucoin",
             "lighterxyz"
         ]
     );
@@ -525,6 +536,36 @@ async fn market_stats_http_capabilities_bounds_and_catalog_proof() {
                     stats["fields"]["perp"]["openInterest"]["state"],
                     "unsupported"
                 );
+            }
+            "kucoin" => {
+                assert_eq!(stats["upstreamMode"], "sharedPolling");
+                assert_eq!(stats["scope"]["params"], json!({}));
+                assert_eq!(stats["rateIntervalMs"], Value::Null);
+                assert_eq!(stats["paymentIntervalMs"], Value::Null);
+                assert_eq!(stats["fundingKinds"], json!(["estimate"]));
+                assert_eq!(
+                    stats["allMarkets"]["types"],
+                    json!(["spot", "perp", "future"])
+                );
+                assert_eq!(
+                    stats["fields"]["perp"]["openInterest"]["state"],
+                    "supported"
+                );
+                assert_eq!(stats["fields"]["perp"]["indexPrice"]["state"], "supported");
+                assert_eq!(
+                    stats["fields"]["perp"]["lastSettledFunding"]["state"],
+                    "unsupported"
+                );
+                assert_eq!(stats["fields"]["spot"]["funding"]["state"], "notApplicable");
+                assert_eq!(
+                    stats["fields"]["spot"]["markPrice"]["state"],
+                    "notApplicable"
+                );
+                assert_eq!(
+                    stats["fields"]["spot"]["openInterest"]["state"],
+                    "notApplicable"
+                );
+                assert_eq!(stats["fields"]["spot"]["volume24h"]["state"], "supported");
             }
             other => panic!("uncovered capability: {other}"),
         }

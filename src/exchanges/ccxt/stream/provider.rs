@@ -32,6 +32,7 @@ pub(in crate::exchanges::ccxt) enum LiveProvider {
     Extended(ccxt_pro::pro::extended::ExtendedCore),
     Apex(venues::apex::stream::Provider),
     Bitfinex(venues::bitfinex::stream::Provider),
+    Kucoin(venues::kucoin::stream::Provider),
 }
 
 macro_rules! dispatch {
@@ -45,6 +46,7 @@ macro_rules! dispatch {
             LiveProvider::Extended($core) => $body,
             LiveProvider::Apex($core) => $body,
             LiveProvider::Bitfinex($core) => $body,
+            LiveProvider::Kucoin($core) => $body,
         }
     };
 }
@@ -85,6 +87,7 @@ impl LiveProvider {
             Venue::Aster => Self::Aster(ccxt_pro::pro::aster::AsterCore::new(config)),
             Venue::Apex => Self::Apex(venues::apex::stream::provider(config)),
             Venue::Bitfinex => Self::Bitfinex(venues::bitfinex::stream::provider(config)),
+            Venue::Kucoin => Self::Kucoin(venues::kucoin::stream::provider(config)),
             Venue::Extended => {
                 Self::Extended(super::super::venues::extended::stream::provider(config))
             }
@@ -105,6 +108,7 @@ impl LiveProvider {
             Self::Aster(core) => super::super::venues::aster::stream::url(core, spec).await?,
             Self::Apex(core) => venues::apex::stream::url(&mut core.core, spec).await?,
             Self::Bitfinex(core) => venues::bitfinex::stream::url(&mut core.core, spec).await?,
+            Self::Kucoin(core) => venues::kucoin::stream::url(&mut core.core, spec).await?,
             Self::Extended(core) => super::super::venues::extended::stream::url(core, spec).await?,
         };
         url.as_str()
@@ -113,11 +117,30 @@ impl LiveProvider {
             .ok_or_else(|| ExchangeError::UpstreamData("invalid stock websocket URL".into()))
     }
 
+    /// KuCoin mints its public WebSocket URL from a REST `bullet-public`
+    /// negotiation carrying an expiring token. The stable `url()` value is only
+    /// an owner identity; a fresh session URL is negotiated on every connect.
+    pub(in crate::exchanges::ccxt) async fn session_url(
+        &mut self,
+        spec: &LiveSpec,
+    ) -> Result<String, ExchangeError> {
+        match self {
+            Self::Kucoin(core) => venues::kucoin::stream::session_url(&mut core.core, spec).await,
+            _ => Err(ExchangeError::Internal(
+                "session URL negotiation is only defined for KuCoin".into(),
+            )),
+        }
+    }
+
     /// Bind every stock watch to the actual session URL, including its fresh
     /// connection timestamp. Owner/preparation identity stays timestamp-free.
     pub(in crate::exchanges::ccxt) fn bind_url(&mut self, url: &str) {
         if let Self::Bitfinex(core) = self {
             core.bind_url(url);
+        }
+        if let Self::Kucoin(core) = self {
+            core.bind_url(url);
+            venues::kucoin::stream::bind_url(&mut core.core, url);
         }
         if let Self::Apex(core) = self {
             core.bind_url(url);
@@ -252,6 +275,7 @@ impl LiveProvider {
                 return core.next(url, hashes).await;
             }
             if let Self::Bitfinex(core) = self { return core.next(url, hashes).await; }
+            if let Self::Kucoin(core) = self { return core.next(url, hashes).await; }
             Ok(LiveEvent::Data(dispatch!(self, core => core.ws_run(url.to_string(), hashes.to_vec(), Value::Null, Vec::new(), Value::Null).await)))
         }).catch_unwind().await.map_err(panic_error)?
     }

@@ -47,10 +47,10 @@ Frontend apps (including Electron and web frontends) often cannot directly use s
 - Realtime endpoint:
   - `GET /v1/ws` (channels `trades`, `orderbook`, `ohlcv`, `marketstats`)
 - Realtime channel support:
-  - `trades`: `hyperliquid`, `binance`, `bybit`, `aster`, `extended`, `lighterxyz`, `apex`, `bitfinex`
-  - `orderbook`: `hyperliquid`, `binance`, `bybit`, `aster`, `extended`, `lighterxyz`, `apex`, `bitfinex`
-  - `ohlcv`: `hyperliquid`, `binance`, `bybit`, `aster`, `extended`, `apex`, `bitfinex`
-  - `marketstats`: `hyperliquid`, `binance`, `bybit`, `extended`, `aster`, `apex`, `bitfinex` (`sharedPolling`), `lighterxyz` (`sharedPollingAndWebSocket`)
+  - `trades`: `hyperliquid`, `binance`, `bybit`, `aster`, `extended`, `lighterxyz`, `apex`, `bitfinex`, `kucoin`
+  - `orderbook`: `hyperliquid`, `binance`, `bybit`, `aster`, `extended`, `lighterxyz`, `apex`, `bitfinex`, `kucoin`
+  - `ohlcv`: `hyperliquid`, `binance`, `bybit`, `aster`, `extended`, `apex`, `bitfinex`, `kucoin`
+  - `marketstats`: `hyperliquid`, `binance`, `bybit`, `extended`, `aster`, `apex`, `bitfinex` (`sharedPolling`), `lighterxyz` (`sharedPollingAndWebSocket`), `kucoin` (`sharedPolling`)
 - exchange supported:
   - `hyperliquid` (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`, `fetchMarkets`, `fetchMarketStats`)
   - `binance` (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`, `fetchMarkets`, `fetchMarketStats`)
@@ -60,6 +60,7 @@ Frontend apps (including Electron and web frontends) often cannot directly use s
   - `extended` perpetual public market data: all five snapshot endpoints plus realtime trades, order books, OHLCV, and marketstats
   - `apex` Omni perpetuals: all five snapshot endpoints and all four realtime channels; see [Apex support](#apex-omni-support)
   - `bitfinex` spot and linear perpetuals: all five snapshot endpoints and all four realtime channels; see [Bitfinex support](#bitfinex-support)
+  - `kucoin` spot and perpetuals: all five snapshot endpoints and all four realtime channels; see [KuCoin support](#kucoin-support)
 - Extended accepts `BASE-USD`, `BASE/USD`, and `BASE/USD:USD`. REST and realtime trade/book symbols now use stock `BASE/USDC:USDC`; the catalog display pair remains `BASE/USD`.
 - Extended's standard websocket order book is indicative, not the RFQ real-book stream. Spot, private trading/account, funding history, and account streams are not supported.
 - Extended REST and websocket URLs are configurable for testnet deployments.
@@ -84,7 +85,7 @@ Real HTTP snapshots were exercised for the original six venues and subsequently 
 
 ### Limits and optional sources
 
-Defaults remain 100 trades and 200 candles. Positive trade/candle limits are capped: Binance/Bybit 1,000; Aster trades 1,000 and candles 1,500; Hyperliquid 5,000 (actual trades limited to the upstream window); Lighter trades 100 and candles 500; Extended trades 1,000 and candles 10,000; Apex trades 1,000 and candles 200; Bitfinex trades/candles 10,000. Bybit spot trades are capped at 60. Zero limits are rejected.
+Defaults remain 100 trades and 200 candles. Positive trade/candle limits are capped: Binance/Bybit 1,000; Aster trades 1,000 and candles 1,500; Hyperliquid 5,000 (actual trades limited to the upstream window); Lighter trades 100 and candles 500; Extended trades 1,000 and candles 10,000; Apex trades 1,000 and candles 200; Bitfinex trades/candles 10,000; KuCoin trades 100 and candles 1,500 spot / 200 contract. Bybit spot trades are capped at 60. Zero limits are rejected.
 
 Book display depth uses top-level `limit`, then `params.levels`, `depth`, `limit`. Default 100, except Hyperliquid 20 and Bybit options 25. Maxima: Hyperliquid 20, Lighter 100, Apex 200, Bitfinex 250, Binance/Aster/Extended 1,000 (Binance spot 5,000), Bybit 10,000 (options 25). Over-depth requests return 501 instead of silently clamping. Bybit spot above 200 and contracts above 1,000 use stock's full-book endpoint. Binance contract depth is rounded up to a supported source limit before top-N projection.
 
@@ -115,6 +116,7 @@ Book display depth uses `params.levels`, then `depth`, then `limit`. Zero is inv
 | Extended | 20 / 1,000 | Stock standard indicative book; not RFQ liquidity; depth 1 is a view, not a different endpoint |
 | Apex | 25 / 200 | Fixed `orderBook200` topic; all display depths share the same backing book |
 | Bitfinex | 25 / 100 | Fixed 100-level `P0` price-aggregated book; stock checksum covers only top 25 |
+| KuCoin | 25 / 100 | Fixed incremental topic per symbol; the REST snapshot is seeded on the first delta and replayed; stock owns sequence maintenance |
 
 Binance linear books accept `rpi: true`; Binance trades accept `name: trade | aggTrade`. Candle timeframe precedence is `params.timeframe`, then `interval`, then `1m`; stock timeframe aliases are accepted. Binance contract candles accept `price: mark | index`; Extended accepts `candleType: trades | mark-prices | index-prices`, which takes precedence over `price: mark | index`. REST-only price sources and limits do not imply WS support. Candle volume remains `null` when absent, including Extended mark/index candles; updates replace the candle at the same timestamp.
 
@@ -343,7 +345,7 @@ Server order book update:
 
 ### Realtime OHLCV Stream (WebSocket)
 
-Supported exchanges: `hyperliquid`, `binance`, `bybit`, `aster`, `extended`, `apex`, `bitfinex`. Lighter has no stock Pro candle watcher.
+Supported exchanges: `hyperliquid`, `binance`, `bybit`, `aster`, `extended`, `apex`, `bitfinex`, `kucoin`. Lighter has no stock Pro candle watcher.
 
 Aster supports these futures intervals: `1m`, `3m`, `5m`, `15m`, `30m`, `1h`, `2h`, `4h`, `6h`, `8h`, `12h`, `1d`, `3d`, `1w`, and `1M`.
 
@@ -570,6 +572,28 @@ Statistics share bulk `fetchTickers` and `fetchOpenInterests`; funding/mark use 
 
 Native unsubscribe keeps unrelated feeds connected when safe. Reused channel IDs or failed/timed-out control cause a shared reconnect; clients must accept continuity errors and fresh snapshots. Stock top-25 checksum validation remains enabled, but no full-depth sequence guarantee is claimed. [Detailed support, upstream decisions, official references, and verification](docs/bitfinex.md).
 
+### KuCoin support
+
+`exchange: "kucoin"` supports spot and contracts (linear and inverse perpetuals, plus any dated futures the venue returns) through stock `KucoinCore`. Symbols resolve as native spot `BTC-USDT`, native perp `XBTUSDTM`, unified `BTC/USDT` / `BTC/USDT:USDT`, or the catalog's opaque `marketId`. Spot and perpetual display pairs both render `BTC/USDT`, so a bare display pair is ambiguous: use the native id or `params.type`/`category`. The default catalog contains every loaded product; default all-market statistics select perpetuals.
+
+```json
+{"exchange":"kucoin","symbol":"XBTUSDTM","timeframe":"1m","limit":200}
+```
+
+Use with `/v1/fetchOHLCV`. Timeframes: `1m`, `3m`, `5m`, `15m`, `30m`, `1h`, `2h`, `4h`, `6h`, `8h`, `12h`, `1d`, `1w`, `1M`; contract validation rejects stock’s null/unsupported `3m`, `6h`, and `1M` entries after market resolution. Trade candles only. REST trades return the venue's recent window (maximum 100); `since`/`until` filter that window, not historical coverage. REST books accept native depth 20 or 100 (maximum 100) and project the requested top-N. REST candles cap at 1,500 spot / 200 contract. Public endpoints need no credentials.
+
+Live trades, books, and candles use stock Pro. The public WebSocket URL is **not** a static value: every (re)connect mints a tokenized URL from `POST /api/v1/bullet-public` (spot) or the futures equivalent, and Ferris seeds that session URL into stock's `options.urls` so the watches and the driver share one connection. The configured `KUCOIN_WS_URL`/`KUCOIN_FUTURES_WS_URL` are stable owner identities, not the connected URL. Unsubscribe is stock-owned (`unsubscribe:{hash}`). `Controlled` also schedules stock’s required JSON heartbeat on the existing worker/client and reconnects on missed Pong; no second reader or heartbeat socket is used.
+
+Two pinned-port defects required the existing `Controlled` outer driver: the incremental book cache is measured by the handle Dict's length (always 1), so Ferris sets `options.watchOrderBook.snapshotDelay = 1` to request the REST snapshot on the first delta; and the base `get_cache_index`/`handle_deltas` path is incomplete for KuCoin, so `KucoinControl` calls pinned KuCoin’s `get_cache_index` and replays each cached delta, in order, through its exposed `handle_book_delta(orderbook, delta)` method. Stock still owns transport, subscriptions, parsing, reset, cache clearing, resolution, and book maintenance.
+
+```json
+{"exchange":"kucoin","fields":["funding","markPrice","indexPrice","lastPrice","volume24h","openInterest"],"params":{}}
+```
+
+Use with `/v1/fetchMarketStats`. Each shared acquisition issues two ticker calls (spot `fetchTickers` + contract `fetchTickers`), one bulk `fetchFundingRates`, and one bulk `fetchOpenInterests`. Funding is the UTA `nextFundingRate` as a decimal-fraction `estimate` with the native `currentGranularity` interval and `fundingTime` as the next payment time. Open interest is the native `openInterest` contract/lot count (the multiplier is not applied), amount only. Contract volume is stock's `volumeOf24h`/`turnoverOf24h`; spot volume is `vol`/`volValue`. Prices preserve stock’s unified timestamp when supplied (spot bulk carries the aggregate time); freshness uses receipt time. Last-settled funding and funding history are unsupported. Contract acquisition cannot separate linear/inverse/dated rows, so a linear/inverse statistics scope includes every contract product in the loaded catalog.
+
+Config: `KUCOIN_REST_BASE_URL` (spot REST and UTA paths), `KUCOIN_FUTURES_REST_BASE_URL`, `KUCOIN_WS_URL`, `KUCOIN_FUTURES_WS_URL`. Verification: deterministic `tests/kucoin.rs` exercises the pinned stock methods over loopback HTTP/WS: catalog/aliases, REST trades/books/candles, scalar provenance, unsupported bounds, bulk call shapes, and live trades/candles/books over the negotiated URL with stock unsubscribe. Tests also cover native futures payloads on a separate negotiated endpoint, token renewal/cleanup, fresh reconnect books, JSON heartbeats, inverse/dated metadata, and cancellation during bullet negotiation. This is not a public-network or load qualification. See [KuCoin decisions and limitations](docs/kucoin.md).
+
 ### Apex Omni support
 
 Apex (`exchange: "apex"`) supports the stock perpetual catalog, REST trades/books/candles, live trades/books/candles, and bulk statistics through the existing HTTP and WebSocket endpoints. Spot, tokenized-stock, prediction, and prelaunch product catalogs are not included.
@@ -606,7 +630,7 @@ Verification: public Apex HTTP snapshots and mixed live trades/books/candles/sta
 
 All eight venues use stock CCXT acquisition; the original six-venue integrated HTTP pass exercised `fetchMarketStats` on all six and returned the documented field states, including the numeric volume/open-interest value objects. Hyperliquid uses primary-DEX `fetchTickers` contexts: hourly decimal-fraction `currentUnclassified` funding, mark/oracle prices, quote-only volume and base-unit OI. `lastPrice` is unsupported because stock ticker `last` is a midpoint. A synthetic next-hour timestamp is not published as an exchange payment schedule. Price assets now follow the CCXT catalog rather than the retired oracle-quote special case.
 
-Omitted/null `marketIds` selects active perpetuals by default, or active spot/future/option markets when that product is explicitly selected. Selected requests accept 1–100 exact catalog-issued ID strings; IDs are case-sensitive, sorted and deduplicated. Omitted/null `fields` means `["funding"]`; empty lists are invalid. Supported selectors are `type`, `category`, and `subType`, plus Hyperliquid's primary `dex: ""`; conflicting or unqualified products fail validation. Binance/Bybit support spot, linear/inverse contracts, and options; Aster/Hyperliquid/Lighter support perpetuals and spot; Extended and Apex support perpetuals. Unknown IDs need a complete matching catalog: incomplete identity proof yields 502, not a fabricated 400. REST rejects unknown top-level keys, including `symbol`.
+Omitted/null `marketIds` selects active perpetuals by default, or active spot/future/option markets when that product is explicitly selected. Selected requests accept 1–100 exact catalog-issued ID strings; IDs are case-sensitive, sorted and deduplicated. Omitted/null `fields` means `["funding"]`; empty lists are invalid. Supported selectors are `type`, `category`, and `subType`, plus Hyperliquid's primary `dex: ""`; conflicting or unqualified products fail validation. Binance/Bybit support spot, linear/inverse contracts, and options; Aster/Hyperliquid/Lighter support perpetuals and spot; Extended and Apex support perpetuals; KuCoin supports spot, perpetuals, and dated futures (contract acquisition loads every contract type together). Unknown IDs need a complete matching catalog: incomplete identity proof yields 502, not a fabricated 400. REST rejects unknown top-level keys, including `symbol`.
 
 Response: `{timestamp, scope, markets, coverage}`. Scope contains canonical exchange/product params. Rows flatten catalog identity and add only requested `fields`. Coverage is `{expectedMarkets, returnedMarkets, enumerationComplete, sourceFailures}`. Cold all-market upstream failure returns HTTP 200 with no rows, null expected count, incomplete enumeration and explicit failures. Known membership survives failed/incomplete catalog loads. An adapter without statistics support returns 501 / `UNSUPPORTED_FEATURE`; ordinary errors use flat `{code,message}`.
 
@@ -715,6 +739,10 @@ Defaults:
 - `APEX_WS_URL` (default: `wss://quote.omni.apex.exchange/realtime_public?v=2`; omit the connection timestamp, which Ferris generates per session)
 - `BITFINEX_REST_BASE_URL` (default: `https://api-pub.bitfinex.com`; no `/v2` suffix)
 - `BITFINEX_WS_URL` (default: `wss://api-pub.bitfinex.com/ws/2`)
+- `KUCOIN_REST_BASE_URL` (default: `https://api.kucoin.com`; also serves the UTA paths)
+- `KUCOIN_FUTURES_REST_BASE_URL` (default: `https://api-futures.kucoin.com`)
+- `KUCOIN_WS_URL` (default: `wss://x-push-spot.kucoin.com`; stable owner identity, not the connected URL)
+- `KUCOIN_FUTURES_WS_URL` (default: `wss://x-push-futures.kucoin.com`; stable owner identity)
 - `EXTENDED_REST_BASE_URL` (default: `https://api.starknet.extended.exchange/api/v1`; must end in `/api/v1` for stock signing)
 - `EXTENDED_WS_URL` (default: `wss://api.starknet.extended.exchange/stream.extended.exchange/v1`)
 - `REQUEST_TIMEOUT_MS` (default: `10000`)
