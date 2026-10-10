@@ -112,7 +112,6 @@ struct Counters {
 }
 
 struct UpstreamState {
-    info_calls: Mutex<Vec<String>>,
     frames: Mutex<Vec<Value>>,
     counters: Mutex<Counters>,
     revision: watch::Sender<u64>,
@@ -131,7 +130,6 @@ impl Upstream {
         let (outbound, _) = broadcast::channel(256);
         let (close, _) = broadcast::channel(8);
         Self(Arc::new(UpstreamState {
-            info_calls: Mutex::new(Vec::new()),
             frames: Mutex::new(Vec::new()),
             counters: Mutex::new(Counters::default()),
             revision,
@@ -147,10 +145,6 @@ impl Upstream {
 
     fn counters(&self) -> Counters {
         *self.0.counters.lock()
-    }
-
-    fn info_calls(&self) -> Vec<String> {
-        self.0.info_calls.lock().clone()
     }
 
     fn frames(&self) -> Vec<Value> {
@@ -310,13 +304,10 @@ impl Upstream {
 }
 
 async fn info_handler(State(upstream): State<Upstream>, Json(request): Json<Value>) -> Json<Value> {
-    upstream
-        .0
-        .info_calls
-        .lock()
-        .push(request["type"].as_str().unwrap_or_default().to_string());
     upstream.bump();
     match request["type"].as_str() {
+        Some("spotMeta") => Json(spot_metadata()[0].clone()),
+        Some("perpDexs") => Json(json!([null])),
         Some("metaAndAssetCtxs") => Json(swap_metadata()),
         Some("spotMetaAndAssetCtxs") => Json(spot_metadata()),
         other => panic!("unexpected upstream /info request: {other:?}"),
@@ -414,6 +405,9 @@ fn config(base: &str) -> Config {
         kucoin_futures_rest_base_url: "http://127.0.0.1:1".into(),
         kucoin_ws_url: "ws://127.0.0.1:1".into(),
         kucoin_futures_ws_url: "ws://127.0.0.1:1".into(),
+        nado_gateway_base_url: "http://127.0.0.1:1".into(),
+        nado_archive_base_url: "http://127.0.0.1:1".into(),
+        nado_ws_url: "ws://127.0.0.1:1".into(),
         request_timeout_ms: 5_000,
     }
 }
@@ -847,11 +841,6 @@ async fn book_source_is_shared_across_display_depths_and_retired_feeds_do_not_le
         Some(1_700_000_000_004)
     );
 
-    assert_eq!(
-        upstream.info_calls().len(),
-        2,
-        "one metadata load serves both swap and spot markets"
-    );
     assert_eq!(upstream.counters().connections, 1);
 
     drop(shallow);

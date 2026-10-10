@@ -23,9 +23,7 @@ use tokio::time::Instant;
 pub(in crate::exchanges::ccxt) use super::super::aster::statistics::{
     acquisition_params, normalize,
 };
-pub(in crate::exchanges::ccxt) use super::super::defaults::{
-    statistics_noop_param as accepts_noop_param, statistics_selection as selection_matches,
-};
+pub(in crate::exchanges::ccxt) use super::super::defaults::statistics_selection as selection_matches;
 const TICKERS: &str = "bitfinex:ccxt:fetchTickers";
 const STATUS: &str = "bitfinex:ccxt:fetchOpenInterests";
 const MARK: &str = "bitfinex:ccxt:fetchOpenInterests+parseFundingRate";

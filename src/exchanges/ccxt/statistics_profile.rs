@@ -138,8 +138,11 @@ pub(crate) fn normalize_params(venue: Venue, input: &Value) -> Result<Value, Exc
             ExchangeError::BadSymbol("market statistics params must be an object or null".into())
         })?;
         for (key, value) in input {
-            if venues::dispatch!(venue, exchange => exchange::statistics::accepts_noop_param(key, value))
-            {
+            if venue == Venue::Hyperliquid && key == "dex" {
+                let dex = value
+                    .as_str()
+                    .ok_or_else(|| ExchangeError::BadSymbol("`dex` must be a string".into()))?;
+                selectors.insert(key.clone(), Value::String(dex.trim().to_string()));
                 continue;
             }
             if !matches!(key.as_str(), "type" | "category" | "subType") {

@@ -20,6 +20,9 @@ pub struct Config {
     pub kucoin_futures_rest_base_url: String,
     pub kucoin_ws_url: String,
     pub kucoin_futures_ws_url: String,
+    pub nado_gateway_base_url: String,
+    pub nado_archive_base_url: String,
+    pub nado_ws_url: String,
     pub request_timeout_ms: u64,
 }
 
@@ -126,6 +129,22 @@ impl Config {
             .trim()
             .to_string();
 
+        // Unversioned roots; Nado uses both v1 and v2 public APIs.
+        let nado_gateway_base_url = std::env::var("NADO_GATEWAY_BASE_URL")
+            .unwrap_or_else(|_| "https://gateway.prod.nado.xyz".into())
+            .trim()
+            .trim_end_matches('/')
+            .to_string();
+        let nado_archive_base_url = std::env::var("NADO_ARCHIVE_BASE_URL")
+            .unwrap_or_else(|_| "https://archive.prod.nado.xyz".into())
+            .trim()
+            .trim_end_matches('/')
+            .to_string();
+        let nado_ws_url = std::env::var("NADO_WS_URL")
+            .unwrap_or_else(|_| "wss://gateway.prod.nado.xyz/v1/subscribe".into())
+            .trim()
+            .to_string();
+
         let request_timeout_ms = match std::env::var("REQUEST_TIMEOUT_MS") {
             Ok(value) => value
                 .trim()
@@ -153,6 +172,9 @@ impl Config {
             kucoin_futures_rest_base_url,
             kucoin_ws_url,
             kucoin_futures_ws_url,
+            nado_gateway_base_url,
+            nado_archive_base_url,
+            nado_ws_url,
             request_timeout_ms,
         })
     }

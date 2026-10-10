@@ -164,9 +164,20 @@ pub fn project_snapshot(
     snapshot: &MarketStatsSourceSnapshot,
 ) -> MarketStatsSnapshot {
     let all_product = statistics_profile::all_market_product(&topic.params);
+    let requested_dex = topic.params.get("dex").and_then(Value::as_str);
+    let matches_scope = |row: &MarketStatsRow| {
+        requested_dex.is_none_or(|dex| {
+            row.market
+                .identity
+                .as_ref()
+                .and_then(|id| id.dex.as_deref())
+                == Some(dex)
+        })
+    };
     let mut markets: Vec<_> = snapshot
         .rows
         .iter()
+        .filter(|row| matches_scope(row))
         .filter(|row| {
             let Some(id) = row_id(row) else { return false };
             match &topic.market_ids {
@@ -214,6 +225,7 @@ pub fn project_snapshot(
                 snapshot
                     .rows
                     .iter()
+                    .filter(|row| matches_scope(row))
                     .filter(|row| row.market.market_type == all_product && row.market.active)
                     .count()
             }),

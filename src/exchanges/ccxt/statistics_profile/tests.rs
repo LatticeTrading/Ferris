@@ -52,6 +52,9 @@ async fn unqualified_venues_never_prepare_or_subscribe_statistics() {
         kucoin_futures_rest_base_url: "http://127.0.0.1:1".into(),
         kucoin_ws_url: "ws://127.0.0.1:1".into(),
         kucoin_futures_ws_url: "ws://127.0.0.1:1".into(),
+        nado_gateway_base_url: "http://127.0.0.1:1".into(),
+        nado_archive_base_url: "http://127.0.0.1:1".into(),
+        nado_ws_url: "ws://127.0.0.1:1".into(),
     };
     let service = CcxtService::start(&config).unwrap();
     service.shutdown().await.unwrap();

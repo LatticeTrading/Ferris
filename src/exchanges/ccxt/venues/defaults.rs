@@ -8,10 +8,6 @@ use crate::{config::Config, exchanges::traits::ExchangeError, models::UnifiedMar
 use ccxt::types::Market;
 use serde_json::Value as JsonValue;
 
-pub(in crate::exchanges::ccxt) fn statistics_noop_param(_key: &str, _value: &JsonValue) -> bool {
-    false
-}
-
 pub(in crate::exchanges::ccxt) fn statistics_selection(
     _product: UnifiedMarketType,
     category: Option<&str>,

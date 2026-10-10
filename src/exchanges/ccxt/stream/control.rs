@@ -230,9 +230,11 @@ impl<C: ExchangeBase, P: Protocol<Core = C>> Controlled<C, P> {
             ));
         }
         let ping = P::ping(&mut self.core);
-        let id = ccxt::value::get_value_k(&ping, "id")
+        let raw_id = ccxt::value::get_value_k(&ping, "id");
+        let id = raw_id
             .as_str()
             .map(str::to_owned)
+            .or_else(|| raw_id.as_i64().map(|id| id.to_string()))
             .ok_or_else(|| ExchangeError::Internal("stock ping has no request id".into()))?;
         let client = ccxt_pro::pro::ws_client::get_client(&self.url);
         if !client.is_some_and(|client| client.send_text(ping.to_json().to_string())) {

@@ -59,3 +59,32 @@ fn hyperliquid_never_synthesizes_last_price_and_keeps_quote_only_volume() {
     assert_eq!(funding.kind, FundingKind::CurrentUnclassified);
     assert_eq!(funding.next_payment_timestamp, None);
 }
+
+#[test]
+fn hip3_markets_use_the_combined_ticker_source() {
+    let mut catalog = entry(
+        "XYZ:BTC",
+        "USDC",
+        UnifiedMarketType::Perp,
+        Some(false),
+        serde_json::json!({}),
+    );
+    catalog.market.identity.as_mut().unwrap().dex = Some("xyz".into());
+    let value = ticker(serde_json::json!({
+        "markPx": "123.45",
+        "oraclePx": "123.40",
+        "funding": "0.001",
+        "dayNtlVlm": "1000",
+        "openInterest": "10"
+    }));
+    let src = sources(Some(&value), &catalog, HYPERLIQUID_TICKERS);
+    let (fields, _) = build_fields(Venue::Hyperliquid, &catalog, &src, true);
+    let MarketStatsValue::Price(price) = fields[&MarketStatsFieldName::MarkPrice]
+        .value
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("price variant");
+    };
+    assert_eq!(price.amount, "123.45");
+}

@@ -25,9 +25,7 @@ use ccxt::{value::get_value_k, Params, Value};
 use serde_json::{json, Map, Value as JsonValue};
 use tokio::time::Instant;
 
-pub(in crate::exchanges::ccxt) use super::super::defaults::{
-    statistics_noop_param as accepts_noop_param, statistics_selection as selection_matches,
-};
+pub(in crate::exchanges::ccxt) use super::super::defaults::statistics_selection as selection_matches;
 
 const TICKERS_SPOT: &str = "kucoin:ccxt:fetchTickers(spot)";
 const TICKERS_CONTRACT: &str = "kucoin:ccxt:fetchTickers(contract)";

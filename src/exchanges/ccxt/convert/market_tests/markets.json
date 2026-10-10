@@ -56,6 +56,13 @@
     "precision": {"price": 0.1}, "limits": {"amount": {"min": 0.001}},
     "info": {"symbol": "BTC", "quote_asset_id": 3}
   },
+  "nado": {
+    "id": "2", "symbol": "BTC/USDT0:USDT0", "base": "BTC", "quote": "USDT0",
+    "settle": "USDT0", "settleId": "0", "type": "swap", "swap": true, "contract": true,
+    "linear": true, "inverse": false, "active": true, "contractSize": 1,
+    "precision": {"price": 0.1}, "limits": {"amount": {"min": null}},
+    "info": {"symbol": "BTC-PERP", "ticker_id": "BTC-PERP_USDT0"}
+  },
   "kucoin": {
     "id": "XBTUSDTM", "symbol": "BTC/USDT:USDT", "base": "BTC", "quote": "USDT",
     "settle": "USDT", "type": "swap", "swap": true, "contract": true,

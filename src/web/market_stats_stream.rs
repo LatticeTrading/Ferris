@@ -331,7 +331,7 @@ mod tests {
     fn topic() -> MarketStatsTopic {
         MarketStatsTopic {
             exchange: "hyperliquid".into(),
-            params: json!({"dex": ""}),
+            params: json!({}),
             market_ids: None,
             fields: vec![
                 MarketStatsFieldName::Funding,
@@ -474,6 +474,53 @@ mod tests {
         yield_now().await;
         advance(duration).await;
         yield_now().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hyperliquid_dex_stream_removes_only_members_of_its_projection() {
+        let primary = row("BTC");
+        let mut hip3 = row("BTC");
+        let identity = hip3.market.identity.as_mut().unwrap();
+        identity.dex = Some("xyz".into());
+        identity.market_id = crate::market_stats::make_market_id(
+            "hyperliquid",
+            UnifiedMarketType::Perp,
+            None,
+            Some("xyz"),
+            "BTC",
+        )
+        .unwrap();
+        let removed = market_id(&hip3).to_string();
+        let mut latest = source(vec![primary, hip3]);
+        let mut streams = Vec::new();
+        for params in [json!({}), json!({"dex":""}), json!({"dex":"xyz"})] {
+            let mut scoped = topic();
+            scoped.params = params;
+            let mut stream = Stream::new(scoped.clone(), latest.clone(), 8);
+            let mut consumer = Consumer::default();
+            assert!(consumer.apply(&stream.receive().await));
+            consumer.assert_matches(&scoped, &latest);
+            streams.push((scoped, stream, consumer));
+        }
+        latest.rows.pop();
+        for (_, stream, _) in &streams {
+            stream.publish(&latest);
+        }
+        advance_and_run(Duration::from_secs(1)).await;
+        for (scoped, mut stream, mut consumer) in streams {
+            if scoped.params.get("dex").and_then(Value::as_str) == Some("") {
+                assert!(matches!(
+                    stream.outgoing.try_recv(),
+                    Err(mpsc::error::TryRecvError::Empty)
+                ));
+            } else {
+                let delta = stream.receive().await;
+                assert_eq!(delta["removedMarketIds"], json!([removed]));
+                assert!(consumer.apply(&delta));
+            }
+            consumer.assert_matches(&scoped, &latest);
+            stream.stop().await;
+        }
     }
 
     #[tokio::test(start_paused = true)]

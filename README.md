@@ -12,7 +12,7 @@ response shapes, partial-statistics rendering, chart bootstrap, and current limi
 - unified endpoint shapes (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`, `fetchMarkets`, `fetchMarketStats`)
 - backend websocket fanout for realtime channels (`GET /v1/ws`)
 - stock CCXT / CCXT Pro `4.5.85` snapshots, statistics, and realtime acquisition behind isolated Rust owners
-- market-data support for `hyperliquid`, `binance`, `bybit`, `aster`, `extended`, `lighterxyz`, `apex`, and `bitfinex`, with product-specific capabilities
+- market-data support for `hyperliquid`, `binance`, `bybit`, `aster`, `extended`, `lighterxyz`, `apex`, `bitfinex`, `kucoin`, and `nado`, with product-specific capabilities
 - shared upstream websocket topics for trades/books/candles; shared 30-second stock statistics polling plus maintained Lighter Pro `watchTickers`
 - Hyperliquid public trades use the stock recent-trade window; no additional history collector/cache
 
@@ -42,15 +42,15 @@ Frontend apps (including Electron and web frontends) often cannot directly use s
   - `POST /v1/fetchOHLCV`
   - `POST /v1/fetchOrderBook`
   - `POST /v1/fetchMarkets`
-- `POST /v1/fetchMarketStats` (all eight venues; qualified products and numeric metric units below)
+- `POST /v1/fetchMarketStats` (all ten venues; qualified products and numeric metric units below)
 - Capability discovery: `GET /v1/capabilities` (no upstream acquisition)
 - Realtime endpoint:
   - `GET /v1/ws` (channels `trades`, `orderbook`, `ohlcv`, `marketstats`)
 - Realtime channel support:
-  - `trades`: `hyperliquid`, `binance`, `bybit`, `aster`, `extended`, `lighterxyz`, `apex`, `bitfinex`, `kucoin`
+  - `trades`: `hyperliquid`, `binance`, `bybit`, `aster`, `extended`, `lighterxyz`, `apex`, `bitfinex`, `kucoin`, `nado` (Nado production handshake blocked; see below)
   - `orderbook`: `hyperliquid`, `binance`, `bybit`, `aster`, `extended`, `lighterxyz`, `apex`, `bitfinex`, `kucoin`
-  - `ohlcv`: `hyperliquid`, `binance`, `bybit`, `aster`, `extended`, `apex`, `bitfinex`, `kucoin`
-  - `marketstats`: `hyperliquid`, `binance`, `bybit`, `extended`, `aster`, `apex`, `bitfinex` (`sharedPolling`), `lighterxyz` (`sharedPollingAndWebSocket`), `kucoin` (`sharedPolling`)
+  - `ohlcv`: `hyperliquid`, `binance`, `bybit`, `aster`, `extended`, `apex`, `bitfinex`, `kucoin`, `nado` (Nado production handshake blocked; see below)
+  - `marketstats`: `hyperliquid`, `binance`, `bybit`, `extended`, `aster`, `apex`, `bitfinex` (`sharedPolling`), `lighterxyz` (`sharedPollingAndWebSocket`), `kucoin`, `nado` (`sharedPolling`)
 - exchange supported:
   - `hyperliquid` (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`, `fetchMarkets`, `fetchMarketStats`)
   - `binance` (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`, `fetchMarkets`, `fetchMarketStats`)
@@ -61,6 +61,7 @@ Frontend apps (including Electron and web frontends) often cannot directly use s
   - `apex` Omni perpetuals: all five snapshot endpoints and all four realtime channels; see [Apex support](#apex-omni-support)
   - `bitfinex` spot and linear perpetuals: all five snapshot endpoints and all four realtime channels; see [Bitfinex support](#bitfinex-support)
   - `kucoin` spot and perpetuals: all five snapshot endpoints and all four realtime channels; see [KuCoin support](#kucoin-support)
+  - `nado` spot and linear perpetuals: all five snapshot endpoints and polling-backed realtime marketstats; trade/candle stream adapters implemented, production WS blocked; live books rejected. See [Nado support](#nado-support).
 - Extended accepts `BASE-USD`, `BASE/USD`, and `BASE/USD:USD`. REST and realtime trade/book symbols now use stock `BASE/USDC:USDC`; the catalog display pair remains `BASE/USD`.
 - Extended's standard websocket order book is indicative, not the RFQ real-book stream. Spot, private trading/account, funding history, and account streams are not supported.
 - Extended REST and websocket URLs are configurable for testnet deployments.
@@ -68,7 +69,7 @@ Frontend apps (including Electron and web frontends) often cannot directly use s
 
 ## CCXT REST snapshot contract
 
-All five snapshot endpoints use stock CCXT for the eight registered venues. HTTP envelopes remain Ferris-owned. Trades/books/candles on `/v1/ws` use CCXT Pro; statistics use shared stock polling and Lighter Pro `watchTickers` with Ferris snapshot/revisioned-delta delivery.
+All five snapshot endpoints use stock CCXT for the ten registered venues. HTTP envelopes remain Ferris-owned. Trades/books/candles on `/v1/ws` use CCXT Pro; statistics use shared stock polling and Lighter Pro `watchTickers` with Ferris snapshot/revisioned-delta delivery.
 
 Real HTTP snapshots were exercised for the original six venues and subsequently for Apex. Extended's missing-User-Agent HTTP 403 is fixed by an Extended-only `Ferris/1.0` header on stock HTTP clients; live catalog, statistics, trades, candles, and book snapshots passed. Its stock WebSocket connector still omits headers and receives 403; see [CCXT-004](CCXT_KNOWN_ISSUES.md#ccxt-004). There is no native REST fallback.
 
@@ -78,7 +79,7 @@ Real HTTP snapshots were exercised for the original six venues and subsequently 
 - Use `params.type` (`spot`, `perp`/`swap`, `future`, `option`), `category` (`spot`, `linear`, `inverse`, `option`), `subType`, and `settle` for stock-supported products. Carry the same product selectors from catalog discovery into subsequent snapshots, including requests using opaque `marketId` strings; a nondefault identity does not load another acquisition profile automatically. Conflicting or ambiguous identities fail rather than select an arbitrary market.
 - `params.coin` overrides `symbol` except on Lighter, which uses `market_id`/`marketId`. Aliases must resolve against metadata. Case, punctuation, Unicode, quote, settlement, expiry, and DEX distinctions are not inferred from ticker spelling.
 - Catalog display symbols remain `BASE/QUOTE`; trade/book responses return the resolved CCXT symbol, not an echo of the input alias. Assets, precision, contract size, optional fields, and trade `info` now follow stock output. Catalog identity exists for all retained products; it does not imply statistics support for that product.
-- Extended uses native USD catalog/settlement identity but CCXT USDC trade/book symbols. Lighter REST uses CCXT's `USDC` naming and numeric native IDs, not the former Explorer catalog. Hyperliquid spot identity uses metadata `@index`.
+- Hyperliquid default and linear catalogs include stock CCXT HIP3 deployed perpetual markets. Their native DEX identity is preserved in `dex`; bulk statistics use the same stock `fetchTickers` acquisition, which includes HIP3 when the catalog is configured with `hip3`. HIP3 loading remains bounded by stock CCXT's default ten-DEX limit unless `fetchMarkets.hip3.dexes` is explicitly configured in code.
 - Trades are newest-first; candles are oldest-first. `since` and end bounds are inclusive milliseconds. Recent-only trade APIs filter their returned window; requesting an old time does not create historical coverage.
 - Candles remain `[timestamp, open, high, low, close, volume]`; volume is `null` when stock omits it, including Bybit mark/index/premium-index and Extended mark/index candles. Missing/nonfinite required prices or invalid book levels produce `UPSTREAM_DATA_INVALID`, not zero-filled data.
 - Book timestamps/nonces retain stock provenance. Extended REST book time is CCXT receipt time, not exchange time; Lighter REST book time/nonce are absent; Bybit full/RPI books have no nonce from the stock parser. Lighter returns individual orders, so multiple rows can share a price; these are not aggregated price levels.
@@ -345,7 +346,7 @@ Server order book update:
 
 ### Realtime OHLCV Stream (WebSocket)
 
-Supported exchanges: `hyperliquid`, `binance`, `bybit`, `aster`, `extended`, `apex`, `bitfinex`, `kucoin`. Lighter has no stock Pro candle watcher.
+Supported exchanges: `hyperliquid`, `binance`, `bybit`, `aster`, `extended`, `apex`, `bitfinex`, `kucoin`, `nado`. Lighter has no stock Pro candle watcher. Nado's candle adapter is loopback-tested but its production WebSocket handshake is blocked; see [Nado support](#nado-support).
 
 Aster supports these futures intervals: `1m`, `3m`, `5m`, `15m`, `30m`, `1h`, `2h`, `4h`, `6h`, `8h`, `12h`, `1d`, `3d`, `1w`, and `1M`.
 
@@ -492,6 +493,16 @@ Error shape for this endpoint:
 }
 ```
 
+### Hyperliquid Market Statistics
+
+`fetchMarkets`, `fetchMarketStats`, and `/v1/ws` `marketstats` use the same DEX selection semantics: omit `params.dex` for primary plus discovered HIP3 markets, use `{"dex":""}` for primary only, or `{"dex":"xyz"}` for that deployed DEX only. Default all-market statistics enumerate active perpetuals; `{"type":"spot"}` selects spot statistics. Statistics responses, subscription acknowledgments, and deltas preserve the requested normalized DEX constraint; a mixed scope does not contain a `dex` constraint.
+
+```json
+{"exchange":"hyperliquid","params":{},"fields":["funding","markPrice","indexPrice","volume24h","openInterest"]}
+```
+
+DEX filters are projections of the shared combined ticker acquisition, not separate upstream polls. Coverage counts describe the filtered view. Selected `marketIds` must agree with any explicit DEX constraint. Each row's top-level `dex` identifies its deployed DEX (`""` for primary, `null` for spot); no separate deployer field is supplied. Preserve the full opaque `marketId`, which already includes DEX identity, when joining catalog rows or applying stream deltas/tombstones. HIP3 discovery remains subject to the stock ten-DEX loading limit described above; enumeration completeness is relative to the loaded catalog.
+
 ### Binance Market Statistics
 
 Default statistics enumerate active USDⓈ-M perpetuals. Explicit `category: "inverse"`, `"spot"`, or `"option"` selects another stock catalog; `type: "future"` selects expiry futures within the linear/inverse category. Obtain opaque IDs from `fetchMarkets` with the matching product selectors. Selected known inactive contracts remain selectable with implemented fields `unavailable` / `inactive-market`.
@@ -572,6 +583,34 @@ Statistics share bulk `fetchTickers` and `fetchOpenInterests`; funding/mark use 
 
 Native unsubscribe keeps unrelated feeds connected when safe. Reused channel IDs or failed/timed-out control cause a shared reconnect; clients must accept continuity errors and fresh snapshots. Stock top-25 checksum validation remains enabled, but no full-depth sequence guarantee is claimed. [Detailed support, upstream decisions, official references, and verification](docs/bitfinex.md).
 
+### Nado support
+
+Use `exchange: "nado"`. Catalog discovery includes spot and linear perpetuals; default all-market statistics select perpetuals, while `params.type: "spot"` selects spot. Resolve symbols with numeric native product IDs (strings, e.g. `"2"`), native ticker IDs (`BTC-PERP_USDT0`), unified symbols (`BTC/USDT0:USDT0`), or the catalog's opaque `marketId`. The quote and settlement token is **USDT0**, not USDT. Display-pair aliases that collide across spot/perpetuals require a product selector or native/unified ID.
+
+```json
+{"exchange":"nado","symbol":"BTC-PERP_USDT0","timeframe":"1m","limit":200}
+```
+
+Use with `/v1/fetchOHLCV`. REST trades and candles cap at 500 rows. Both apply `since` as a local filter, not an upstream start-time cursor. Candle `params.until` / `params.endTime` sets the upstream end time in milliseconds (stock converts to seconds), allowing backward historical windows. Trade time bounds only filter the recent window; trade-ID pagination is not exposed. REST books support top 1–100 per side (a conservative Ferris cap, not a claimed venue maximum), with millisecond timestamp and null nonce. Supported candle timeframes: `1m`, `5m`, `15m`, `1h`, `2h`, `4h`, `1d`, `1w`, `4w`. Mark/index candles are unsupported. Minimum order size stays null because stock exposes minimum cost instead of minimum amount.
+
+```json
+{"exchange":"nado","fields":["funding","markPrice","indexPrice","lastPrice","volume24h","openInterest"]}
+```
+
+Use with `/v1/fetchMarketStats`, or add `"op":"subscribe","channel":"marketstats"` for `/v1/ws`. Each shared poll makes **two bulk calls**, not per-market calls: stock `fetchTickers` supplies last/volume, and `fetchFundingRates` supplies the contracts rows, including mark/index and **bulk open interest** from retained `info`. No duplicate `fetchOpenInterests` request is needed. OI is native `open_interest` amount plus `open_interest_usd` USD notional; no price multiplication or USDT0 relabeling. The upstream default `edge=true` aggregates volume/OI across chains. Funding is a decimal-fraction **24-hour rate with hourly settlement**, `currentUnclassified`, with the next change timestamp normalized to milliseconds; it is not a settled rate. Last-settled funding is unsupported. Bulk rows have no exchange timestamp: freshness uses receipt time, with shared 30-second polling and 90-second expiry. Spot funding/mark/index/OI are not applicable.
+
+**Realtime limitations:**
+
+- Trade and OHLCV adapters, mixed-channel sharing, numeric-ID JSON heartbeats, reconnects, and downstream envelopes are implemented and tested against loopback using stock Pro. **Production connections currently receive HTTP 403**: Nado requires `Sec-WebSocket-Extensions: permessage-deflate`, which the pinned CCXT Rust WebSocket transport does not negotiate/decode. A header-only workaround would falsely advertise compression. `NADO_WS_URL` can point to a compatible endpoint; no transport fork or native fallback is included. Polling-backed `marketstats` is unaffected.
+- **Live order books are explicitly unsupported**, rather than publishing potentially incorrect depth. Stock 4.5.85 fetches the REST snapshot before subscribing and has no snapshot-to-first-delta bridge. The official protocol requires subscribe → buffer → snapshot → replay; its later timestamp gap check cannot repair that initial race. REST books remain available.
+- Removing a trade/candle feed rebuilds the shared upstream connection (remaining feeds are resubscribed). Stock unwatch leaves the `subscribe:<stream JSON>` key owned and mishandles settlement-colon candle cleanup, making in-place re-add unsafe. Clients must accept continuity errors/reconnects. WS trades have no native trade IDs.
+
+Configuration: `NADO_GATEWAY_BASE_URL` (default `https://gateway.prod.nado.xyz`) and `NADO_ARCHIVE_BASE_URL` (default `https://archive.prod.nado.xyz`) are **unversioned** roots; Ferris configures both `/v1` and `/v2`. `NADO_WS_URL` defaults to `wss://gateway.prod.nado.xyz/v1/subscribe`.
+
+Verification: `tests/nado.rs` and `tests/nado/` exercise stock catalog/aliases, REST request bounds, x18 and time conversions, bulk units/receipts/partial failures, public WS envelopes, connection sharing, reconnection and fresh re-add. The full offline suite passes. Public-network smoke tests passed catalog, REST trades/books/candles and bulk statistics (77 active perpetuals at verification); the opt-in public WS test reproduces the compression-related 403, not a successful live stream.
+
+Official references: [contracts and funding units](https://docs.nado.xyz/developer-resources/api/v2/contracts), [funding methodology](https://docs.nado.xyz/core/funding-rates), [order-book synchronization](https://docs.nado.xyz/developer-resources/api/subscriptions/events#maintaining-a-local-orderbook), [streams](https://docs.nado.xyz/developer-resources/api/subscriptions/streams), [candlesticks](https://docs.nado.xyz/developer-resources/api/archive-indexer/candlesticks), [REST books](https://docs.nado.xyz/developer-resources/api/v2/orderbook).
+
 ### KuCoin support
 
 `exchange: "kucoin"` supports spot and contracts (linear and inverse perpetuals, plus any dated futures the venue returns) through stock `KucoinCore`. Symbols resolve as native spot `BTC-USDT`, native perp `XBTUSDTM`, unified `BTC/USDT` / `BTC/USDT:USDT`, or the catalog's opaque `marketId`. Spot and perpetual display pairs both render `BTC/USDT`, so a bare display pair is ambiguous: use the native id or `params.type`/`category`. The default catalog contains every loaded product; default all-market statistics select perpetuals.
@@ -628,9 +667,9 @@ Verification: public Apex HTTP snapshots and mixed live trades/books/candles/sta
 {"exchange":"hyperliquid","fields":["funding","markPrice","indexPrice"],"params":{"dex":""}}
 ```
 
-All eight venues use stock CCXT acquisition; the original six-venue integrated HTTP pass exercised `fetchMarketStats` on all six and returned the documented field states, including the numeric volume/open-interest value objects. Hyperliquid uses primary-DEX `fetchTickers` contexts: hourly decimal-fraction `currentUnclassified` funding, mark/oracle prices, quote-only volume and base-unit OI. `lastPrice` is unsupported because stock ticker `last` is a midpoint. A synthetic next-hour timestamp is not published as an exchange payment schedule. Price assets now follow the CCXT catalog rather than the retired oracle-quote special case.
+All ten venues use stock CCXT acquisition; the original six-venue integrated HTTP pass exercised `fetchMarketStats` on all six and returned the documented field states, including the numeric volume/open-interest value objects. Hyperliquid uses primary-DEX `fetchTickers` contexts: hourly decimal-fraction `currentUnclassified` funding, mark/oracle prices, quote-only volume and base-unit OI. `lastPrice` is unsupported because stock ticker `last` is a midpoint. A synthetic next-hour timestamp is not published as an exchange payment schedule. Price assets now follow the CCXT catalog rather than the retired oracle-quote special case.
 
-Omitted/null `marketIds` selects active perpetuals by default, or active spot/future/option markets when that product is explicitly selected. Selected requests accept 1–100 exact catalog-issued ID strings; IDs are case-sensitive, sorted and deduplicated. Omitted/null `fields` means `["funding"]`; empty lists are invalid. Supported selectors are `type`, `category`, and `subType`, plus Hyperliquid's primary `dex: ""`; conflicting or unqualified products fail validation. Binance/Bybit support spot, linear/inverse contracts, and options; Aster/Hyperliquid/Lighter support perpetuals and spot; Extended and Apex support perpetuals; KuCoin supports spot, perpetuals, and dated futures (contract acquisition loads every contract type together). Unknown IDs need a complete matching catalog: incomplete identity proof yields 502, not a fabricated 400. REST rejects unknown top-level keys, including `symbol`.
+Omitted/null `marketIds` selects active perpetuals by default, or active spot/future/option markets when that product is explicitly selected. Selected requests accept 1–100 exact catalog-issued ID strings; IDs are case-sensitive, sorted and deduplicated. Omitted/null `fields` means `["funding"]`; empty lists are invalid. Supported selectors are `type`, `category`, and `subType`, plus Hyperliquid's primary `dex: ""`; conflicting or unqualified products fail validation. Binance/Bybit support spot, linear/inverse contracts, and options; Aster/Hyperliquid/Lighter/Nado support perpetuals and spot; Extended and Apex support perpetuals; KuCoin supports spot, perpetuals, and dated futures (contract acquisition loads every contract type together). Unknown IDs need a complete matching catalog: incomplete identity proof yields 502, not a fabricated 400. REST rejects unknown top-level keys, including `symbol`.
 
 Response: `{timestamp, scope, markets, coverage}`. Scope contains canonical exchange/product params. Rows flatten catalog identity and add only requested `fields`. Coverage is `{expectedMarkets, returnedMarkets, enumerationComplete, sourceFailures}`. Cold all-market upstream failure returns HTTP 200 with no rows, null expected count, incomplete enumeration and explicit failures. Known membership survives failed/incomplete catalog loads. An adapter without statistics support returns 501 / `UNSUPPORTED_FEATURE`; ordinary errors use flat `{code,message}`.
 
@@ -683,6 +722,7 @@ No Ferris currency/contract conversion or missing-side price multiplication is p
 | Extended perpetual | Base `dailyVolumeBase` / collateral `dailyVolume` | Base `openInterestBase` / collateral `openInterest` (catalog USD naming) |
 | Aster perpetual | Base `volume` / quote `quoteVolume` | Unsupported |
 | Lighter perpetual | Base `daily_base_token_volume` / quote `daily_quote_token_volume` | null / two-sided USDC notional (`2 ×` WS `open_interest`) |
+| Nado perpetual | Base `base_volume` / USDT0 `quote_volume` | Native `open_interest` / USD `open_interest_usd` (upstream default edge aggregate) |
 | Supported spot products | Base / quote from the venue ticker; Hyperliquid preserves quote-only volume | Not applicable |
 
 Primary field references: [Binance OI](https://developers.binance.com/docs/derivatives/usds-margined-futures/market-data/rest-api/Open-Interest), [Binance option contracts and units](https://developers.binance.com/legacy-docs/derivatives/options-trading/market-data/Exchange-Information), [option volume](https://developers.binance.com/legacy-docs/derivatives/options-trading/market-data/24hr-Ticker-Price-Change-Statistics), [option OI](https://developers.binance.com/legacy-docs/derivatives/options-trading/market-data/Open-Interest), [Bybit OI units](https://bybit-exchange.github.io/docs/v5/market/open-interest), [Bybit option multiplier/quantity](https://www.bybit.com/en/learn/options/bybit-options-lesson-options-parameters-introduction), [Hyperliquid contexts](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint/perpetuals), [Extended market statistics](https://api.docs.extended.exchange/#get-markets). These explain venue fields; the exact pinned stock mappings and unavailable members remain part of Ferris's contract.
@@ -743,6 +783,9 @@ Defaults:
 - `KUCOIN_FUTURES_REST_BASE_URL` (default: `https://api-futures.kucoin.com`)
 - `KUCOIN_WS_URL` (default: `wss://x-push-spot.kucoin.com`; stable owner identity, not the connected URL)
 - `KUCOIN_FUTURES_WS_URL` (default: `wss://x-push-futures.kucoin.com`; stable owner identity)
+- `NADO_GATEWAY_BASE_URL` (default: `https://gateway.prod.nado.xyz`; no version suffix)
+- `NADO_ARCHIVE_BASE_URL` (default: `https://archive.prod.nado.xyz`; no version suffix)
+- `NADO_WS_URL` (default: `wss://gateway.prod.nado.xyz/v1/subscribe`; production currently requires unsupported transport compression)
 - `EXTENDED_REST_BASE_URL` (default: `https://api.starknet.extended.exchange/api/v1`; must end in `/api/v1` for stock signing)
 - `EXTENDED_WS_URL` (default: `wss://api.starknet.extended.exchange/stream.extended.exchange/v1`)
 - `REQUEST_TIMEOUT_MS` (default: `10000`)

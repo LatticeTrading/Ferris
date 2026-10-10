@@ -25,9 +25,7 @@ use crate::{
     },
 };
 
-pub(in crate::exchanges::ccxt) use super::super::defaults::{
-    statistics_noop_param as accepts_noop_param, statistics_selection as selection_matches,
-};
+pub(in crate::exchanges::ccxt) use super::super::defaults::statistics_selection as selection_matches;
 
 const EXTENDED_TICKERS: &str = "extended:ccxt:fetchTickers";
 

@@ -151,6 +151,85 @@ fn source(rows: Vec<MarketStatsRow>, received_at: Instant) -> MarketStatsSourceS
     }
 }
 
+#[test]
+fn hyperliquid_dex_scopes_filter_rows_coverage_and_selected_ids() {
+    let make_row = |dex: &str, native: &str, active| {
+        let mut row = row(native, UnifiedMarketType::Perp, active, 1, Some("0.1"));
+        let identity = row.market.identity.as_mut().unwrap();
+        identity.dex = Some(dex.into());
+        identity.market_id = make_market_id(
+            "hyperliquid",
+            UnifiedMarketType::Perp,
+            None,
+            Some(dex),
+            native,
+        )
+        .unwrap();
+        row
+    };
+    let snapshot = source(
+        vec![
+            make_row("", "BTC", true),
+            make_row("xyz", "BTC", true),
+            make_row("other", "BTC", true),
+            make_row("xyz", "OLD", false),
+            row("@0", UnifiedMarketType::Spot, true, 1, None),
+        ],
+        Instant::now(),
+    );
+    for (params, expected_dexes) in [
+        (json!({}), vec!["", "other", "xyz"]),
+        (json!({"dex":""}), vec![""]),
+        (json!({"dex":" xyz "}), vec!["xyz"]),
+        (json!({"dex":"missing"}), vec![]),
+    ] {
+        let topic = normalize_topic(request(json!({"params":params}))).unwrap();
+        let view = project_snapshot(&topic, &snapshot);
+        let mut dexes: Vec<_> = view
+            .markets
+            .iter()
+            .map(|row| {
+                row.market
+                    .identity
+                    .as_ref()
+                    .unwrap()
+                    .dex
+                    .as_deref()
+                    .unwrap()
+            })
+            .collect();
+        dexes.sort_unstable();
+        assert_eq!(dexes, expected_dexes);
+        assert_eq!(view.coverage.expected_markets, Some(expected_dexes.len()));
+        assert_eq!(view.coverage.returned_markets, expected_dexes.len());
+        assert!(view.coverage.enumeration_complete);
+    }
+    let xyz = snapshot.rows[1]
+        .market
+        .identity
+        .as_ref()
+        .unwrap()
+        .market_id
+        .clone();
+    let primary = snapshot.rows[0]
+        .market
+        .identity
+        .as_ref()
+        .unwrap()
+        .market_id
+        .clone();
+    for params in [json!({}), json!({"dex":"xyz"})] {
+        let selected =
+            normalize_topic(request(json!({"params":params,"marketIds":[xyz]}))).unwrap();
+        validate_selection(&selected, &snapshot).unwrap();
+        let view = project_snapshot(&selected, &snapshot);
+        assert_eq!(row_id(&view.markets[0]), Some(xyz.as_str()));
+    }
+    for (params, id) in [(json!({"dex":""}), xyz), (json!({"dex":"xyz"}), primary)] {
+        assert!(normalize_topic(request(json!({"params":params,"marketIds":[id]}))).is_err());
+    }
+}
+
 fn mismatch(mut snapshot: MarketStatsSourceSnapshot) -> MarketStatsSourceSnapshot {
     snapshot.contexts_valid = false;
     snapshot.source_failures.push(MarketStatsSourceFailure {
@@ -183,7 +262,7 @@ fn market_stats_topics_canonicalize_without_rewriting_identity() {
     })))
     .unwrap();
     let second = normalize_topic(request(json!({
-        "params": {"dex": ""}, "marketIds": [lower, upper],
+        "params": {}, "marketIds": [lower, upper],
         "fields": ["funding", "markPrice"],
     })))
     .unwrap();
@@ -212,7 +291,6 @@ fn market_stats_rejects_noncanonical_or_out_of_scope_ids_before_catalog() {
         r#"["bybit","perp",null,"","BTC"]"#,
         r#"["hyperliquid","perp","", "","BTC"]"#,
         r#"["hyperliquid","perp",null,null,"BTC"]"#,
-        r#"["hyperliquid","perp",null,"other","BTC"]"#,
         r#"["hyperliquid","spot",null,"","0"]"#,
         r#"["hyperliquid","future",null,"","BTC"]"#,
         r#"["hyperliquid","perp",null,"",""]"#,
@@ -234,7 +312,6 @@ fn market_stats_rejects_empty_lists_oversized_input_and_invalid_scope() {
         json!([]),
         json!(""),
         json!({"dex": null}),
-        json!({"dex": "other"}),
         json!({"category": null}),
         json!({"dex": "", "extra": true}),
     ] {

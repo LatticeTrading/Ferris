@@ -33,6 +33,7 @@ pub(in crate::exchanges::ccxt) enum LiveProvider {
     Apex(venues::apex::stream::Provider),
     Bitfinex(venues::bitfinex::stream::Provider),
     Kucoin(venues::kucoin::stream::Provider),
+    Nado(venues::nado::stream::Provider),
 }
 
 macro_rules! dispatch {
@@ -47,6 +48,7 @@ macro_rules! dispatch {
             LiveProvider::Apex($core) => $body,
             LiveProvider::Bitfinex($core) => $body,
             LiveProvider::Kucoin($core) => $body,
+            LiveProvider::Nado($core) => $body,
         }
     };
 }
@@ -88,6 +90,7 @@ impl LiveProvider {
             Venue::Apex => Self::Apex(venues::apex::stream::provider(config)),
             Venue::Bitfinex => Self::Bitfinex(venues::bitfinex::stream::provider(config)),
             Venue::Kucoin => Self::Kucoin(venues::kucoin::stream::provider(config)),
+            Venue::Nado => Self::Nado(venues::nado::stream::provider(config)),
             Venue::Extended => {
                 Self::Extended(super::super::venues::extended::stream::provider(config))
             }
@@ -109,6 +112,7 @@ impl LiveProvider {
             Self::Apex(core) => venues::apex::stream::url(&mut core.core, spec).await?,
             Self::Bitfinex(core) => venues::bitfinex::stream::url(&mut core.core, spec).await?,
             Self::Kucoin(core) => venues::kucoin::stream::url(&mut core.core, spec).await?,
+            Self::Nado(core) => venues::nado::stream::url(&mut core.core, spec).await?,
             Self::Extended(core) => super::super::venues::extended::stream::url(core, spec).await?,
         };
         url.as_str()
@@ -136,6 +140,9 @@ impl LiveProvider {
     /// connection timestamp. Owner/preparation identity stays timestamp-free.
     pub(in crate::exchanges::ccxt) fn bind_url(&mut self, url: &str) {
         if let Self::Bitfinex(core) = self {
+            core.bind_url(url);
+        }
+        if let Self::Nado(core) = self {
             core.bind_url(url);
         }
         if let Self::Kucoin(core) = self {
@@ -276,6 +283,7 @@ impl LiveProvider {
             }
             if let Self::Bitfinex(core) = self { return core.next(url, hashes).await; }
             if let Self::Kucoin(core) = self { return core.next(url, hashes).await; }
+            if let Self::Nado(core) = self { return core.next(url, hashes).await; }
             Ok(LiveEvent::Data(dispatch!(self, core => core.ws_run(url.to_string(), hashes.to_vec(), Value::Null, Vec::new(), Value::Null).await)))
         }).catch_unwind().await.map_err(panic_error)?
     }

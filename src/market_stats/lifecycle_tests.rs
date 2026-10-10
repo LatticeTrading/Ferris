@@ -117,7 +117,7 @@ impl MarketStatsSource for FakeExchange {
         MarketStatsCapabilities::Supported(MarketStatsSupportedCapabilities {
             scope: MarketStatsScope {
                 exchange: "hyperliquid".into(),
-                params: json!({"dex": ""}),
+                params: json!({}),
             },
             all_markets: MarketStatsAllMarketsCapability {
                 types: vec![UnifiedMarketType::Perp],
@@ -303,7 +303,7 @@ fn request(selected: Option<&str>, fields: &[MarketStatsFieldName]) -> FetchMark
         exchange: "hyperliquid".into(),
         market_ids: selected.map(|native| vec![market_id(native)]),
         fields: Some(fields.to_vec()),
-        params: json!({"dex": ""}),
+        params: json!({}),
     }
 }
 

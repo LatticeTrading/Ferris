@@ -90,6 +90,7 @@ fn unsubscribe_policy_is_per_channel_and_preserves_stock_defaults() {
                     UnsubscribeMode::Reconnect
                 }
                 (Venue::Apex | Venue::Bitfinex, _) => UnsubscribeMode::Native,
+                (Venue::Nado, _) => UnsubscribeMode::Reconnect,
                 _ => UnsubscribeMode::Stock,
             };
             assert_eq!(actual, expected, "{venue:?} {channel:?}");
@@ -317,6 +318,30 @@ async fn kucoin_stock_json_heartbeat_is_correlated_and_times_out() {
     assert!(driver.pending_ping.is_none());
     driver.send_heartbeat().unwrap();
     assert_ne!(driver.pending_ping.as_deref(), Some(first.as_str()));
+    assert!(driver
+        .send_heartbeat()
+        .unwrap_err()
+        .to_string()
+        .contains("timed out"));
+    ccxt_pro::pro::ws_client::drop_client(url);
+}
+
+#[tokio::test(start_paused = true)]
+async fn nado_numeric_heartbeat_ids_are_correlated_and_expire() {
+    use venues::nado::stream::NadoControl;
+    let url = "ws://nado-heartbeat.invalid";
+    ccxt_pro::pro::ws_client::mock_setup(url);
+    let mut driver: Controlled<_, NadoControl> =
+        Controlled::new(ccxt_pro::pro::nado::NadoCore::new(None));
+    driver.bind_url(url);
+    driver.send_heartbeat().unwrap();
+    assert_eq!(driver.pending_ping.as_deref(), Some("1"));
+    driver.intercept(&input(json!({"result":{"method":"pong"},"id":2})));
+    assert!(driver.pending_ping.is_some());
+    driver.intercept(&input(json!({"result":{"method":"pong"},"id":1})));
+    assert!(driver.pending_ping.is_none());
+    driver.send_heartbeat().unwrap();
+    assert_eq!(driver.pending_ping.as_deref(), Some("2"));
     assert!(driver
         .send_heartbeat()
         .unwrap_err()

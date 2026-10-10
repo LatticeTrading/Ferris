@@ -353,9 +353,7 @@ pub(in crate::exchanges::ccxt) fn acquisition_params(params: &JsonValue) -> Json
     params
 }
 
-pub(in crate::exchanges::ccxt) use super::super::defaults::{
-    statistics_noop_param as accepts_noop_param, statistics_selection as selection_matches,
-};
+pub(in crate::exchanges::ccxt) use super::super::defaults::statistics_selection as selection_matches;
 
 #[cfg(test)]
 mod tests;

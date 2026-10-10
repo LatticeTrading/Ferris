@@ -322,8 +322,6 @@ pub(in crate::exchanges::ccxt) fn acquisition_params(_params: &JsonValue) -> Jso
     json!({})
 }
 
-pub(in crate::exchanges::ccxt) use super::super::defaults::statistics_noop_param as accepts_noop_param;
-
 pub(in crate::exchanges::ccxt) fn selection_matches(
     _product: UnifiedMarketType,
     category: Option<&str>,

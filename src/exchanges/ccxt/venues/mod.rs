@@ -16,6 +16,7 @@ pub(super) mod extended;
 pub(super) mod hyperliquid;
 pub(super) mod kucoin;
 pub(super) mod lighter;
+pub(super) mod nado;
 
 macro_rules! dispatch {
     ($venue:expr, $exchange:ident => $body:expr) => {
@@ -50,6 +51,10 @@ macro_rules! dispatch {
             }
             $crate::exchanges::ccxt::Venue::Lighter => {
                 use $crate::exchanges::ccxt::venues::lighter as $exchange;
+                $body
+            }
+            $crate::exchanges::ccxt::Venue::Nado => {
+                use $crate::exchanges::ccxt::venues::nado as $exchange;
                 $body
             }
             $crate::exchanges::ccxt::Venue::Kucoin => {

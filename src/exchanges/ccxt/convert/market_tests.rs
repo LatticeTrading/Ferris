@@ -99,6 +99,17 @@ fn existing_alias_sets_and_native_metadata_are_unchanged() {
             "tBTCF0:USTF0",
         ),
         (
+            Venue::Nado,
+            vec!["BTC/USDT0", "BTC/USDT0:USDT0", "2", "BTC-PERP_USDT0"],
+            "2",
+            "USDT0",
+            Some("0"),
+            None,
+            None,
+            Some("PERPETUAL"),
+            "BTC-PERP_USDT0",
+        ),
+        (
             Venue::Kucoin,
             vec!["BTC/USDT", "BTC/USDT:USDT", "XBTUSDTM", "BTC"],
             "XBTUSDTM",

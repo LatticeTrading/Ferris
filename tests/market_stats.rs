@@ -87,8 +87,11 @@ impl Reply {
 struct InfoMock {
     primary: Arc<RwLock<Reply>>,
     spot: Arc<RwLock<Reply>>,
+    perp_dexs: Arc<RwLock<Reply>>,
+    hip3: Arc<RwLock<Reply>>,
     primary_count: Arc<AtomicUsize>,
     spot_count: Arc<AtomicUsize>,
+    perp_dexs_count: Arc<AtomicUsize>,
 }
 
 /// Stock Hyperliquid perpetual + spot metadata/contexts fixture. The contexts
@@ -130,8 +133,15 @@ impl InfoMock {
         Self {
             primary: Arc::new(RwLock::new(Reply::ok(primary_fixture()))),
             spot: Arc::new(RwLock::new(Reply::ok(spot_fixture()))),
+            perp_dexs: Arc::new(RwLock::new(Reply::ok(json!([null])))),
+            hip3: Arc::new(RwLock::new(Reply::ok(json!([
+                {"collateralToken":0,"universe":[{"name":"xyz:BTC","szDecimals":5}]},
+                [{"funding":"0.0001","markPx":"61000","oraclePx":"60999",
+                  "dayNtlVlm":"2000","openInterest":"2"}]
+            ])))),
             primary_count: Arc::new(AtomicUsize::new(0)),
             spot_count: Arc::new(AtomicUsize::new(0)),
+            perp_dexs_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -148,15 +158,25 @@ async fn info_handler(
     State(state): State<InfoMock>,
     Json(request): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
+    if request["type"] == "metaAndAssetCtxs" && request["dex"] == "xyz" {
+        let reply = state.hip3.read().await.clone();
+        return (reply.status, Json(reply.body));
+    }
     let (count, slot) = match request["type"].as_str() {
         Some("metaAndAssetCtxs") => (&state.primary_count, &state.primary),
-        Some("spotMetaAndAssetCtxs") => (&state.spot_count, &state.spot),
+        Some("spotMetaAndAssetCtxs") | Some("spotMeta") => (&state.spot_count, &state.spot),
+        Some("perpDexs") => (&state.perp_dexs_count, &state.perp_dexs),
         other => panic!("unexpected upstream acquisition: {other:?}"),
     };
     count.fetch_add(1, Ordering::SeqCst);
     let reply = slot.read().await.clone();
-    if let Some(barrier) = reply.barrier {
-        barrier.acquire().await.unwrap().forget();
+    if request["type"] == "spotMeta" {
+        return (reply.status, Json(reply.body[0].clone()));
+    }
+    if request["type"] == "spotMetaAndAssetCtxs" || request["type"] == "metaAndAssetCtxs" {
+        if let Some(barrier) = reply.barrier {
+            barrier.acquire().await.unwrap().forget();
+        }
     }
     (reply.status, Json(reply.body))
 }
@@ -215,6 +235,9 @@ fn disabled_config(timeout_ms: u64) -> Config {
         kucoin_futures_rest_base_url: "http://127.0.0.1:1".into(),
         kucoin_ws_url: "ws://127.0.0.1:1".into(),
         kucoin_futures_ws_url: "ws://127.0.0.1:1".into(),
+        nado_gateway_base_url: "http://127.0.0.1:1".into(),
+        nado_archive_base_url: "http://127.0.0.1:1".into(),
+        nado_ws_url: "ws://127.0.0.1:1".into(),
         request_timeout_ms: timeout_ms,
     }
 }
@@ -248,6 +271,11 @@ fn ccxt_service(venue: Venue, base: &str, timeout_ms: u64) -> CcxtService {
         Venue::Apex => {
             config.apex_rest_base_url = format!("{base}/api");
             config.apex_ws_url = format!("{}/realtime_public?v=2", ws_base(base));
+        }
+        Venue::Nado => {
+            config.nado_gateway_base_url = base.into();
+            config.nado_archive_base_url = base.into();
+            config.nado_ws_url = format!("{}/v1/subscribe", ws_base(base));
         }
         Venue::Kucoin => {
             config.kucoin_rest_base_url = base.into();
@@ -347,10 +375,110 @@ fn spot_id(index: u64) -> String {
 
 fn source_params() -> FetchMarketStatsParams {
     FetchMarketStatsParams {
-        params: json!({"dex":""}),
+        params: json!({}),
         open_interest_market_ids: Vec::new(),
         include_bulk: true,
     }
+}
+
+#[tokio::test]
+async fn hyperliquid_mixed_primary_and_hip3_scopes_share_http_and_ws_acquisition() {
+    let (mock, upstream, up_stop, up_server) = hyperliquid_server().await;
+    *mock.perp_dexs.write().await = Reply::ok(json!([null, {"name":"xyz"}]));
+    let source = ccxt_stats_exchange(Venue::Hyperliquid, &upstream, 2_000);
+    let (url, state, stop, server) = backend(source).await;
+    let client = reqwest::Client::new();
+    let xyz_id = ferris_market_data_backend::market_stats::make_market_id(
+        "hyperliquid",
+        UnifiedMarketType::Perp,
+        None,
+        Some("xyz"),
+        "xyz:BTC",
+    )
+    .unwrap();
+    let mut sockets = Vec::new();
+    for (params, expected_ids) in [
+        (
+            json!({}),
+            vec![
+                native_id("ETH"),
+                native_id("BTC"),
+                native_id("HYPE"),
+                native_id("SOL"),
+                native_id("DOGE"),
+                xyz_id.clone(),
+            ],
+        ),
+        (
+            json!({"dex":""}),
+            vec![
+                native_id("ETH"),
+                native_id("BTC"),
+                native_id("HYPE"),
+                native_id("SOL"),
+                native_id("DOGE"),
+            ],
+        ),
+        (json!({"dex":"xyz"}), vec![xyz_id.clone()]),
+    ] {
+        let request = json!({"params":params,"fields":["markPrice"]});
+        let snapshot = stats_http(&client, &url, request.clone(), StatusCode::OK).await;
+        assert_eq!(snapshot["scope"]["params"], params);
+        let mut ids: Vec<_> = snapshot["markets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["marketId"].as_str().unwrap().to_string())
+            .collect();
+        let mut expected_ids = expected_ids;
+        ids.sort();
+        expected_ids.sort();
+        assert_eq!(ids, expected_ids);
+        assert_eq!(snapshot["coverage"]["expectedMarkets"], ids.len());
+        assert_eq!(snapshot["coverage"]["returnedMarkets"], ids.len());
+        assert_eq!(snapshot["coverage"]["enumerationComplete"], true);
+        let mut socket = stats_socket(&url).await;
+        ws_send(&mut socket, stats_command("subscribe", &request)).await;
+        let view = ws_initial(&mut socket).await;
+        assert_eq!(view.topic["params"], params);
+        assert_eq!(
+            view.markets.keys().cloned().collect::<Vec<_>>(),
+            expected_ids
+        );
+        sockets.push((socket, view));
+    }
+    let selected = stats_http(
+        &client,
+        &url,
+        json!({"marketIds":[xyz_id],"fields":["markPrice"]}),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(
+        selected["markets"][0]["fields"]["markPrice"]["value"]["amount"],
+        "61000"
+    );
+    assert_eq!(selected["markets"][0]["dex"], "xyz");
+    stats_http(
+        &client,
+        &url,
+        json!({"params":{"dex":""},"marketIds":[xyz_id]}),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    assert_eq!(
+        mock.primary_calls(),
+        2,
+        "all DEX projections share metadata and one ticker poll"
+    );
+    for (mut socket, _) in sockets {
+        socket.close(None).await.unwrap();
+    }
+    state.shutdown_market_stats().await;
+    let _ = stop.send(());
+    server.await.unwrap();
+    let _ = up_stop.send(());
+    up_server.await.unwrap();
 }
 
 async fn wait_count(counter: &AtomicUsize, expected: usize) {
@@ -397,7 +525,8 @@ async fn market_stats_http_capabilities_bounds_and_catalog_proof() {
             "extended",
             "hyperliquid",
             "kucoin",
-            "lighterxyz"
+            "lighterxyz",
+            "nado"
         ]
     );
     for exchange in exchanges {
@@ -416,7 +545,6 @@ async fn market_stats_http_capabilities_bounds_and_catalog_proof() {
         match exchange["exchange"].as_str().unwrap() {
             "hyperliquid" => {
                 assert_eq!(stats["upstreamMode"], "sharedPolling");
-                assert_eq!(stats["scope"]["params"], json!({"dex":""}));
                 assert_eq!(stats["rateIntervalMs"], 3_600_000);
                 assert_eq!(stats["paymentIntervalMs"], 3_600_000);
                 assert_eq!(stats["fundingKinds"], json!(["currentUnclassified"]));
@@ -537,6 +665,29 @@ async fn market_stats_http_capabilities_bounds_and_catalog_proof() {
                     "unsupported"
                 );
             }
+            "nado" => {
+                assert_eq!(stats["upstreamMode"], "sharedPolling");
+                assert_eq!(stats["allMarkets"]["types"], json!(["spot", "perp"]));
+                assert_eq!(stats["fundingKinds"], json!(["currentUnclassified"]));
+                for field in [
+                    "funding",
+                    "lastPrice",
+                    "markPrice",
+                    "indexPrice",
+                    "volume24h",
+                    "openInterest",
+                ] {
+                    assert_eq!(stats["fields"]["perp"][field]["state"], "supported");
+                }
+                assert_eq!(
+                    stats["fields"]["perp"]["lastSettledFunding"]["state"],
+                    "unsupported"
+                );
+                assert_eq!(
+                    stats["fields"]["spot"]["openInterest"]["state"],
+                    "notApplicable"
+                );
+            }
             "kucoin" => {
                 assert_eq!(stats["upstreamMode"], "sharedPolling");
                 assert_eq!(stats["scope"]["params"], json!({}));
@@ -575,7 +726,6 @@ async fn market_stats_http_capabilities_bounds_and_catalog_proof() {
         json!({"fields":[]}),
         json!({"symbol":"BTC"}),
         json!({"fields":["unknown"]}),
-        json!({"params":{"dex":"other"}}),
         json!({"params":{"category":"perp"}}),
         json!({"params":[]}),
         json!({"marketIds":["bad"]}),
@@ -1074,7 +1224,7 @@ async fn market_stats_ws_shares_http_and_releases_duplicate_demand() {
     let mut btc_socket = stats_socket(&url).await;
     let btc = native_id("BTC");
     let all_request =
-        json!({"exchange":"hyperliquid","params":{"dex":""},"fields":["funding","markPrice"]});
+        json!({"exchange":"hyperliquid","params":{},"fields":["funding","markPrice"]});
     let btc_request = json!({"marketIds":[btc],"fields":["funding","markPrice"]});
 
     ws_send(&mut all_socket, stats_command("subscribe", &all_request)).await;
@@ -1437,7 +1587,6 @@ async fn market_stats_ws_classifies_errors_and_limits_distinct_connection_topics
         json!({"marketIds":vec![native_id("BTC");101]}),
         json!({"marketIds":["bad"]}),
         json!({"marketIds":["[\"other\",\"perp\",null,\"\",\"BTC\"]"]}),
-        json!({"params":{"dex":"other"}}),
         json!({"params":{"category":"perp"}}),
         json!({"params":[]}),
     ] {
@@ -1596,7 +1745,7 @@ async fn market_stats_ws_cold_all_market_failure_recovers_without_selected_lease
         .unwrap()
         .iter()
         .any(|failure| failure["reason"] == "upstream-failure"));
-    let duplicate = json!({"marketIds":null,"fields":["funding"],"params":{"dex":""}});
+    let duplicate = json!({"marketIds":null,"fields":["funding"],"params":{}});
     ws_send(&mut all_socket, stats_command("subscribe", &duplicate)).await;
     assert_eq!(
         ws_next(&mut all_socket).await,

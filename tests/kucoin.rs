@@ -258,6 +258,9 @@ impl Harness {
             kucoin_futures_rest_base_url: format!("http://{addr}/futures"),
             kucoin_ws_url: format!("ws://{addr}/spot"),
             kucoin_futures_ws_url: format!("ws://{addr}/futures"),
+            nado_gateway_base_url: "http://127.0.0.1:1".into(),
+            nado_archive_base_url: "http://127.0.0.1:1".into(),
+            nado_ws_url: "ws://127.0.0.1:1".into(),
         };
         let service = CcxtService::start(&config).unwrap();
         let realtime = RealtimeService::new(service.clone());

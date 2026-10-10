@@ -1,4 +1,5 @@
-use ccxt::{types::Market, TypedExchange};
+use ccxt::{types::Market, Params, TypedExchange};
+use serde_json::{json, Map as JsonMap, Value as JsonValue};
 
 use crate::exchanges::traits::ExchangeError;
 
@@ -16,6 +17,7 @@ pub(in crate::exchanges::ccxt) enum Provider {
     Apex(ccxt::Apex),
     Bitfinex(ccxt::Bitfinex),
     Kucoin(ccxt::Kucoin),
+    Nado(ccxt::Nado),
 }
 
 macro_rules! dispatch {
@@ -30,6 +32,7 @@ macro_rules! dispatch {
             Provider::Apex($exchange) => $body,
             Provider::Bitfinex($exchange) => $body,
             Provider::Kucoin($exchange) => $body,
+            Provider::Nado($exchange) => $body,
         }
     };
 }
@@ -50,6 +53,7 @@ impl Provider {
             Venue::Apex => Self::Apex(ccxt::Apex::new(config)),
             Venue::Bitfinex => Self::Bitfinex(ccxt::Bitfinex::new(config)),
             Venue::Kucoin => Self::Kucoin(ccxt::Kucoin::new(config)),
+            Venue::Nado => Self::Nado(ccxt::Nado::new(config)),
             Venue::Extended => {
                 Self::Extended(super::super::venues::extended::rest_provider(config))
             }
@@ -60,6 +64,31 @@ impl Provider {
         &mut self,
         reload: bool,
     ) -> ccxt::Result<Vec<Market>> {
+        if let Self::Hyperliquid(exchange) = self {
+            if reload || exchange.markets().is_empty() {
+                let response = exchange
+                    .call_raw(
+                        "public_post_info",
+                        vec![ccxt::Value::from_json(&json!({"type":"spotMeta"}))],
+                    )
+                    .await?;
+                let raw = response.to_json();
+                let mut cached = JsonMap::new();
+                for token in raw["tokens"].as_array().into_iter().flatten() {
+                    let Some(index) = token["index"].as_u64() else {
+                        continue;
+                    };
+                    let Some(name) = token["name"].as_str() else {
+                        continue;
+                    };
+                    cached.insert(index.to_string(), JsonValue::String(name.to_string()));
+                }
+                exchange.set_options(Params::new().with_json(
+                    "cachedCurrenciesById",
+                    &JsonValue::Object(cached).to_string(),
+                ));
+            }
+        }
         // Stock's fallible inherent method preserves acquisition errors rather
         // than presenting a failed load as an empty metadata snapshot.
         dispatch!(self, exchange => exchange.try_load_markets(reload).await)

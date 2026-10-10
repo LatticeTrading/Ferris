@@ -35,9 +35,15 @@ pub(in crate::exchanges::ccxt) async fn acquire(
     acquired: &mut Acquired,
     failures: &mut Vec<MarketStatsSourceFailure>,
 ) {
-    let venue = Venue::Hyperliquid;
     if params.include_bulk {
-        acquire_tickers(venue, HYPERLIQUID_TICKERS, provider, acquired, failures).await;
+        acquire_tickers(
+            Venue::Hyperliquid,
+            HYPERLIQUID_TICKERS,
+            provider,
+            acquired,
+            failures,
+        )
+        .await;
     }
 }
 
@@ -48,10 +54,11 @@ pub(in crate::exchanges::ccxt) fn observe(
 ) -> (MarketStatsField, Option<Instant>) {
     let base = entry.market.base.as_str();
     let quote = entry.market.quote.as_str();
-    let ticker = data.row(HYPERLIQUID_TICKERS, entry);
+    let source = HYPERLIQUID_TICKERS;
+    let ticker = data.row(source, entry);
     match name {
         MarketStatsFieldName::Funding => funding_field(
-            HYPERLIQUID_TICKERS,
+            source,
             ticker.row,
             ticker.error,
             ticker.receipt,
@@ -62,7 +69,7 @@ pub(in crate::exchanges::ccxt) fn observe(
             None,
         ),
         MarketStatsFieldName::MarkPrice => price_field(
-            HYPERLIQUID_TICKERS,
+            source,
             ticker.row,
             ticker.error,
             ticker.receipt,
@@ -71,7 +78,7 @@ pub(in crate::exchanges::ccxt) fn observe(
             quote,
         ),
         MarketStatsFieldName::IndexPrice => price_field(
-            HYPERLIQUID_TICKERS,
+            source,
             ticker.row,
             ticker.error,
             ticker.receipt,
@@ -80,25 +87,24 @@ pub(in crate::exchanges::ccxt) fn observe(
             quote,
         ),
         MarketStatsFieldName::Volume24h => volume_field(
-            HYPERLIQUID_TICKERS,
+            source,
             ticker.row,
             ticker.error,
             ticker.receipt,
-            // No base volume in the swap context; never derive it.
             "\u{0}base-not-provided",
             "dayNtlVlm",
         ),
         MarketStatsFieldName::OpenInterest => {
             let Some(row) = ticker.row else {
-                return missing_pair(HYPERLIQUID_TICKERS, ticker.error);
+                return missing_pair(source, ticker.error);
             };
             let info = get_value_k(row, "info");
             match nonneg_number(&get_value_k(&info, "openInterest")) {
-                Err(()) => invalid_pair(HYPERLIQUID_TICKERS, ticker.receipt),
-                Ok(None) => missing_pair(HYPERLIQUID_TICKERS, ticker.error),
+                Err(()) => invalid_pair(source, ticker.receipt),
+                Ok(None) => missing_pair(source, ticker.error),
                 Ok(Some(amount)) => (
                     observed(
-                        HYPERLIQUID_TICKERS,
+                        source,
                         MarketStatsValue::OpenInterest(OpenInterestValue {
                             open_interest_amount: Some(amount),
                             open_interest_value: None,
@@ -139,7 +145,6 @@ pub(in crate::exchanges::ccxt) const PROFILE: Profile = Profile {
     live: None,
     live_perp_fields: &[],
     limitations: &[
-        "primary-dex-only",
         "volume-quote-only",
         "open-interest-amount-is-base",
         "stock-ticker-last-is-midpoint",
@@ -159,9 +164,12 @@ pub(in crate::exchanges::ccxt) fn catalog_products(
 pub(in crate::exchanges::ccxt) fn normalize(
     scope: CatalogScope,
     _product: Option<UnifiedMarketType>,
-    _selectors: &Map<String, JsonValue>,
+    selectors: &Map<String, JsonValue>,
 ) -> JsonValue {
-    let mut params = json!({"dex":""});
+    let mut params = json!({});
+    if let Some(dex) = selectors.get("dex") {
+        params["dex"] = dex.clone();
+    }
     if scope == CatalogScope::Spot {
         params["type"] = json!("spot");
     }
@@ -172,11 +180,13 @@ pub(in crate::exchanges::ccxt) fn normalize(
 }
 
 pub(in crate::exchanges::ccxt) fn acquisition_params(params: &JsonValue) -> JsonValue {
-    params.clone()
-}
-
-pub(in crate::exchanges::ccxt) fn accepts_noop_param(key: &str, value: &JsonValue) -> bool {
-    key == "dex" && value.as_str() == Some("")
+    // DEX selection is a projection; all scopes share the combined ticker poll.
+    let mut params = params.clone();
+    params
+        .as_object_mut()
+        .expect("normalized statistics params")
+        .remove("dex");
+    params
 }
 
 pub(in crate::exchanges::ccxt) fn selection_matches(
@@ -184,13 +194,14 @@ pub(in crate::exchanges::ccxt) fn selection_matches(
     category: Option<&str>,
     dex: Option<&str>,
     _native_id: &str,
-    _params: &JsonValue,
+    params: &JsonValue,
 ) -> bool {
     category.is_none()
-        && if product == UnifiedMarketType::Perp {
-            dex == Some("")
-        } else {
-            dex.is_none()
+        && match (product, params.get("dex").and_then(JsonValue::as_str)) {
+            (UnifiedMarketType::Perp, Some(requested)) => dex == Some(requested),
+            (UnifiedMarketType::Perp, None) => dex.is_some(),
+            (UnifiedMarketType::Spot, None) => dex.is_none(),
+            _ => false,
         }
 }
 

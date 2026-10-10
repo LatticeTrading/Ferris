@@ -32,10 +32,8 @@ pub(in crate::exchanges::ccxt) fn configure(
     config: &Config,
     value: &mut JsonValue,
 ) -> Result<(), ExchangeError> {
-    // Stock parse_currency writes through &self with no UnsafeCell.
-    // Normal constructor configuration bypasses that optional loader;
-    // stock spot metadata itself supplies the native token names.
-    value["has"] = json!({"fetchCurrencies": false});
+    // HIP3 market parsing needs the stock currency cache for collateral names.
+    value["has"] = json!({"fetchCurrencies": true});
     let base = config.hyperliquid_base_url.trim_end_matches('/');
     let ws = if let Some(host) = base.strip_prefix("https://") {
         format!("wss://{host}/ws")
@@ -61,10 +59,28 @@ pub(in crate::exchanges::ccxt) fn market_types(
     scope: CatalogScope,
 ) -> Option<&'static [&'static str]> {
     match scope {
-        CatalogScope::Default => Some(&["swap", "spot"]),
+        CatalogScope::Default => Some(&["swap", "spot", "hip3"]),
         CatalogScope::Spot => Some(&["spot"]),
-        CatalogScope::Linear => Some(&["swap"]),
+        CatalogScope::Linear => Some(&["swap", "hip3"]),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{market_types, CatalogScope};
+
+    #[test]
+    fn default_and_linear_load_hip3_markets() {
+        assert_eq!(
+            market_types(CatalogScope::Default),
+            Some(&["swap", "spot", "hip3"][..])
+        );
+        assert_eq!(
+            market_types(CatalogScope::Linear),
+            Some(&["swap", "hip3"][..])
+        );
+        assert_eq!(market_types(CatalogScope::Spot), Some(&["spot"][..]));
     }
 }
 
