@@ -3,17 +3,14 @@
 use ccxt::{Params, Value};
 use serde_json::{json, Value as JsonValue};
 
-use crate::{
-    exchanges::{
-        ccxt::{
-            catalog::CatalogMarket,
-            rest::{params::integer_param, Operation},
-            venue::{exchange_error, Provider, Venue},
-            venues::shared_rest,
-        },
-        traits::ExchangeError,
+use crate::exchanges::{
+    ccxt::{
+        catalog::CatalogMarket,
+        rest::{params::integer_param, Operation},
+        venue::{exchange_error, Provider, Venue},
+        venues::shared_rest,
     },
-    models::UnifiedMarketType,
+    traits::ExchangeError,
 };
 
 const VENUE: Venue = Venue::Hyperliquid;
@@ -54,14 +51,11 @@ pub(in crate::exchanges::ccxt) async fn trades(
     _limit: i64,
     _params: Params,
 ) -> Result<Value, ExchangeError> {
-    // Unified fetch_trades is userFills, not public prints.
-    let coin = if market.market.market_type == UnifiedMarketType::Perp {
-        market.raw.get("baseName")
-    } else {
-        market.raw.get("id")
-    }
-    .and_then(JsonValue::as_str)
-    .ok_or_else(|| ExchangeError::UpstreamData("missing stock trade coin".into()))?;
+    // Unified fetch_trades is userFills, not public prints; recentTrades is the
+    // public tape. It takes only a coin and returns the newest prints, so the
+    // caller's since/until window is applied by the shared snapshot filter and
+    // the coin must be the catalog's native handle, never display text.
+    let coin = super::native_coin(market)?;
     let rows = provider
         .call(
             "public_post_info",
@@ -76,10 +70,15 @@ pub(in crate::exchanges::ccxt) async fn trades(
 
 pub(in crate::exchanges::ccxt) fn candle_params(
     market: &CatalogMarket,
-    input: &JsonValue,
+    _input: &JsonValue,
 ) -> Result<Params, ExchangeError> {
-    let params = shared_rest::candle_price(VENUE, market, input, false, false)?;
-    Ok(params)
+    // Hyperliquid's candleSnapshot `req` accepts only coin/interval/startTime/
+    // endTime; there is no price-source selector, and `allows` rejects `price`
+    // before this point. The coin and window are built by the stock method from
+    // the same native handle this validates, so a catalog row that no longer
+    // agrees with its loaded stock metadata is rejected before any request.
+    super::native_coin(market)?;
+    Ok(Params::none())
 }
 
 pub(in crate::exchanges::ccxt) async fn book(
@@ -88,6 +87,9 @@ pub(in crate::exchanges::ccxt) async fn book(
     limit: u64,
     input: &JsonValue,
 ) -> Result<Value, ExchangeError> {
+    // Stock builds the l2Book coin from `baseName` (perps) or the market id
+    // (spot); reject a catalog row that disagrees before requesting.
+    super::native_coin(market)?;
     let mut params = Params::none();
     let figures = integer_param(input, &["nSigFigs"])?;
     if let Some(figures) = figures {

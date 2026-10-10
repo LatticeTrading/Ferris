@@ -471,8 +471,87 @@ async fn hyperliquid_mixed_primary_and_hip3_scopes_share_http_and_ws_acquisition
         2,
         "all DEX projections share metadata and one ticker poll"
     );
-    for (mut socket, _) in sockets {
-        socket.close(None).await.unwrap();
+    let selected_request = json!({"marketIds":[xyz_id],"fields":["markPrice"]});
+    let mut selected_socket = stats_socket(&url).await;
+    ws_send(
+        &mut selected_socket,
+        stats_command("subscribe", &selected_request),
+    )
+    .await;
+    let mut selected_view = ws_initial(&mut selected_socket).await;
+    let original_generation = selected_view.generation.clone();
+
+    mock.hip3.write().await.body[1][0]["markPx"] = json!("62000");
+    tokio::time::sleep(Duration::from_secs(31)).await;
+    for (socket, view) in &mut sockets {
+        let delta = ws_delta(socket, view).await;
+        assert_eq!(delta["removedMarketIds"], json!([]));
+        if view.topic["params"]["dex"] != "" {
+            assert_eq!(
+                view.markets[&xyz_id]["fields"]["markPrice"]["value"]["amount"],
+                "62000"
+            );
+        } else {
+            assert!(!view.markets.contains_key(&xyz_id));
+        }
+    }
+    ws_delta(&mut selected_socket, &mut selected_view).await;
+    assert_eq!(
+        selected_view.markets[&xyz_id]["fields"]["markPrice"]["value"]["amount"],
+        "62000"
+    );
+    let primary_btc = native_id("BTC");
+    assert_eq!(
+        sockets[0].1.markets[&primary_btc],
+        sockets[1].1.markets[&primary_btc]
+    );
+    assert_ne!(
+        sockets[0].1.markets[&primary_btc]["fields"]["markPrice"]["value"]["amount"],
+        "62000"
+    );
+    ws_disconnect(selected_socket).await;
+    let mut selected_socket = stats_socket(&url).await;
+    ws_send(
+        &mut selected_socket,
+        stats_command("subscribe", &selected_request),
+    )
+    .await;
+    selected_view = ws_initial(&mut selected_socket).await;
+    assert_ne!(selected_view.generation, original_generation);
+    assert_eq!(
+        selected_view.markets[&xyz_id],
+        sockets[2].1.markets[&xyz_id]
+    );
+
+    // A removed HIP3 BTC must not tombstone primary BTC in their shared poll.
+    *mock.hip3.write().await = Reply::ok(json!([{"collateralToken":0,"universe":[]}, []]));
+    tokio::time::sleep(Duration::from_secs(31)).await;
+    for (socket, view) in &mut sockets {
+        let delta = ws_delta(socket, view).await;
+        let expected = if view.topic["params"]["dex"] == "" {
+            json!([])
+        } else {
+            json!([xyz_id])
+        };
+        assert_eq!(delta["removedMarketIds"], expected);
+        assert!(!view.markets.contains_key(&xyz_id));
+        assert_ws_matches_http(&client, &url, view).await;
+    }
+    let removed = ws_delta(&mut selected_socket, &mut selected_view).await;
+    assert_eq!(removed["removedMarketIds"], json!([xyz_id]));
+    assert_eq!(
+        sockets[0].1.markets[&primary_btc],
+        sockets[1].1.markets[&primary_btc]
+    );
+    assert_eq!(
+        sockets[1].1.markets[&primary_btc]["fields"]["markPrice"]["state"],
+        "available"
+    );
+    ws_unsubscribe(&mut selected_socket, &selected_view.topic).await;
+    ws_disconnect(selected_socket).await;
+    for (mut socket, view) in sockets {
+        ws_unsubscribe(&mut socket, &view.topic).await;
+        ws_disconnect(socket).await;
     }
     state.shutdown_market_stats().await;
     let _ = stop.send(());

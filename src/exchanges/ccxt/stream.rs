@@ -127,6 +127,14 @@ pub(super) async fn prepare_live(
             venues::dispatch!(venue, exchange => exchange::stream::candle_params(market, &topic.params, &mut params))?;
         }
     }
+    if venue == Venue::Hyperliquid {
+        venues::hyperliquid::stream::subscription_params(
+            market,
+            channel,
+            timeframe.as_deref(),
+            &mut params,
+        )?;
+    }
     let symbol = market.ccxt_symbol.clone();
     let candle_cache_key = venues::dispatch!(venue, exchange => exchange::stream::candle_cache_key(timeframe.as_deref(), &params));
     let mut spec = LiveSpec {

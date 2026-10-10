@@ -83,7 +83,16 @@ impl LiveProvider {
             Venue::Binance => Self::Binance(ccxt_pro::pro::binance::BinanceCore::new(config)),
             Venue::Bybit => Self::Bybit(ccxt_pro::pro::bybit::BybitCore::new(config)),
             Venue::Hyperliquid => {
-                Self::Hyperliquid(ccxt_pro::pro::hyperliquid::HyperliquidCore::new(config))
+                let mut core = ccxt_pro::pro::hyperliquid::HyperliquidCore::new(config);
+                if let Some(watch) = &spec.catalog {
+                    let snapshot = watch.load();
+                    for entry in snapshot.catalog.entries() {
+                        venues::hyperliquid::stream::index_market(&mut core, &entry.raw);
+                    }
+                } else {
+                    venues::hyperliquid::stream::index_market(&mut core, &spec.market);
+                }
+                Self::Hyperliquid(core)
             }
             Venue::Lighter => Self::Lighter(ccxt_pro::pro::lighter::LighterCore::new(config)),
             Venue::Aster => Self::Aster(ccxt_pro::pro::aster::AsterCore::new(config)),
@@ -178,6 +187,9 @@ impl LiveProvider {
                 core.set_markets(markets, &[]);
             }
         });
+        if let Self::Hyperliquid(core) = self {
+            venues::hyperliquid::stream::index_market(core, &spec.market);
+        }
         if let Self::Apex(core) = self {
             venues::apex::stream::index_market_ids(&mut core.core);
         }
@@ -187,6 +199,11 @@ impl LiveProvider {
     /// calls this when the shared catalog cell advances, so a newly listed
     /// market is parseable without restarting the shared URL.
     pub(in crate::exchanges::ccxt) fn add_catalog(&mut self, entries: &[CatalogMarket]) {
+        if let Self::Hyperliquid(core) = self {
+            for entry in entries {
+                venues::hyperliquid::stream::index_market(core, &entry.raw);
+            }
+        }
         dispatch!(self, core => {
             let mut markets = core.markets.clone();
             let mut changed = false;

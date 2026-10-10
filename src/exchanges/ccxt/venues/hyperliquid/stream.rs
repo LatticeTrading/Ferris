@@ -24,6 +24,62 @@ const VENUE: Venue = Venue::Hyperliquid;
 pub(in crate::exchanges::ccxt) const CANDLES: bool = true;
 pub(in crate::exchanges::ccxt) const UNWATCH_BOOK_LIMIT: bool = false;
 
+/// Seeding stock markets skips fetch_hip3_markets, which normally builds this
+/// parser lookup. Preserve its native coin -> unified base/collateral mapping;
+/// otherwise coin_to_market_id silently assumes USDC (also for unsubscribe ACKs).
+pub(in crate::exchanges::ccxt) fn index_market(
+    core: &mut ccxt_pro::pro::hyperliquid::HyperliquidCore,
+    market: &JsonValue,
+) {
+    if !market["info"]["dex"]
+        .as_str()
+        .is_some_and(|dex| !dex.is_empty())
+    {
+        return;
+    }
+    let coin = market["baseName"].as_str().expect("validated native coin");
+    let tokens = ccxt::runtime::get_value_mut(&mut core.options, &Value::from("hip3TokensByName"));
+    if tokens.is_null() {
+        *tokens = ccxt::Params::none().into_value_object();
+    }
+    if !ccxt::value::get_value_k(tokens, coin).is_null() {
+        return;
+    }
+    ccxt::set_value(
+        tokens,
+        &Value::from(coin),
+        ccxt::Params::none()
+            .with_str("code", market["base"].as_str().expect("catalog base"))
+            .with_str("quote", market["quote"].as_str().expect("catalog quote"))
+            .into_value_object(),
+    );
+}
+
+pub(in crate::exchanges::ccxt) fn subscription_params(
+    market: &CatalogMarket,
+    channel: RealtimeChannel,
+    timeframe: Option<&str>,
+    params: &mut JsonValue,
+) -> Result<(), ExchangeError> {
+    // Pro extends the request root, not the nested subscription. A root dex or
+    // coin would not select the HIP3 market. Use the catalog's native coin for
+    // both watch and unwatch; retain any book aggregation already prepared.
+    if !params["subscription"].is_object() {
+        params["subscription"] = json!({});
+    }
+    let subscription = &mut params["subscription"];
+    subscription["coin"] = json!(super::native_coin(market)?);
+    subscription["type"] = json!(match channel {
+        RealtimeChannel::Trades => "trades",
+        RealtimeChannel::OrderBook => "l2Book",
+        RealtimeChannel::Ohlcv => "candle",
+    });
+    if let Some(timeframe) = timeframe {
+        subscription["interval"] = json!(timeframe);
+    }
+    Ok(())
+}
+
 pub(in crate::exchanges::ccxt) fn allows(channel: RealtimeChannel, key: &str) -> bool {
     match key {
         "coin" => true,
@@ -40,7 +96,7 @@ pub(in crate::exchanges::ccxt) fn book_depth(
 }
 
 pub(in crate::exchanges::ccxt) fn book_params(
-    market: &CatalogMarket,
+    _market: &CatalogMarket,
     input: &JsonValue,
     params: &mut JsonValue,
 ) -> Result<(), ExchangeError> {
@@ -56,15 +112,12 @@ pub(in crate::exchanges::ccxt) fn book_params(
             "mantissa requires nSigFigs=5 and 1, 2, or 5".into(),
         ));
     }
-    // The stock watcher merges params at the request root. Its
-    // subscription object is the supported way to set aggregation.
-    if figures.is_some() {
-        params["subscription"] = json!({
-            "type": "l2Book",
-            "coin": if market.raw["swap"] == true { &market.raw["baseName"] } else { &market.raw["id"] },
-            "nSigFigs": figures,
-            "mantissa": mantissa,
-        });
+    // subscription_params supplies the native coin and channel afterward.
+    if let Some(figures) = figures {
+        params["subscription"] = json!({"nSigFigs": figures});
+        if let Some(mantissa) = mantissa {
+            params["subscription"]["mantissa"] = json!(mantissa);
+        }
     }
     Ok(())
 }
