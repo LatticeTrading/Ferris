@@ -42,7 +42,7 @@ Frontend apps (including Electron and web frontends) often cannot directly use s
   - `POST /v1/fetchOHLCV`
   - `POST /v1/fetchOrderBook`
   - `POST /v1/fetchMarkets`
-- `POST /v1/fetchMarketStats` (all ten venues; qualified products and numeric metric units below)
+- `POST /v1/fetchMarketStats` (all eleven venues; qualified products and numeric metric units below)
 - Capability discovery: `GET /v1/capabilities` (no upstream acquisition)
 - Realtime endpoint:
   - `GET /v1/ws` (channels `trades`, `orderbook`, `ohlcv`, `marketstats`)
@@ -50,7 +50,7 @@ Frontend apps (including Electron and web frontends) often cannot directly use s
   - `trades`: `hyperliquid`, `binance`, `bybit`, `aster`, `extended`, `lighterxyz`, `apex`, `bitfinex`, `kucoin`, `nado` (Nado production handshake blocked; see below)
   - `orderbook`: `hyperliquid`, `binance`, `bybit`, `aster`, `extended`, `lighterxyz`, `apex`, `bitfinex`, `kucoin`
   - `ohlcv`: `hyperliquid`, `binance`, `bybit`, `aster`, `extended`, `apex`, `bitfinex`, `kucoin`, `nado` (Nado production handshake blocked; see below)
-  - `marketstats`: `hyperliquid`, `binance`, `bybit`, `extended`, `aster`, `apex`, `bitfinex` (`sharedPolling`), `lighterxyz` (`sharedPollingAndWebSocket`), `kucoin`, `nado` (`sharedPolling`)
+  - `marketstats`: `hyperliquid`, `binance`, `bybit`, `extended`, `aster`, `apex`, `bitfinex` (`sharedPolling`), `lighterxyz` (`sharedPollingAndWebSocket`), `kucoin`, `nado` (`sharedPolling`), `variational` (`sharedPolling`)
 - exchange supported:
   - `hyperliquid` (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`, `fetchMarkets`, `fetchMarketStats`)
   - `binance` (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`, `fetchMarkets`, `fetchMarketStats`)
@@ -62,6 +62,7 @@ Frontend apps (including Electron and web frontends) often cannot directly use s
   - `bitfinex` spot and linear perpetuals: all five snapshot endpoints and all four realtime channels; see [Bitfinex support](#bitfinex-support)
   - `kucoin` spot and perpetuals: all five snapshot endpoints and all four realtime channels; see [KuCoin support](#kucoin-support)
   - `nado` spot and linear perpetuals: all five snapshot endpoints and polling-backed realtime marketstats; trade/candle stream adapters implemented, production WS blocked; live books rejected. See [Nado support](#nado-support).
+  - `variational` perpetual and swap listings: `fetchMarkets` and polling-backed `fetchMarketStats`; public trades, candles, and real order books are not available from Variational.
 - Extended accepts `BASE-USD`, `BASE/USD`, and `BASE/USD:USD`. REST and realtime trade/book symbols now use stock `BASE/USDC:USDC`; the catalog display pair remains `BASE/USD`.
 - Extended's standard websocket order book is indicative, not the RFQ real-book stream. Spot, private trading/account, funding history, and account streams are not supported.
 - Extended REST and websocket URLs are configurable for testnet deployments.

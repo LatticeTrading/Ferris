@@ -10,6 +10,7 @@ use ferris_market_data_backend::{
     exchanges::{
         ccxt::{CcxtExchange, CcxtService, Venue},
         registry::ExchangeRegistry,
+        variational::VariationalExchange,
     },
     realtime::RealtimeService,
     web::{self, AppState},
@@ -37,6 +38,9 @@ async fn main() -> anyhow::Result<()> {
     for venue in Venue::ALL {
         registry.register(Arc::new(CcxtExchange::new(venue, ccxt.clone())));
     }
+    registry.register(Arc::new(
+        VariationalExchange::new().context("failed to start Variational adapter")?,
+    ));
 
     let realtime = RealtimeService::new(ccxt.clone());
 

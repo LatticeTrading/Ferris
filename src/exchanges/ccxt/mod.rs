@@ -26,6 +26,7 @@ use crate::models::{
 };
 use async_trait::async_trait;
 use rest::{SnapshotRequest, SnapshotResponse};
+use serde_json::Value;
 
 pub struct CcxtExchange {
     venue: Venue,
@@ -103,6 +104,37 @@ impl MarketDataExchange for CcxtExchange {
 
 #[async_trait]
 impl MarketStatsSource for CcxtExchange {
+    fn normalize_params(&self, input: &Value) -> Result<Value, ExchangeError> {
+        statistics_profile::normalize_params(self.venue, input)
+    }
+
+    fn acquisition_params(&self, params: &Value) -> Value {
+        statistics_profile::acquisition_params(self.venue, params)
+    }
+
+    fn catalog_source(&self) -> &'static str {
+        statistics_profile::catalog_source(self.venue)
+    }
+
+    fn catalog_products(&self, params: &Value) -> &'static [crate::models::UnifiedMarketType] {
+        statistics_profile::catalog_products(
+            self.venue,
+            statistics_profile::scope(self.venue, params)
+                .unwrap_or(crate::exchanges::ccxt::CatalogScope::Default),
+        )
+    }
+
+    fn selection_matches(
+        &self,
+        product: crate::models::UnifiedMarketType,
+        category: Option<&str>,
+        dex: Option<&str>,
+        native_id: &str,
+        params: &Value,
+    ) -> bool {
+        statistics_profile::selection_matches(self.venue, product, category, dex, native_id, params)
+    }
+
     fn capabilities(&self) -> MarketStatsCapabilities {
         statistics_profile::capabilities(self.venue)
     }

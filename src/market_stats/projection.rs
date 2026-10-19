@@ -30,7 +30,92 @@ use statistics_profile::STALE_AFTER;
 fn catalog_source(exchange: &str, _product: UnifiedMarketType, _params: &Value) -> &'static str {
     Venue::from_public_id(exchange)
         .map(statistics_profile::catalog_source)
-        .unwrap_or("ccxt:loadMarkets")
+        .unwrap_or(match exchange {
+            "variational" => "variational:metadata/v2/stats",
+            _ => "ccxt:loadMarkets",
+        })
+}
+
+/// Native sources use the same topic contract as CCXT, but provide their own
+/// parameter and identity policy instead of being added to `Venue`.
+pub fn normalize_topic_for_source(
+    request: FetchMarketStatsRequest,
+    source: &dyn crate::exchanges::traits::MarketStatsSource,
+) -> Result<MarketStatsTopic, ApiError> {
+    let exchange = request.exchange.trim().to_ascii_lowercase();
+    let params = source
+        .normalize_params(&request.params)
+        .map_err(|error| ApiError::Validation(error.to_string()))?;
+    let market_ids = match request.market_ids {
+        Some(mut ids) => {
+            if ids.is_empty() || ids.len() > 100 {
+                return Err(ApiError::Validation(
+                    "marketIds must contain between 1 and 100 IDs".into(),
+                ));
+            }
+            for id in &ids {
+                market_id_type_for_source(id, &exchange, &params, source)?;
+            }
+            ids.sort_unstable();
+            ids.dedup();
+            Some(ids)
+        }
+        None => None,
+    };
+    let mut fields = request
+        .fields
+        .unwrap_or_else(|| vec![MarketStatsFieldName::Funding]);
+    if fields.is_empty() {
+        return Err(ApiError::Validation("fields must not be empty".into()));
+    }
+    fields.sort_unstable();
+    fields.dedup();
+    Ok(MarketStatsTopic {
+        exchange,
+        params,
+        market_ids,
+        fields,
+    })
+}
+
+fn market_id_type_for_source(
+    id: &str,
+    exchange: &str,
+    params: &Value,
+    source: &dyn crate::exchanges::traits::MarketStatsSource,
+) -> Result<UnifiedMarketType, ApiError> {
+    let invalid = || ApiError::Validation(format!("invalid marketId: {id}"));
+    let (id_exchange, product, category, dex, native_id): (
+        String,
+        UnifiedMarketType,
+        Option<String>,
+        Option<String>,
+        String,
+    ) = serde_json::from_str(id).map_err(|_| invalid())?;
+    if id_exchange != exchange
+        || native_id.is_empty()
+        || !source.catalog_products(params).contains(&product)
+        || !source.selection_matches(
+            product,
+            category.as_deref(),
+            dex.as_deref(),
+            &native_id,
+            params,
+        )
+    {
+        return Err(invalid());
+    }
+    let canonical = make_market_id(
+        exchange,
+        product,
+        category.as_deref(),
+        dex.as_deref(),
+        &native_id,
+    )?;
+    if canonical != id {
+        return Err(invalid());
+    }
+    Ok(product)
 }
 
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
@@ -115,6 +200,28 @@ fn market_id_type(id: &str, exchange: &str, params: &Value) -> Result<UnifiedMar
         return Err(invalid());
     }
     Ok(product)
+}
+
+pub fn validate_selection_for_source(
+    topic: &MarketStatsTopic,
+    snapshot: &MarketStatsSourceSnapshot,
+    source: &dyn crate::exchanges::traits::MarketStatsSource,
+) -> Result<(), ApiError> {
+    let Some(ids) = &topic.market_ids else {
+        return Ok(());
+    };
+    let known: HashSet<&str> = snapshot.rows.iter().filter_map(row_id).collect();
+    for id in ids {
+        let product = market_id_type_for_source(id, &topic.exchange, &topic.params, source)?;
+        if known.contains(id.as_str()) {
+            continue;
+        }
+        if snapshot.complete_catalogs.contains(&product) {
+            return Err(ApiError::Validation(format!("unknown marketId: {id}")));
+        }
+        return Err(incomplete_catalog_error(snapshot, source.catalog_source()));
+    }
+    Ok(())
 }
 
 pub fn validate_selection(

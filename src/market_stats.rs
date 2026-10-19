@@ -195,7 +195,14 @@ impl MarketStatsCoordinator {
                 request.exchange
             )));
         }
-        normalize_topic(request)
+        let source = exchange
+            .market_stats_source()
+            .expect("source checked above");
+        if Venue::from_public_id(&request.exchange).is_some() {
+            normalize_topic(request)
+        } else {
+            projection::normalize_topic_for_source(request, source)
+        }
     }
 
     pub async fn snapshot(
@@ -232,12 +239,22 @@ impl MarketStatsCoordinator {
         ),
         ApiError,
     > {
-        let venue = Venue::from_public_id(&topic.exchange)
+        let exchange = self
+            .inner
+            .registry
+            .get(&topic.exchange)
             .ok_or_else(|| ApiError::UnsupportedExchange(topic.exchange.clone()))?;
-        let params = statistics_profile::acquisition_params(venue, &topic.params);
+        let params = exchange
+            .market_stats_source()
+            .ok_or_else(|| {
+                ApiError::UnsupportedFeature("market statistics are not implemented".into())
+            })?
+            .acquisition_params(&topic.params);
+        let venue = Venue::from_public_id(&topic.exchange);
         let acquisition_key = serde_json::to_string(&(&topic.exchange, &params))
             .map_err(|error| ApiError::Exchange(ExchangeError::Internal(error.to_string())))?;
-        let interest_ids = if statistics_profile::selected_open_interest(venue).is_some()
+        let interest_ids = if venue
+            .is_some_and(|venue| statistics_profile::selected_open_interest(venue).is_some())
             && topic.fields.contains(&MarketStatsFieldName::OpenInterest)
         {
             topic
@@ -248,11 +265,6 @@ impl MarketStatsCoordinator {
             Vec::new()
         };
         let projection_key = projection_key(topic)?;
-        let exchange = self
-            .inner
-            .registry
-            .get(&topic.exchange)
-            .ok_or_else(|| ApiError::UnsupportedExchange(topic.exchange.clone()))?;
         let mut shutdown = self.inner.shutdown.subscribe();
         let mut receiver = {
             let mut state = self.inner.state.lock().await;
@@ -317,7 +329,12 @@ impl MarketStatsCoordinator {
                 let epoch = source.epoch;
                 let wake = source.wake.clone();
                 source.worker = Some(tokio::spawn(run_source(
-                    inner, key, epoch, exchange, params, wake,
+                    inner,
+                    key,
+                    epoch,
+                    exchange.clone(),
+                    params,
+                    wake,
                 )));
             }
             source.wake.notify_one();
@@ -343,7 +360,14 @@ impl MarketStatsCoordinator {
                     source.latest.send_replace(Arc::new(expired));
                 }
                 let latest = source.latest.borrow().clone();
-                let valid = validate_selection(topic, &latest);
+                let valid = if venue.is_some() {
+                    validate_selection(topic, &latest)
+                } else {
+                    let source = exchange
+                        .market_stats_source()
+                        .expect("statistics source disappeared");
+                    projection::validate_selection_for_source(topic, &latest, source)
+                };
                 if valid.is_ok()
                     && interest_ids.iter().any(|id| {
                         source
