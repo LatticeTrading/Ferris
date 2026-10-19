@@ -149,7 +149,7 @@ pub(in crate::exchanges::ccxt) fn slots(
     let slots = field(&core.options, &["streamLimits", binance_kind(spec)])
         .as_i64()
         .and_then(|slots| usize::try_from(slots).ok());
-    if !slots.is_some_and(|slots| slots > 0) {
+    if slots.is_none_or(|slots| slots <= 0) {
         return Err(ExchangeError::Internal(
             "invalid stock Binance stream allocator".into(),
         ));

@@ -207,6 +207,10 @@ impl MarketDataExchange for FakeExchange {
         self.venue
     }
 
+    fn capabilities(&self) -> crate::models::ExchangeDataCapabilities {
+        crate::models::ExchangeDataCapabilities::unsupported()
+    }
+
     fn market_stats_source(&self) -> Option<&dyn MarketStatsSource> {
         Some(self)
     }

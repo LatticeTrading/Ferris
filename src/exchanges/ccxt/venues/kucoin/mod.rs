@@ -23,6 +23,16 @@ pub(in crate::exchanges::ccxt) mod rest;
 pub(in crate::exchanges::ccxt) mod statistics;
 pub(in crate::exchanges::ccxt) mod stream;
 
+pub(in crate::exchanges::ccxt) fn capabilities() -> crate::models::ExchangeDataCapabilities {
+    super::super::capabilities::for_venue(
+        statistics::PROFILE.products,
+        true,
+        true,
+        true,
+        crate::models::RealtimeMode::Polling,
+    )
+}
+
 pub(in crate::exchanges::ccxt) fn api(config: &Config) -> Result<JsonValue, ExchangeError> {
     let spot = config.kucoin_rest_base_url.trim_end_matches('/');
     let futures = config.kucoin_futures_rest_base_url.trim_end_matches('/');

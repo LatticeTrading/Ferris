@@ -19,6 +19,29 @@ pub(in crate::exchanges::ccxt) mod rest;
 pub(in crate::exchanges::ccxt) mod statistics;
 pub(in crate::exchanges::ccxt) mod stream;
 
+pub(in crate::exchanges::ccxt) fn capabilities() -> crate::models::ExchangeDataCapabilities {
+    let mut capabilities = super::super::capabilities::for_venue(
+        statistics::PROFILE.products,
+        true,
+        false,
+        true,
+        crate::models::RealtimeMode::Polling,
+    );
+    capabilities.realtime.trades = crate::models::RealtimeCapability::unsupported(
+        crate::models::CapabilityReason::UpstreamTransportUnavailable,
+        "Nado production websocket transport requires unsupported permessage-deflate",
+    );
+    capabilities.realtime.orderbook = crate::models::RealtimeCapability::unsupported(
+        crate::models::CapabilityReason::AdapterNotImplemented,
+        "Nado live books require snapshot/delta synchronization absent from the pinned CCXT adapter",
+    );
+    capabilities.realtime.ohlcv = crate::models::RealtimeCapability::unsupported(
+        crate::models::CapabilityReason::UpstreamTransportUnavailable,
+        "Nado production websocket transport requires unsupported permessage-deflate",
+    );
+    capabilities
+}
+
 pub(in crate::exchanges::ccxt) fn api(config: &Config) -> Result<JsonValue, ExchangeError> {
     let gateway = config.nado_gateway_base_url.trim_end_matches('/');
     let archive = config.nado_archive_base_url.trim_end_matches('/');

@@ -495,16 +495,179 @@ pub struct CapabilitiesResponse {
 #[serde(rename_all = "camelCase")]
 pub struct ExchangeCapabilities {
     pub exchange: String,
+    pub features: ExchangeDataCapabilities,
     pub market_stats: MarketStatsCapabilities,
     pub funding_rate_history: FeatureCapability,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExchangeDataCapabilities {
+    pub fetch_markets: DataCapability,
+    pub fetch_trades: DataCapability,
+    pub fetch_ohlcv: DataCapability,
+    pub fetch_order_book: DataCapability,
+    pub fetch_market_stats: DataCapability,
+    pub realtime: RealtimeCapabilities,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RealtimeCapabilities {
+    pub trades: RealtimeCapability,
+    pub orderbook: RealtimeCapability,
+    pub ohlcv: RealtimeCapability,
+    pub marketstats: RealtimeCapability,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DataCapability {
+    pub state: CapabilityState,
+    pub reason: Option<CapabilityReason>,
+    pub message: Option<String>,
+    pub supported_products: Vec<UnifiedMarketType>,
+    pub market_scope: MarketScope,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RealtimeCapability {
+    pub state: CapabilityState,
+    pub reason: Option<CapabilityReason>,
+    pub message: Option<String>,
+    pub supported_products: Vec<UnifiedMarketType>,
+    pub market_scope: MarketScope,
+    pub mode: Option<RealtimeMode>,
+    pub poll_interval_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityReason {
+    AdapterNotImplemented,
+    VenueDataUnavailable,
+    UnsupportedProduct,
+    UnsupportedMarketScope,
+    IndicativeQuotesOnly,
+    UpstreamTransportUnavailable,
+    UpstreamWebsocketUnavailable,
+    RequiresAuthentication,
+    NotApplicable,
+    PartialSupport,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MarketScope {
+    Catalog,
+    AllMarkets,
+    SelectedMarkets,
+    MarketSpecific,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RealtimeMode {
+    Polling,
+    Websocket,
+    Hybrid,
+}
+
+impl DataCapability {
+    pub fn supported(products: Vec<UnifiedMarketType>, market_scope: MarketScope) -> Self {
+        Self {
+            state: CapabilityState::Supported,
+            reason: None,
+            message: None,
+            supported_products: products,
+            market_scope,
+        }
+    }
+
+    pub fn unsupported(reason: CapabilityReason, message: impl Into<String>) -> Self {
+        Self {
+            state: CapabilityState::Unsupported,
+            reason: Some(reason),
+            message: Some(message.into()),
+            supported_products: Vec::new(),
+            market_scope: MarketScope::MarketSpecific,
+        }
+    }
+}
+
+impl RealtimeCapability {
+    pub fn supported(
+        products: Vec<UnifiedMarketType>,
+        market_scope: MarketScope,
+        mode: RealtimeMode,
+        poll_interval_ms: Option<u64>,
+    ) -> Self {
+        Self {
+            state: CapabilityState::Supported,
+            reason: None,
+            message: None,
+            supported_products: products,
+            market_scope,
+            mode: Some(mode),
+            poll_interval_ms,
+        }
+    }
+
+    pub fn unsupported(reason: CapabilityReason, message: impl Into<String>) -> Self {
+        Self {
+            state: CapabilityState::Unsupported,
+            reason: Some(reason),
+            message: Some(message.into()),
+            supported_products: Vec::new(),
+            market_scope: MarketScope::MarketSpecific,
+            mode: None,
+            poll_interval_ms: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum CapabilityState {
     Supported,
+    Partial,
     Unsupported,
     NotApplicable,
+}
+
+impl ExchangeDataCapabilities {
+    pub fn unsupported() -> Self {
+        let unsupported = || DataCapability {
+            state: CapabilityState::Unsupported,
+            reason: Some(CapabilityReason::AdapterNotImplemented),
+            message: Some("operation is not implemented by this adapter".into()),
+            supported_products: Vec::new(),
+            market_scope: MarketScope::MarketSpecific,
+        };
+        let realtime = || RealtimeCapability {
+            state: CapabilityState::Unsupported,
+            reason: Some(CapabilityReason::AdapterNotImplemented),
+            message: Some("realtime operation is not implemented by this adapter".into()),
+            supported_products: Vec::new(),
+            market_scope: MarketScope::MarketSpecific,
+            mode: None,
+            poll_interval_ms: None,
+        };
+        Self {
+            fetch_markets: unsupported(),
+            fetch_trades: unsupported(),
+            fetch_ohlcv: unsupported(),
+            fetch_order_book: unsupported(),
+            fetch_market_stats: unsupported(),
+            realtime: RealtimeCapabilities {
+                trades: realtime(),
+                orderbook: realtime(),
+                ohlcv: realtime(),
+                marketstats: realtime(),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

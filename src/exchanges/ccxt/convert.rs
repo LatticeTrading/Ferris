@@ -43,10 +43,10 @@ pub(super) fn convert_market(
 
     // Venue naming policy may distinguish native display and unified assets.
     let display_quote =
-        super::venues::dispatch!(venue, exchange => exchange::display_quote(&raw_info, &quote));
+        super::venues::dispatch!(venue, exchange => exchange::display_quote(raw_info, &quote));
     let display_symbol = format!("{base}/{display_quote}");
 
-    let identity = build_identity(venue, market, market_type, &raw_info)?;
+    let identity = build_identity(venue, market, market_type, raw_info)?;
 
     // Policies interpret loaded metadata, but cannot patch identity or bypass
     // shared numeric validation. Apex suppresses stock's order-minimum multiplier.
@@ -68,9 +68,9 @@ pub(super) fn convert_market(
         contract_size,
         info: UnifiedMarketInfo {
             category: venue_category(venue, market),
-            raw_symbol: Some(raw_symbol(venue, market, &raw_info)),
+            raw_symbol: Some(raw_symbol(venue, market, raw_info)),
             exchange_symbol: Some(exchange_market_id),
-            is_rfq: json_bool(&raw_info, "isRfq"),
+            is_rfq: json_bool(raw_info, "isRfq"),
             is_off_hours: json_bool(raw_info, "isOffHours"),
         },
         identity: Some(identity),

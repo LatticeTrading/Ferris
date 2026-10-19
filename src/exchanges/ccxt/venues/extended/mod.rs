@@ -21,6 +21,16 @@ pub(in crate::exchanges::ccxt) mod rest;
 pub(in crate::exchanges::ccxt) mod statistics;
 pub(in crate::exchanges::ccxt) mod stream;
 
+pub(in crate::exchanges::ccxt) fn capabilities() -> crate::models::ExchangeDataCapabilities {
+    super::super::capabilities::for_venue(
+        statistics::PROFILE.products,
+        false,
+        false,
+        false,
+        crate::models::RealtimeMode::Polling,
+    )
+}
+
 pub(in crate::exchanges::ccxt) fn api(config: &Config) -> Result<JsonValue, ExchangeError> {
     Ok({
         // Ferris config includes /api/v1; stock signing adds /api/{version}.

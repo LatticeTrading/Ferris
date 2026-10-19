@@ -31,9 +31,9 @@ pub(in crate::exchanges::ccxt) fn index_market(
     core: &mut ccxt_pro::pro::hyperliquid::HyperliquidCore,
     market: &JsonValue,
 ) {
-    if !market["info"]["dex"]
+    if market["info"]["dex"]
         .as_str()
-        .is_some_and(|dex| !dex.is_empty())
+        .is_none_or(|dex| dex.is_empty())
     {
         return;
     }

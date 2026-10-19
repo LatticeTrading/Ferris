@@ -23,6 +23,21 @@ pub(in crate::exchanges::ccxt) mod rest;
 pub(in crate::exchanges::ccxt) mod statistics;
 pub(in crate::exchanges::ccxt) mod stream;
 
+pub(in crate::exchanges::ccxt) fn capabilities() -> crate::models::ExchangeDataCapabilities {
+    let mut capabilities = super::super::capabilities::for_venue(
+        statistics::PROFILE.products,
+        true,
+        true,
+        false,
+        crate::models::RealtimeMode::Hybrid,
+    );
+    capabilities.realtime.ohlcv = crate::models::RealtimeCapability::unsupported(
+        crate::models::CapabilityReason::AdapterNotImplemented,
+        "the pinned CCXT Pro adapter has no candle watcher for Lighter",
+    );
+    capabilities
+}
+
 pub(in crate::exchanges::ccxt) fn api(config: &Config) -> Result<JsonValue, ExchangeError> {
     Ok(json!({
         "root": config.lighter_rest_base_url,

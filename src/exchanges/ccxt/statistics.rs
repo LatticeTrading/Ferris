@@ -176,7 +176,7 @@ pub(in crate::exchanges::ccxt) fn build_fields(
                 ),
                 None,
             ),
-            CapabilityState::Supported => {
+            CapabilityState::Partial | CapabilityState::Supported => {
                 let profile = venues::statistics_profile(venue);
                 if (!bulk
                     && !(name == MarketStatsFieldName::OpenInterest

@@ -70,6 +70,10 @@ pub(super) fn statistics_profile(venue: Venue) -> &'static Profile {
     dispatch!(venue, exchange => &exchange::statistics::PROFILE)
 }
 
+pub(super) fn data_capabilities(venue: Venue) -> crate::models::ExchangeDataCapabilities {
+    dispatch!(venue, exchange => exchange::capabilities())
+}
+
 fn scope_error(venue: Venue, scope: CatalogScope) -> ExchangeError {
     ExchangeError::BadSymbol(format!(
         "{} has no qualified {scope:?} catalog profile",

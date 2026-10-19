@@ -17,13 +17,14 @@ use crate::{
     exchanges::traits::{ExchangeError, MarketDataExchange, MarketStatsSource},
     market_stats::{make_market_id, MarketStatsSourceSnapshot},
     models::{
-        CapabilityState, CcxtOhlcv, CcxtOrderBook, CcxtTrade, FeatureCapability,
-        FetchMarketStatsParams, FetchMarketsParams, FetchOhlcvParams, FetchOrderBookParams,
-        FetchTradesParams, FundingKind, FundingRateUnit, FundingValue,
-        MarketStatsAllMarketsCapability, MarketStatsCapabilities, MarketStatsField,
-        MarketStatsFieldName, MarketStatsFieldState, MarketStatsRow, MarketStatsScope,
-        MarketStatsSelectedMarketsCapability, MarketStatsSupportedCapabilities, MarketStatsValue,
-        MarketStatsWsCapability, OpenInterestValue, PriceValue, UnifiedMarket, UnifiedMarketInfo,
+        CapabilityReason, CapabilityState, CcxtOhlcv, CcxtOrderBook, CcxtTrade, DataCapability,
+        ExchangeDataCapabilities, FeatureCapability, FetchMarketStatsParams, FetchMarketsParams,
+        FetchOhlcvParams, FetchOrderBookParams, FetchTradesParams, FundingKind, FundingRateUnit,
+        FundingValue, MarketScope, MarketStatsAllMarketsCapability, MarketStatsCapabilities,
+        MarketStatsField, MarketStatsFieldName, MarketStatsFieldState, MarketStatsRow,
+        MarketStatsScope, MarketStatsSelectedMarketsCapability, MarketStatsSupportedCapabilities,
+        MarketStatsValue, MarketStatsWsCapability, OpenInterestValue, PriceValue,
+        RealtimeCapabilities, RealtimeCapability, RealtimeMode, UnifiedMarket, UnifiedMarketInfo,
         UnifiedMarketType, Volume24hValue,
     },
 };
@@ -128,6 +129,49 @@ impl VariationalExchange {
 impl MarketDataExchange for VariationalExchange {
     fn id(&self) -> &'static str {
         "variational"
+    }
+
+    fn capabilities(&self) -> ExchangeDataCapabilities {
+        let products = vec![UnifiedMarketType::Perp];
+        ExchangeDataCapabilities {
+            fetch_markets: DataCapability::supported(products.clone(), MarketScope::Catalog),
+            fetch_trades: DataCapability::unsupported(
+                CapabilityReason::VenueDataUnavailable,
+                "Variational does not expose public trade history",
+            ),
+            fetch_ohlcv: DataCapability::unsupported(
+                CapabilityReason::VenueDataUnavailable,
+                "Variational does not expose public candles",
+            ),
+            fetch_order_book: DataCapability::unsupported(
+                CapabilityReason::IndicativeQuotesOnly,
+                "Variational exposes indicative quote tiers, not an L2 order book",
+            ),
+            fetch_market_stats: DataCapability::supported(
+                products.clone(),
+                MarketScope::AllMarkets,
+            ),
+            realtime: RealtimeCapabilities {
+                trades: RealtimeCapability::unsupported(
+                    CapabilityReason::VenueDataUnavailable,
+                    "Variational does not expose public realtime trades",
+                ),
+                orderbook: RealtimeCapability::unsupported(
+                    CapabilityReason::IndicativeQuotesOnly,
+                    "Variational does not expose a realtime L2 order book",
+                ),
+                ohlcv: RealtimeCapability::unsupported(
+                    CapabilityReason::VenueDataUnavailable,
+                    "Variational does not expose public realtime candles",
+                ),
+                marketstats: RealtimeCapability::supported(
+                    products,
+                    MarketScope::AllMarkets,
+                    RealtimeMode::Polling,
+                    Some(POLL_INTERVAL.as_millis() as u64),
+                ),
+            },
+        }
     }
 
     fn market_stats_source(&self) -> Option<&dyn MarketStatsSource> {

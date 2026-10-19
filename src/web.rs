@@ -269,6 +269,7 @@ pub async fn capabilities(State(state): State<AppState>) -> Json<CapabilitiesRes
                 });
             Some(ExchangeCapabilities {
                 exchange: id.to_string(),
+                features: exchange.capabilities(),
                 market_stats,
                 funding_rate_history: FeatureCapability {
                     state: CapabilityState::Unsupported,
@@ -1225,7 +1226,7 @@ fn send_ws_json<T: Serialize>(outgoing_sender: &Sender<Message>, payload: &T) ->
         }
     };
 
-    match outgoing_sender.try_send(Message::Text(encoded.into())) {
+    match outgoing_sender.try_send(Message::Text(encoded)) {
         Ok(()) => true,
         Err(TrySendError::Full(_)) => {
             warn!("closing websocket client: outgoing queue is full");

@@ -3,9 +3,9 @@ use serde_json::Value;
 
 use crate::market_stats::MarketStatsSourceSnapshot;
 use crate::models::{
-    CcxtOhlcv, CcxtOrderBook, CcxtTrade, FetchMarketStatsParams, FetchMarketsParams,
-    FetchOhlcvParams, FetchOrderBookParams, FetchTradesParams, MarketStatsCapabilities,
-    UnifiedMarket,
+    CcxtOhlcv, CcxtOrderBook, CcxtTrade, ExchangeDataCapabilities, FetchMarketStatsParams,
+    FetchMarketsParams, FetchOhlcvParams, FetchOrderBookParams, FetchTradesParams,
+    MarketStatsCapabilities, UnifiedMarket,
 };
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -77,6 +77,8 @@ pub trait MarketStatsSource: Send + Sync {
 #[async_trait]
 pub trait MarketDataExchange: Send + Sync {
     fn id(&self) -> &'static str;
+
+    fn capabilities(&self) -> ExchangeDataCapabilities;
 
     fn market_stats_source(&self) -> Option<&dyn MarketStatsSource> {
         None

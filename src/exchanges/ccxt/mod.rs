@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+mod capabilities;
 mod catalog;
 mod convert;
 mod live;
@@ -43,6 +44,10 @@ impl CcxtExchange {
 impl MarketDataExchange for CcxtExchange {
     fn id(&self) -> &'static str {
         self.venue.public_id()
+    }
+
+    fn capabilities(&self) -> crate::models::ExchangeDataCapabilities {
+        venues::data_capabilities(self.venue)
     }
 
     fn market_stats_source(&self) -> Option<&dyn MarketStatsSource> {
