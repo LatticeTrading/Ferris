@@ -21,9 +21,9 @@ pub use venue::{CatalogScope, Venue};
 
 use crate::exchanges::traits::{ExchangeError, MarketDataExchange, MarketStatsSource};
 use crate::models::{
-    CcxtOhlcv, CcxtOrderBook, CcxtTrade, FetchMarketStatsParams, FetchMarketsParams,
-    FetchOhlcvParams, FetchOrderBookParams, FetchTradesParams, MarketStatsCapabilities,
-    UnifiedMarket,
+    CcxtOhlcv, CcxtOrderBook, CcxtTicker, CcxtTrade, FetchMarketStatsParams, FetchMarketsParams,
+    FetchOhlcvParams, FetchOrderBookParams, FetchTickersParams, FetchTradesParams,
+    MarketStatsCapabilities, UnifiedMarket,
 };
 use async_trait::async_trait;
 use rest::{SnapshotRequest, SnapshotResponse};
@@ -104,6 +104,14 @@ impl MarketDataExchange for CcxtExchange {
             SnapshotResponse::Book(book) => Ok(book),
             _ => unreachable!("owner returns the requested snapshot variant"),
         }
+    }
+    async fn fetch_tickers(
+        &self,
+        _params: FetchTickersParams,
+    ) -> Result<Vec<CcxtTicker>, ExchangeError> {
+        Err(ExchangeError::UnsupportedFeature(
+            "fetchTickers is not exposed by the native facade for stock CCXT venues".into(),
+        ))
     }
 }
 

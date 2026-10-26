@@ -80,7 +80,6 @@ impl FetchTradesRequest {
         }
     }
 }
-
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FetchOhlcvRequest {
@@ -110,6 +109,31 @@ impl FetchOhlcvRequest {
             timeframe: self.timeframe,
             since: self.since,
             limit: self.limit,
+            params: self.params,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FetchTickersRequest {
+    #[serde(default = "default_exchange")]
+    pub exchange: String,
+    pub symbols: Option<Vec<String>>,
+    #[serde(default)]
+    pub params: Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct FetchTickersParams {
+    pub symbols: Option<Vec<String>>,
+    pub params: Value,
+}
+
+impl FetchTickersRequest {
+    pub fn into_params(self) -> FetchTickersParams {
+        FetchTickersParams {
+            symbols: self.symbols,
             params: self.params,
         }
     }
@@ -162,6 +186,30 @@ pub struct CcxtTrade {
     pub fee: Option<CcxtFee>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CcxtTicker {
+    pub info: Value,
+    pub symbol: String,
+    pub timestamp: Option<u64>,
+    pub datetime: Option<String>,
+    pub high: Option<f64>,
+    pub low: Option<f64>,
+    pub bid: Option<f64>,
+    pub bid_volume: Option<f64>,
+    pub ask: Option<f64>,
+    pub ask_volume: Option<f64>,
+    pub vwap: Option<f64>,
+    pub open: Option<f64>,
+    pub close: Option<f64>,
+    pub last: Option<f64>,
+    pub previous_close: Option<f64>,
+    pub change: Option<f64>,
+    pub percentage: Option<f64>,
+    pub average: Option<f64>,
+    pub base_volume: Option<f64>,
+    pub quote_volume: Option<f64>,
+}
 #[derive(Debug, Clone, Serialize)]
 pub struct CcxtFee {
     pub currency: Option<String>,
@@ -504,6 +552,7 @@ pub struct ExchangeCapabilities {
 #[serde(rename_all = "camelCase")]
 pub struct ExchangeDataCapabilities {
     pub fetch_markets: DataCapability,
+    pub fetch_tickers: DataCapability,
     pub fetch_trades: DataCapability,
     pub fetch_ohlcv: DataCapability,
     pub fetch_order_book: DataCapability,
@@ -656,6 +705,7 @@ impl ExchangeDataCapabilities {
         };
         Self {
             fetch_markets: unsupported(),
+            fetch_tickers: unsupported(),
             fetch_trades: unsupported(),
             fetch_ohlcv: unsupported(),
             fetch_order_book: unsupported(),

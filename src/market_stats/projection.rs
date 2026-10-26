@@ -31,6 +31,7 @@ fn catalog_source(exchange: &str, _product: UnifiedMarketType, _params: &Value) 
     Venue::from_public_id(exchange)
         .map(statistics_profile::catalog_source)
         .unwrap_or(match exchange {
+            "phoenix" => "phoenix:v1/view/exchange/markets",
             "variational" => "variational:metadata/v2/stats",
             _ => "ccxt:loadMarkets",
         })

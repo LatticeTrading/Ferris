@@ -11,7 +11,11 @@ use std::{
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::{sync::Mutex, time::Instant};
+use tokio::{
+    sync::Mutex,
+    time::{sleep, Instant},
+};
+use tracing::warn;
 
 use crate::{
     exchanges::traits::{ExchangeError, MarketDataExchange, MarketStatsSource},
@@ -22,10 +26,10 @@ use crate::{
         FetchOhlcvParams, FetchOrderBookParams, FetchTradesParams, FundingKind, FundingRateUnit,
         FundingValue, MarketScope, MarketStatsAllMarketsCapability, MarketStatsCapabilities,
         MarketStatsField, MarketStatsFieldName, MarketStatsFieldState, MarketStatsRow,
-        MarketStatsScope, MarketStatsSelectedMarketsCapability, MarketStatsSupportedCapabilities,
-        MarketStatsValue, MarketStatsWsCapability, OpenInterestValue, PriceValue,
-        RealtimeCapabilities, RealtimeCapability, RealtimeMode, UnifiedMarket, UnifiedMarketInfo,
-        UnifiedMarketType, Volume24hValue,
+        MarketStatsScope, MarketStatsSelectedMarketsCapability, MarketStatsSourceFailure,
+        MarketStatsSupportedCapabilities, MarketStatsValue, MarketStatsWsCapability,
+        OpenInterestValue, PriceValue, RealtimeCapabilities, RealtimeCapability, RealtimeMode,
+        UnifiedMarket, UnifiedMarketInfo, UnifiedMarketType, Volume24hValue,
     },
 };
 
@@ -33,23 +37,42 @@ const ENDPOINT: &str =
     "https://omni-client-api.prod.ap-northeast-1.variational.io/metadata/v2/stats";
 const SOURCE: &str = "variational:metadata/v2/stats";
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
+const RETRY_DELAY: Duration = Duration::from_secs(1);
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(5);
+const MAX_RETRIES: usize = 1;
 // Ferris equivalents use a 365-day year. Preserve the native annualized rate
 // rather than misinterpreting the swap's ACT/360 payment rate as a daily rate.
 const YEAR_MS: u64 = 365 * 86_400_000;
 
-type CachedObservation = Option<(Instant, Result<Arc<Observation>, ExchangeError>)>;
+struct CachedObservation {
+    expires_at: Instant,
+    result: Result<Arc<Observation>, ExchangeError>,
+    last_good: Option<Arc<Observation>>,
+}
+
+type ObservationCache = Option<CachedObservation>;
 
 #[derive(Clone)]
 pub struct VariationalExchange {
     client: reqwest::Client,
     endpoint: String,
-    cache: Arc<Mutex<CachedObservation>>,
+    cache: Arc<Mutex<ObservationCache>>,
 }
 
+#[derive(Clone)]
 struct Observation {
     snapshot: Snapshot,
     received_at: Instant,
     wall: u64,
+    next_poll_at: Instant,
+    refresh_error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpstreamErrorBody {
+    error: Option<String>,
+    message: Option<String>,
+    retry_after_seconds: Option<u64>,
 }
 
 impl VariationalExchange {
@@ -74,54 +97,137 @@ impl VariationalExchange {
     }
 
     async fn observation(&self) -> Result<Arc<Observation>, ExchangeError> {
-        // Share both requests and the original receipt across market-list and
-        // stats callers. Cache failures too so clients cannot hammer a 429.
-        // Holding the async mutex makes concurrent cold requests single-flight;
-        // cancelling the request drops the lock and does not leave a worker.
+        // Share requests and the original receipt across market-list and stats
+        // callers. Holding the mutex across the fetch keeps this single-flight,
+        // including the bounded retry below. A failed refresh must not erase a
+        // usable catalog: retain the last good observation and expose it as
+        // stale until the next refresh window.
         let mut cache = self.cache.lock().await;
-        if let Some((expires, result)) = cache.as_ref() {
-            if Instant::now() < *expires {
-                return result.clone();
+        let now = Instant::now();
+        if let Some(entry) = cache.as_ref() {
+            if now < entry.expires_at {
+                return entry.result.clone();
             }
         }
-        let result = self.fetch_observation().await.map(Arc::new);
-        let received_at = result
-            .as_ref()
-            .map_or_else(|_| Instant::now(), |value| value.received_at);
-        *cache = Some((received_at + POLL_INTERVAL, result.clone()));
+
+        let fetched = self.fetch_observation().await.map(Arc::new);
+        let now = Instant::now();
+        let entry = match fetched {
+            Ok(observation) => CachedObservation {
+                expires_at: observation.next_poll_at,
+                result: Ok(observation.clone()),
+                last_good: Some(observation),
+            },
+            Err(error) => {
+                // Retain data only for transport/HTTP failures. A malformed or
+                // semantically invalid successful response must still fail closed
+                // rather than silently serving it as a stale refresh.
+                let last_good = matches!(&error, ExchangeError::UpstreamRequest(_))
+                    .then(|| cache.as_ref().and_then(|entry| entry.last_good.clone()))
+                    .flatten();
+                if let Some(last_good) = last_good {
+                    let stale = Arc::new(Observation {
+                        snapshot: last_good.snapshot.clone(),
+                        received_at: last_good.received_at,
+                        wall: last_good.wall,
+                        next_poll_at: now + POLL_INTERVAL,
+                        refresh_error: Some(error.to_string()),
+                    });
+                    CachedObservation {
+                        expires_at: now + POLL_INTERVAL,
+                        result: Ok(stale),
+                        last_good: Some(last_good),
+                    }
+                } else {
+                    CachedObservation {
+                        expires_at: now + POLL_INTERVAL,
+                        result: Err(error),
+                        last_good: None,
+                    }
+                }
+            }
+        };
+        let result = entry.result.clone();
+        *cache = Some(entry);
         result
     }
 
     async fn fetch_observation(&self) -> Result<Observation, ExchangeError> {
-        let response = self
-            .client
-            .get(&self.endpoint)
-            .send()
-            .await
-            .map_err(|error| ExchangeError::UpstreamRequest(error.to_string()))?;
-        if !response.status().is_success() {
-            return Err(ExchangeError::UpstreamRequest(format!(
-                "Variational returned HTTP {}",
-                response.status()
-            )));
-        }
-        let snapshot: Snapshot = response.json().await.map_err(|error| {
-            ExchangeError::UpstreamData(format!("invalid Variational metadata: {error}"))
-        })?;
-        let mut ids = HashSet::new();
-        for listing in &snapshot.listings {
-            market_from_listing(listing)?;
-            if !ids.insert(&listing.ticker) {
-                return Err(ExchangeError::UpstreamData(
-                    "duplicate Variational ticker".into(),
-                ));
+        let mut retries = 0;
+        loop {
+            // Do not retry transport failures here: reqwest's 20-second timeout
+            // is per attempt, and retrying one could exceed the endpoint budget.
+            // HTTP 429/5xx responses are fast and carry the upstream's retry hint.
+            let response = self
+                .client
+                .get(&self.endpoint)
+                .send()
+                .await
+                .map_err(|error| ExchangeError::UpstreamRequest(error.to_string()))?;
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let cf_ray = response
+                    .headers()
+                    .get("cf-ray")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned);
+                let body = response.bytes().await.unwrap_or_default();
+                let details = serde_json::from_slice::<UpstreamErrorBody>(&body).ok();
+                let retry_after = details
+                    .as_ref()
+                    .and_then(|body| body.retry_after_seconds)
+                    .map(|seconds| {
+                        Duration::from_secs(seconds.clamp(1, MAX_RETRY_DELAY.as_secs()))
+                    });
+                let delay = retry_after.unwrap_or(RETRY_DELAY);
+                let retryable = status.as_u16() == 429 || status.is_server_error();
+                let detail = details
+                    .as_ref()
+                    .and_then(|body| body.message.as_deref().or(body.error.as_deref()))
+                    .unwrap_or("no upstream error detail");
+                warn!(
+                    status = status.as_u16(),
+                    cf_ray = cf_ray.as_deref().unwrap_or("unknown"),
+                    retry_after_seconds = retry_after.map(|value| value.as_secs()),
+                    error = detail,
+                    retry = retryable && retries < MAX_RETRIES,
+                    "Variational upstream request rejected"
+                );
+                if retryable && retries < MAX_RETRIES {
+                    retries += 1;
+                    sleep(delay).await;
+                    continue;
+                }
+                let ray = cf_ray
+                    .map(|value| format!(", cf-ray {value}"))
+                    .unwrap_or_default();
+                return Err(ExchangeError::UpstreamRequest(format!(
+                    "Variational returned HTTP {status}{ray}: {detail}"
+                )));
             }
+
+            let snapshot: Snapshot = response.json().await.map_err(|error| {
+                ExchangeError::UpstreamData(format!("invalid Variational metadata: {error}"))
+            })?;
+            let mut ids = HashSet::new();
+            for listing in &snapshot.listings {
+                market_from_listing(listing)?;
+                if !ids.insert(&listing.ticker) {
+                    return Err(ExchangeError::UpstreamData(
+                        "duplicate Variational ticker".into(),
+                    ));
+                }
+            }
+            let received_at = Instant::now();
+            return Ok(Observation {
+                snapshot,
+                received_at,
+                wall: now_millis(),
+                next_poll_at: received_at + POLL_INTERVAL,
+                refresh_error: None,
+            });
         }
-        Ok(Observation {
-            snapshot,
-            received_at: Instant::now(),
-            wall: now_millis(),
-        })
     }
 }
 
@@ -135,6 +241,10 @@ impl MarketDataExchange for VariationalExchange {
         let products = vec![UnifiedMarketType::Perp];
         ExchangeDataCapabilities {
             fetch_markets: DataCapability::supported(products.clone(), MarketScope::Catalog),
+            fetch_tickers: DataCapability::unsupported(
+                CapabilityReason::VenueDataUnavailable,
+                "Variational does not expose public tickers",
+            ),
             fetch_trades: DataCapability::unsupported(
                 CapabilityReason::VenueDataUnavailable,
                 "Variational does not expose public trade history",
@@ -348,6 +458,28 @@ impl MarketStatsSource for VariationalExchange {
             rows.push(MarketStatsRow { market, fields });
         }
         rows.sort_unstable_by(|a, b| a.market.symbol.cmp(&b.market.symbol));
+        let source_failures = observation
+            .refresh_error
+            .as_ref()
+            .map(|message| {
+                // The catalog and values are still useful, but this is a stale
+                // snapshot. Keep original receipt times so age remains honest.
+                for row in &mut rows {
+                    for field in row.fields.values_mut() {
+                        if field.state == MarketStatsFieldState::Available {
+                            field.state = MarketStatsFieldState::Stale;
+                            field.reason = Some("upstream-failure".into());
+                        }
+                    }
+                }
+                MarketStatsSourceFailure {
+                    source: SOURCE.into(),
+                    reason: "upstream-failure".into(),
+                    message: message.clone(),
+                }
+            })
+            .into_iter()
+            .collect();
         Ok(MarketStatsSourceSnapshot {
             rows,
             catalog_known: true,
@@ -357,18 +489,18 @@ impl MarketStatsSource for VariationalExchange {
             contexts_valid: true,
             received_at: Some(observation.received_at),
             field_received_at,
-            next_poll_at: observation.received_at + POLL_INTERVAL,
-            source_failures: Vec::new(),
+            next_poll_at: observation.next_poll_at,
+            source_failures,
         })
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct Snapshot {
     listings: Vec<Listing>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct Listing {
     ticker: String,
     contract_type: String,

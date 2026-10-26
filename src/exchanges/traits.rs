@@ -3,11 +3,10 @@ use serde_json::Value;
 
 use crate::market_stats::MarketStatsSourceSnapshot;
 use crate::models::{
-    CcxtOhlcv, CcxtOrderBook, CcxtTrade, ExchangeDataCapabilities, FetchMarketStatsParams,
-    FetchMarketsParams, FetchOhlcvParams, FetchOrderBookParams, FetchTradesParams,
-    MarketStatsCapabilities, UnifiedMarket,
+    CcxtOhlcv, CcxtOrderBook, CcxtTicker, CcxtTrade, ExchangeDataCapabilities,
+    FetchMarketStatsParams, FetchMarketsParams, FetchOhlcvParams, FetchOrderBookParams,
+    FetchTickersParams, FetchTradesParams, MarketStatsCapabilities, UnifiedMarket,
 };
-
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum ExchangeError {
     #[error("bad symbol: {0}")]
@@ -95,9 +94,16 @@ pub trait MarketDataExchange: Send + Sync {
         &self,
         params: FetchOrderBookParams,
     ) -> Result<CcxtOrderBook, ExchangeError>;
-
     async fn fetch_markets(
         &self,
         params: FetchMarketsParams,
     ) -> Result<Vec<UnifiedMarket>, ExchangeError>;
+    async fn fetch_tickers(
+        &self,
+        _params: FetchTickersParams,
+    ) -> Result<Vec<CcxtTicker>, ExchangeError> {
+        Err(ExchangeError::UnsupportedFeature(
+            "fetchTickers is not implemented by this exchange".into(),
+        ))
+    }
 }

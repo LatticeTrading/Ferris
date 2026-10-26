@@ -9,6 +9,7 @@ use ferris_market_data_backend::{
     config::Config,
     exchanges::{
         ccxt::{CcxtExchange, CcxtService, Venue},
+        phoenix::PhoenixExchange,
         registry::ExchangeRegistry,
         variational::VariationalExchange,
     },
@@ -33,22 +34,25 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("failed to bind tcp listener")?;
     let ccxt = CcxtService::start(&config).context("failed to start CCXT owners")?;
+    let phoenix = Arc::new(PhoenixExchange::new().context("failed to start Phoenix adapter")?);
 
     let mut registry = ExchangeRegistry::new();
     for venue in Venue::ALL {
         registry.register(Arc::new(CcxtExchange::new(venue, ccxt.clone())));
     }
+    registry.register(phoenix.clone());
     registry.register(Arc::new(
         VariationalExchange::new().context("failed to start Variational adapter")?,
     ));
 
-    let realtime = RealtimeService::new(ccxt.clone());
+    let realtime = RealtimeService::new(ccxt.clone()).with_phoenix(phoenix);
 
     let state = AppState::new(Arc::new(registry), realtime);
 
     let app = Router::new()
         .route("/healthz", get(web::health))
         .route("/v1/fetchTrades", post(web::fetch_trades))
+        .route("/v1/fetchTickers", post(web::fetch_tickers))
         .route("/v1/fetchOHLCV", post(web::fetch_ohlcv))
         .route("/v1/fetchOrderBook", post(web::fetch_order_book))
         .route("/v1/fetchMarkets", post(web::fetch_markets))
@@ -83,7 +87,10 @@ async fn main() -> anyhow::Result<()> {
     // Cancel acquisition before awaiting Axum's in-flight HTTP drain. Upgraded
     // websockets are separate tasks and must be closed/joined explicitly.
     state.shutdown_websockets().await;
-    state.shutdown_market_stats().await;
+    state
+        .shutdown_realtime()
+        .await
+        .context("failed to stop realtime adapters")?;
     let owners = ccxt.shutdown().await.context("failed to stop CCXT owners");
     let result = match result {
         Some(result) => result,

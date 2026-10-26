@@ -1,5 +1,4 @@
 //! Ferris live demand and owned delivery. Stock Pro acquisition lives in CCXT owners.
-
 use std::{
     collections::BTreeMap,
     sync::{
@@ -15,6 +14,7 @@ use tokio::sync::{broadcast, Notify};
 use crate::{
     exchanges::{
         ccxt::{CcxtService, PreparedTopic},
+        phoenix::PhoenixExchange,
         traits::ExchangeError,
     },
     models::{CcxtOhlcv, CcxtOrderBook, CcxtTrade, MarketStatsField, MarketStatsFieldName},
@@ -76,6 +76,14 @@ impl RealtimeTopic {
         } else {
             return Err("`params` must be an object or null".to_string());
         };
+        if exchange == "phoenix" {
+            let allowed = ["timeframe", "interval", "levels", "depth", "limit"];
+            if let Some(object) = params.as_object() {
+                if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
+                    return Err(format!("unsupported Phoenix realtime parameter `{key}`"));
+                }
+            }
+        }
         // serde_json's default Map is ordered, including nested objects.
         Ok(Self {
             exchange,
@@ -85,14 +93,42 @@ impl RealtimeTopic {
     }
 }
 
+pub(crate) enum PreparedRealtimeTopic {
+    Ccxt(PreparedTopic),
+    Phoenix {
+        channel: RealtimeChannel,
+        topic: RealtimeTopic,
+        levels: usize,
+        client_key: String,
+    },
+}
+
+impl PreparedRealtimeTopic {
+    pub(crate) fn client_key(&self) -> &str {
+        match self {
+            Self::Ccxt(prepared) => &prepared.client_key,
+            Self::Phoenix { client_key, .. } => client_key,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct RealtimeService {
     service: CcxtService,
+    phoenix: Option<Arc<PhoenixExchange>>,
 }
 
 impl RealtimeService {
     pub fn new(service: CcxtService) -> Self {
-        Self { service }
+        Self {
+            service,
+            phoenix: None,
+        }
+    }
+
+    pub fn with_phoenix(mut self, phoenix: Arc<PhoenixExchange>) -> Self {
+        self.phoenix = Some(phoenix);
+        self
     }
 
     pub async fn subscribe(
@@ -108,18 +144,89 @@ impl RealtimeService {
         &self,
         channel: RealtimeChannel,
         topic: RealtimeTopic,
-    ) -> Result<PreparedTopic, ExchangeError> {
-        self.service.prepare_live(channel, topic).await
+    ) -> Result<PreparedRealtimeTopic, ExchangeError> {
+        if topic.exchange == "phoenix" {
+            let levels = topic
+                .params
+                .get("levels")
+                .or_else(|| topic.params.get("depth"))
+                .or_else(|| topic.params.get("limit"))
+                .and_then(Value::as_u64)
+                .map(usize::try_from)
+                .transpose()
+                .map_err(|_| ExchangeError::BadSymbol("Phoenix depth is too large".into()))?
+                .unwrap_or(usize::MAX);
+            if levels == 0 {
+                return Err(ExchangeError::BadSymbol(
+                    "Phoenix depth must be positive".into(),
+                ));
+            }
+            let timeframe = (channel == RealtimeChannel::Ohlcv).then(|| {
+                topic
+                    .params
+                    .get("timeframe")
+                    .or_else(|| topic.params.get("interval"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("1m")
+                    .to_string()
+            });
+            if let Some(timeframe) = &timeframe {
+                if !matches!(
+                    timeframe.as_str(),
+                    "1s" | "5s" | "1m" | "5m" | "15m" | "30m" | "1h" | "4h" | "1d"
+                ) {
+                    return Err(ExchangeError::UnsupportedFeature(format!(
+                        "unsupported Phoenix timeframe `{timeframe}`"
+                    )));
+                }
+            }
+            let client_key = serde_json::to_string(&(
+                topic.exchange.clone(),
+                topic.symbol.clone(),
+                channel.as_str(),
+                timeframe,
+                levels,
+            ))
+            .map_err(|e| ExchangeError::Internal(e.to_string()))?;
+            return Ok(PreparedRealtimeTopic::Phoenix {
+                channel,
+                topic,
+                levels,
+                client_key,
+            });
+        }
+        self.service
+            .prepare_live(channel, topic)
+            .await
+            .map(PreparedRealtimeTopic::Ccxt)
     }
 
     pub(crate) async fn subscribe_prepared(
         &self,
-        prepared: PreparedTopic,
+        prepared: PreparedRealtimeTopic,
     ) -> Result<RealtimeSubscription, ExchangeError> {
-        self.service.subscribe_live(prepared).await
+        match prepared {
+            PreparedRealtimeTopic::Ccxt(prepared) => self.service.subscribe_live(prepared).await,
+            PreparedRealtimeTopic::Phoenix {
+                channel,
+                topic,
+                levels,
+                client_key,
+            } => {
+                let phoenix = self.phoenix.as_ref().ok_or_else(|| {
+                    ExchangeError::Internal("Phoenix realtime adapter is not configured".into())
+                })?;
+                phoenix
+                    .subscribe_live(channel, topic, levels, client_key)
+                    .await
+            }
+        }
     }
 
     pub async fn shutdown(&self) -> Result<(), ExchangeError> {
+        if let Some(phoenix) = &self.phoenix {
+            phoenix.shutdown_live().await?;
+        }
         self.service.shutdown_live().await
     }
 }
@@ -234,6 +341,12 @@ mod tests;
 
 #[derive(Clone)]
 pub(crate) struct Publication {
-    pub epoch: u64,
-    pub update: RealtimeUpdate,
+    pub(crate) epoch: u64,
+    pub(crate) update: RealtimeUpdate,
+}
+
+impl Publication {
+    pub(crate) fn new(update: RealtimeUpdate) -> Self {
+        Self { epoch: 0, update }
+    }
 }

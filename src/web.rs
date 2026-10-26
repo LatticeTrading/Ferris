@@ -35,11 +35,11 @@ use crate::{
     exchanges::{registry::ExchangeRegistry, traits::ExchangeError},
     market_stats::{projection_key, MarketStatsCoordinator},
     models::{
-        CapabilitiesResponse, CapabilityState, CcxtOhlcv, CcxtOrderBook, CcxtTrade,
+        CapabilitiesResponse, CapabilityState, CcxtOhlcv, CcxtOrderBook, CcxtTicker, CcxtTrade,
         ExchangeCapabilities, FeatureCapability, FetchMarketStatsRequest, FetchMarketsParams,
         FetchMarketsRequest, FetchMarketsResponse, FetchOhlcvRequest, FetchOrderBookRequest,
-        FetchTradesRequest, HealthResponse, MarketStatsCapabilities, MarketStatsSnapshot,
-        MarketStatsTopic,
+        FetchTickersRequest, FetchTradesRequest, HealthResponse, MarketStatsCapabilities,
+        MarketStatsSnapshot, MarketStatsTopic,
     },
     realtime::{RealtimeChannel, RealtimeReceiver, RealtimeService, RealtimeTopic, RealtimeUpdate},
 };
@@ -279,6 +279,29 @@ pub async fn capabilities(State(state): State<AppState>) -> Json<CapabilitiesRes
         })
         .collect();
     Json(CapabilitiesResponse { exchanges })
+}
+
+pub async fn fetch_tickers(
+    State(state): State<AppState>,
+    Json(request): Json<FetchTickersRequest>,
+) -> Result<Json<Vec<CcxtTicker>>, ApiError> {
+    if let Some(symbols) = request.symbols.as_ref() {
+        if symbols.iter().any(|symbol| symbol.trim().is_empty()) {
+            return Err(ApiError::Validation(
+                "`symbols` cannot contain empty values".into(),
+            ));
+        }
+    }
+    if !(request.params.is_null() || request.params.is_object()) {
+        return Err(ApiError::Validation(
+            "`params` must be an object or null".into(),
+        ));
+    }
+    let exchange_id = request.exchange.trim().to_ascii_lowercase();
+    let Some(exchange) = state.exchange_registry.get(&exchange_id) else {
+        return Err(ApiError::UnsupportedExchange(exchange_id));
+    };
+    Ok(Json(exchange.fetch_tickers(request.into_params()).await?))
 }
 
 pub async fn fetch_trades(
@@ -882,7 +905,7 @@ async fn handle_stream_command(
                 }
             };
 
-            let client_key = prepared.client_key.clone();
+            let client_key = prepared.client_key().to_string();
 
             if let Some(existing) = subscriptions.get(&client_key) {
                 return send_ws_json(
@@ -1011,7 +1034,7 @@ async fn client_key_for_unsubscribe(
         .realtime
         .prepare(channel, topic.clone())
         .await
-        .map(|prepared| prepared.client_key)
+        .map(|prepared| prepared.client_key().to_string())
         .map_err(|err| err.to_string())
 }
 

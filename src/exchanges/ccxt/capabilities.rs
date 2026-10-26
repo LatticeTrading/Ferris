@@ -25,6 +25,10 @@ pub(super) fn for_venue(
 pub(super) fn snapshots(products: &'static [UnifiedMarketType]) -> ExchangeDataCapabilities {
     ExchangeDataCapabilities {
         fetch_markets: DataCapability::supported(products.to_vec(), MarketScope::Catalog),
+        fetch_tickers: DataCapability::unsupported(
+            CapabilityReason::VenueDataUnavailable,
+            "fetchTickers is not exposed by the native CCXT facade",
+        ),
         fetch_trades: DataCapability::supported(products.to_vec(), MarketScope::MarketSpecific),
         fetch_ohlcv: DataCapability::supported(products.to_vec(), MarketScope::MarketSpecific),
         fetch_order_book: DataCapability::supported(products.to_vec(), MarketScope::MarketSpecific),
