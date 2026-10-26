@@ -11,7 +11,7 @@ response shapes, partial-statistics rendering, chart bootstrap, and current limi
 
 - unified endpoint shapes (`fetchTrades`, `fetchTickers`, `fetchOHLCV`, `fetchOrderBook`, `fetchMarkets`, `fetchMarketStats`)
 - backend websocket fanout for realtime channels (`GET /v1/ws`)
-- native `phoenix` adapter: public perpetual market catalog, tickers via mark-price REST, signed fills, candles, order books, exchange-snapshot open interest, and native websocket trades/candles/order books
+- native `phoenix` adapter: public perpetual market catalog, tickers with shared `allMids` mid-prices and exchange-snapshot open interest, signed fills, candles, order books, exchange-snapshot market stats, and native websocket trades/candles/order books
 - Hyperliquid public trades use the stock recent-trade window; no additional history collector/cache
 
 ## Why this exists
@@ -60,7 +60,7 @@ Frontend apps (including Electron and web frontends) often cannot directly use s
   - `apex` Omni perpetuals: all five snapshot endpoints and all four realtime channels; see [Apex support](#apex-omni-support)
   - `bitfinex` spot and linear perpetuals: all five snapshot endpoints and all four realtime channels; see [Bitfinex support](#bitfinex-support)
   - `kucoin` spot and perpetuals: all five snapshot endpoints and all four realtime channels; see [KuCoin support](#kucoin-support)
-  - `phoenix` Eternal perpetuals: native `fetchMarkets`, `fetchTickers`, `fetchTrades`, `fetchOHLCV`, `fetchOrderBook`, and exchange-snapshot-backed market stats; native websocket trades/candles/order books. Public stats expose open interest from the exchange snapshot; funding, 24h volume, mark/index prices in bulk stats, and last price remain explicitly unavailable. Market symbols accept `BASE`, `BASE/USD`, and `BASE/USD:USD` and display as `BASE/USD`.
+  - `phoenix` Eternal perpetuals: native `fetchMarkets`, `fetchTickers`, `fetchTrades`, `fetchOHLCV`, `fetchOrderBook`, and exchange-snapshot-backed market stats; ticker prices use a shared `allMids` WebSocket subscription and are explicitly mid-prices, with open interest from the bulk exchange snapshot. Funding, 24h volume, mark/index prices in bulk stats, and last price remain unavailable. Market symbols accept `BASE`, `BASE/USD`, and `BASE/USD:USD` and display as `BASE/USD`.
   - `variational` perpetual and swap listings: `fetchMarkets` and polling-backed `fetchMarketStats`
   - market-data only (no private trading endpoints yet)
 - Extended's standard websocket order book is indicative, not the RFQ real-book stream. Spot, private trading/account, funding history, and account streams are not supported.
@@ -68,7 +68,7 @@ Frontend apps (including Electron and web frontends) often cannot directly use s
 
 ## CCXT REST snapshot contract
 
-- The five stock-CCXT snapshot families (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`, `fetchMarkets`, and `fetchMarketStats`) cover the ten registered stock venues. Phoenix uses its native REST adapter for those families plus `fetchTickers`; tickers use the per-market public mark-price route, while bulk market stats use the cached exchange market snapshot. Trades/books/candles on `/v1/ws` use CCXT Pro for stock venues, while statistics use shared stock polling and Lighter Pro `watchTickers` with Ferris snapshot/revisioned-delta delivery.
+- A single Phoenix cache owns the bulk `/v1/view/exchange/markets` metadata/snapshot and one lazy `allMids` subscription, shared by ticker and stats callers.
 Real HTTP snapshots were exercised for the original six venues and subsequently for Apex. Extended's missing-User-Agent HTTP 403 is fixed by an Extended-only `Ferris/1.0` header on stock HTTP clients; live catalog, statistics, trades, candles, and book snapshots passed. Its stock WebSocket connector still omits headers and receives 403; see [CCXT-004](CCXT_KNOWN_ISSUES.md#ccxt-004). There is no native REST fallback.
 
 Deployment note: `/v1/ws` is a required HTTP WebSocket-upgrade route. A plain `GET` without `Connection: Upgrade` should return `400`, not `404`; a real upgrade must reach the Axum process. If production returns `404` while REST routes work, the deployed binary or reverse-proxy route is stale/missing, not a Phoenix upstream failure.

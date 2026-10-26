@@ -51,8 +51,24 @@ pub struct PhoenixExchange {
     ws: String,
     cache: Arc<Mutex<Option<(Instant, Arc<Vec<PhoenixMarket>>)>>>,
     stats_cache: Arc<Mutex<Option<(Instant, Arc<Vec<PhoenixStatsRow>>)>>>,
+    mids: Arc<PhoenixMidCache>,
     live: PhoenixLiveHub,
 }
+
+struct PhoenixMidCache {
+    state: Mutex<MidState>,
+    changed: Notify,
+    worker: Mutex<Option<JoinHandle<()>>>,
+    ws: String,
+}
+
+#[derive(Default)]
+struct MidState {
+    values: HashMap<String, f64>,
+    received_at: Option<Instant>,
+    received_wall: Option<u64>,
+}
+
 #[derive(Clone)]
 struct PhoenixLiveHub {
     inner: Arc<Mutex<LiveState>>,
@@ -164,9 +180,15 @@ impl PhoenixExchange {
         Ok(Self {
             client,
             api,
-            ws,
+            ws: ws.clone(),
             cache: Arc::new(Mutex::new(None)),
             stats_cache: Arc::new(Mutex::new(None)),
+            mids: Arc::new(PhoenixMidCache {
+                state: Mutex::new(MidState::default()),
+                changed: Notify::new(),
+                worker: Mutex::new(None),
+                ws: ws.clone(),
+            }),
             live: PhoenixLiveHub {
                 inner: Arc::new(Mutex::new(LiveState {
                     feeds: HashMap::new(),
@@ -204,6 +226,34 @@ impl PhoenixExchange {
             ))
         })
     }
+    async fn all_mids(&self) -> Result<(HashMap<String, f64>, u64), ExchangeError> {
+        let mut worker = self.mids.worker.lock().await;
+        if worker.as_ref().is_none_or(JoinHandle::is_finished) {
+            *worker = Some(spawn_mids_worker(Arc::clone(&self.mids)));
+        }
+        drop(worker);
+        loop {
+            let notified = self.mids.changed.notified();
+            {
+                let state = self.mids.state.lock().await;
+                if let (Some(received_at), Some(received_wall)) =
+                    (state.received_at, state.received_wall)
+                {
+                    if received_at.elapsed() <= Duration::from_secs(90) {
+                        return Ok((state.values.clone(), received_wall));
+                    }
+                }
+            }
+            tokio::time::timeout(Duration::from_secs(10), notified)
+                .await
+                .map_err(|_| {
+                    ExchangeError::UpstreamRequest(
+                        "timed out waiting for Phoenix allMids snapshot".into(),
+                    )
+                })?;
+        }
+    }
+
     async fn markets(&self) -> Result<Arc<Vec<PhoenixMarket>>, ExchangeError> {
         let mut cache = self.cache.lock().await;
         if let Some((until, markets)) = cache.as_ref() {
@@ -347,11 +397,19 @@ impl PhoenixExchange {
         })
     }
     pub(crate) async fn shutdown_live(&self) -> Result<(), ExchangeError> {
-        let feeds = {
-            let mut live = self.live.inner.lock().await;
-            live.stopped = true;
-            live.feeds.drain().map(|(_, feed)| feed).collect::<Vec<_>>()
+        let (feeds, mid_worker) = {
+            let feeds = {
+                let mut live = self.live.inner.lock().await;
+                live.stopped = true;
+                live.feeds.drain().map(|(_, feed)| feed).collect::<Vec<_>>()
+            };
+            let worker = self.mids.worker.lock().await.take();
+            (feeds, worker)
         };
+        if let Some(worker) = mid_worker {
+            worker.abort();
+            let _ = worker.await;
+        }
         for feed in feeds {
             if let Some(worker) = feed.worker.lock().await.take() {
                 worker.abort();
@@ -361,6 +419,66 @@ impl PhoenixExchange {
         Ok(())
     }
 }
+fn spawn_mids_worker(cache: Arc<PhoenixMidCache>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let connection = connect_async(&cache.ws).await;
+            let Ok((mut socket, _)) = connection else {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            };
+            let subscription = json!({
+                "type": "subscribe",
+                "subscription": {"channel": "allMids"}
+            });
+            if socket
+                .send(Message::Text(subscription.to_string()))
+                .await
+                .is_err()
+            {
+                continue;
+            }
+            while let Some(Ok(message)) = socket.next().await {
+                let Message::Text(text) = message else {
+                    continue;
+                };
+                let Ok(value) = serde_json::from_str::<Value>(&text) else {
+                    continue;
+                };
+                let Some(values) = parse_all_mids(&value) else {
+                    continue;
+                };
+                if values.is_empty() {
+                    continue;
+                }
+                let received_wall = now_millis();
+                let mut state = cache.state.lock().await;
+                state.values = values;
+                state.received_at = Some(Instant::now());
+                state.received_wall = Some(received_wall);
+                drop(state);
+                cache.changed.notify_one();
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    })
+}
+
+fn parse_all_mids(value: &Value) -> Option<HashMap<String, f64>> {
+    if value.get("channel").and_then(Value::as_str) != Some("allMids") {
+        return None;
+    }
+    let mids = value.get("mids")?.as_object()?;
+    Some(
+        mids.iter()
+            .filter_map(|(symbol, value)| {
+                let price = value.as_f64()?;
+                (price.is_finite() && price > 0.0).then(|| (symbol.clone(), price))
+            })
+            .collect(),
+    )
+}
+
 async fn run_live_feed(ws: String, feed: Arc<PhoenixFeed>) {
     loop {
         if feed
@@ -660,35 +778,28 @@ impl MarketDataExchange for PhoenixExchange {
             }
             selected
         };
+        let (mids, timestamp) = self.all_mids().await?;
+        let datetime =
+            chrono::DateTime::from_timestamp_millis(timestamp as i64).map(|t| t.to_rfc3339());
         let mut result = Vec::with_capacity(selected.len());
         for market in selected {
-            let snapshot = self
-                .get_json::<Value>(&format!("/v1/view/market/{}", market.symbol), &[])
-                .await?;
-            let mark = snapshot
-                .get("market")
-                .and_then(|value| value.get("markPrice"))
-                .and_then(|value| value.get("price"))
-                .and_then(Value::as_f64)
-                .filter(|v| v.is_finite() && *v > 0.0);
-            let index = snapshot
-                .get("market")
-                .and_then(|value| value.get("spotPrice"))
-                .and_then(|value| value.get("price"))
-                .and_then(Value::as_f64)
-                .filter(|v| v.is_finite() && *v > 0.0);
-            let timestamp = now_millis();
+            let mid = mids.get(&market.symbol).copied();
+            let open_interest = market
+                .stats_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.open_interest_base_lots.as_deref())
+                .and_then(|value| value.parse::<f64>().ok())
+                .filter(|value| value.is_finite() && *value >= 0.0);
             result.push(CcxtTicker {
                 info: json!({
                     "marketSymbol": market.symbol,
-                    "markPrice": mark,
-                    "spotPrice": index,
-                    "openInterest": serde_json::Value::Null
+                    "midPrice": mid,
+                    "openInterest": open_interest,
+                    "midPriceSource": "phoenix:allMids"
                 }),
                 symbol: format!("{}/USD", market.symbol),
                 timestamp: Some(timestamp),
-                datetime: chrono::DateTime::from_timestamp_millis(timestamp as i64)
-                    .map(|t| t.to_rfc3339()),
+                datetime: datetime.clone(),
                 high: None,
                 low: None,
                 bid: None,
@@ -1020,6 +1131,7 @@ fn stats_capabilities() -> MarketStatsCapabilities {
         payment_interval_ms: None,
         limitations: vec![
             "stats-use-exchange-market-snapshot-open-interest-only".into(),
+            "bulk-ticker-mid-price-only-in-ticker-info-not-stats-contract".into(),
             "last-price-volume-funding-mark-index-unavailable".into(),
         ],
     })
@@ -1225,6 +1337,20 @@ fn now_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn all_mids_parses_complete_map_and_ignores_bad_prices() {
+        let frame = json!({
+            "channel": "allMids",
+            "mids": {"BTC": 100.5, "ETH": "bad", "SOL": -1.0},
+            "slot": 123
+        });
+        assert_eq!(
+            parse_all_mids(&frame).unwrap(),
+            HashMap::from([("BTC".into(), 100.5)])
+        );
+        assert!(parse_all_mids(&json!({"channel":"trades", "mids":{"BTC":1.0}})).is_none());
+    }
 
     #[test]
     fn signed_fill_maps_to_ccxt_trade() {
