@@ -9,6 +9,7 @@ use ferris_market_data_backend::{
     config::Config,
     exchanges::{
         ccxt::{CcxtExchange, CcxtService, Venue},
+        perpl::PerplExchange,
         phoenix::PhoenixExchange,
         registry::ExchangeRegistry,
         variational::VariationalExchange,
@@ -35,12 +36,14 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to bind tcp listener")?;
     let ccxt = CcxtService::start(&config).context("failed to start CCXT owners")?;
     let phoenix = Arc::new(PhoenixExchange::new().context("failed to start Phoenix adapter")?);
+    let perpl = Arc::new(PerplExchange::new().context("failed to start Perpl adapter")?);
 
     let mut registry = ExchangeRegistry::new();
     for venue in Venue::ALL {
         registry.register(Arc::new(CcxtExchange::new(venue, ccxt.clone())));
     }
     registry.register(phoenix.clone());
+    registry.register(perpl);
     registry.register(Arc::new(
         VariationalExchange::new().context("failed to start Variational adapter")?,
     ));

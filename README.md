@@ -62,6 +62,7 @@ Frontend apps (including Electron and web frontends) often cannot directly use s
   - `kucoin` spot and perpetuals: all five snapshot endpoints and all four realtime channels; see [KuCoin support](#kucoin-support)
   - `phoenix` Eternal perpetuals: native `fetchMarkets`, `fetchTickers`, `fetchTrades`, `fetchOHLCV`, `fetchOrderBook`, and exchange-snapshot-backed market stats; ticker prices use a shared `allMids` WebSocket subscription and are explicitly mid-prices, with open interest from the bulk exchange snapshot. Funding, 24h volume, mark/index prices in bulk stats, and last price remain unavailable. Market symbols accept `BASE`, `BASE/USD`, and `BASE/USD:USD` and display as `BASE/USD`.
   - `variational` perpetual and swap listings: `fetchMarkets` and polling-backed `fetchMarketStats`
+  - `perpl` isolated perpetuals: native `fetchMarkets`, bulk `fetchTickers`, OHLCV, L2 order books (maximum 100 levels), and polling-backed market stats. Perpl's all-market ticker endpoint is shared for mark/index/last prices, volume, and open interest; public REST trade history and native realtime channels are explicitly unsupported until their contracts are verified.
   - market-data only (no private trading endpoints yet)
 - Extended's standard websocket order book is indicative, not the RFQ real-book stream. Spot, private trading/account, funding history, and account streams are not supported.
 - Extended REST and websocket URLs are configurable for testnet deployments.
@@ -790,6 +791,8 @@ Defaults:
 - `EXTENDED_WS_URL` (default: `wss://api.starknet.extended.exchange/stream.extended.exchange/v1`)
 - `PHOENIX_API_URL` (default: `https://perp-api.phoenix.trade`)
 - `PHOENIX_WS_URL` (default: `wss://perp-api.phoenix.trade/v1/ws`)
+- `PERPL_API_URL` (default: `https://app.perpl.xyz/api`; use the testnet API URL and `PERPL_CHAIN_ID=10143` together for testnet)
+- `PERPL_CHAIN_ID` (default: `143`; catalog identity is rejected when the context chain differs)
 - `REQUEST_TIMEOUT_MS` (default: `10000`)
 - `RUST_LOG` (default: `info`)
 - `LIGHTER_REST_BASE_URL` (default: `https://mainnet.zklighter.elliot.ai`; CCXT catalog, snapshots, and statistics polling)

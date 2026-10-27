@@ -32,6 +32,7 @@ fn catalog_source(exchange: &str, _product: UnifiedMarketType, _params: &Value) 
         .map(statistics_profile::catalog_source)
         .unwrap_or(match exchange {
             "phoenix" => "phoenix:v1/view/exchange/markets",
+            "perpl" => "perpl:v1/pub/context",
             "variational" => "variational:metadata/v2/stats",
             _ => "ccxt:loadMarkets",
         })
