@@ -41,7 +41,11 @@ use crate::{
         FetchTickersRequest, FetchTradesRequest, HealthResponse, MarketStatsCapabilities,
         MarketStatsSnapshot, MarketStatsTopic,
     },
-    realtime::{RealtimeChannel, RealtimeReceiver, RealtimeService, RealtimeTopic, RealtimeUpdate},
+    orderbook::BookAmountMode,
+    realtime::{
+        EncodedPayloads, RealtimeChannel, RealtimeReceiver, RealtimeService, RealtimeTopic,
+        RealtimeUpdate,
+    },
 };
 
 mod market_stats_stream;
@@ -635,6 +639,12 @@ struct WsPongMessage {
 
 const CLIENT_OUTGOING_QUEUE_CAPACITY: usize = 256;
 const CLIENT_REALTIME_SUBSCRIPTION_LIMIT: usize = 200;
+/// Frames already queued for one client are written with a single flush.
+const CLIENT_WRITE_BATCH: usize = 64;
+/// Minimum spacing of flushes to one client. Nagle's algorithm is disabled on
+/// client sockets, so every flush is a packet: a busy client's burst leaves in
+/// one segment at most this much later, an idle client's frame immediately.
+const CLIENT_FLUSH_INTERVAL: Duration = Duration::from_millis(1);
 
 pub async fn trades_stream_ws(
     ws: WebSocketUpgrade,
@@ -662,10 +672,35 @@ async fn handle_trades_stream_socket(socket: WebSocket, state: AppState) {
     let force_close = Arc::new(AtomicBool::new(false));
 
     let mut writer_task = tokio::spawn(async move {
+        let mut next_flush = tokio::time::Instant::now();
         while let Some(message) = outgoing_receiver.recv().await {
-            if ws_sender.send(message).await.is_err() {
+            if ws_sender.feed(message).await.is_err() {
                 break;
             }
+            // Flushed moments ago: this client is mid-burst. Let the rest of
+            // the burst queue up instead of sending one packet per frame.
+            if tokio::time::Instant::now() < next_flush {
+                tokio::time::sleep_until(next_flush).await;
+            }
+            // Coalesce what is already queued into one flush (one socket
+            // write). Order is unchanged, and the bounded outgoing queue still
+            // closes a client that cannot keep up.
+            let mut batched = 1;
+            let mut failed = false;
+            while batched < CLIENT_WRITE_BATCH {
+                let Ok(message) = outgoing_receiver.try_recv() else {
+                    break;
+                };
+                if ws_sender.feed(message).await.is_err() {
+                    failed = true;
+                    break;
+                }
+                batched += 1;
+            }
+            if failed || ws_sender.flush().await.is_err() {
+                break;
+            }
+            next_flush = tokio::time::Instant::now() + CLIENT_FLUSH_INTERVAL;
         }
     });
 
@@ -1068,79 +1103,154 @@ fn spawn_realtime_forwarder(
     close_signal: Arc<Notify>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        // Fixed for the lifetime of the subscription; only `data` varies.
+        let topic_json = serde_json::to_string(&topic).ok();
+        let amount_mode = receiver.book_amount_mode();
         loop {
-            match receiver.recv().await {
-                Ok(RealtimeUpdate::Trades(trades)) => {
-                    if !send_ws_json(
-                        &outgoing_sender,
-                        &WsTradesUpdate {
-                            message_type: "trades",
-                            topic: &topic,
-                            data: trades.as_ref(),
+            let delivered = match receiver.recv_shared().await {
+                Ok((update, encoded)) => {
+                    // A sole viewer serializes its frame directly. Otherwise
+                    // the `data` payload is serialized once per publication and
+                    // shared by every viewer of the same view.
+                    let shared = topic_json
+                        .as_deref()
+                        .filter(|_| receiver.is_shared())
+                        .map(|topic_json| (topic_json, &*encoded));
+                    match update {
+                        RealtimeUpdate::Trades(trades) => match shared {
+                            Some((topic_json, encoded)) => send_shared_frame(
+                                &outgoing_sender,
+                                "trades",
+                                topic_json,
+                                encoded,
+                                (0, BookAmountMode::Native),
+                                &trades.as_slice(),
+                            ),
+                            None => send_ws_json(
+                                &outgoing_sender,
+                                &WsTradesUpdate {
+                                    message_type: "trades",
+                                    topic: &topic,
+                                    data: trades.as_ref(),
+                                },
+                            ),
                         },
-                    ) {
-                        close_signal.notify_one();
-                        return;
-                    }
-                }
-                Ok(RealtimeUpdate::OrderBook(orderbook)) => {
-                    if !send_ws_json(
-                        &outgoing_sender,
-                        &WsOrderBookUpdate {
-                            message_type: "orderbook",
-                            topic: &topic,
-                            data: orderbook_view(&orderbook, levels_limit),
+                        RealtimeUpdate::OrderBook(orderbook) => {
+                            let view = orderbook_view(&orderbook, levels_limit);
+                            match shared {
+                                Some((topic_json, encoded)) => {
+                                    // Viewers whose depth exceeds the published
+                                    // book all render the same complete view.
+                                    let depth = view.asks.len().max(view.bids.len());
+                                    send_shared_frame(
+                                        &outgoing_sender,
+                                        "orderbook",
+                                        topic_json,
+                                        encoded,
+                                        (depth, amount_mode),
+                                        &view,
+                                    )
+                                }
+                                None => send_ws_json(
+                                    &outgoing_sender,
+                                    &WsOrderBookUpdate {
+                                        message_type: "orderbook",
+                                        topic: &topic,
+                                        data: view,
+                                    },
+                                ),
+                            }
+                        }
+                        RealtimeUpdate::Ohlcv(candles) => match shared {
+                            Some((topic_json, encoded)) => send_shared_frame(
+                                &outgoing_sender,
+                                "ohlcv",
+                                topic_json,
+                                encoded,
+                                (0, BookAmountMode::Native),
+                                &candles.as_slice(),
+                            ),
+                            None => send_ws_json(
+                                &outgoing_sender,
+                                &WsOhlcvUpdate {
+                                    message_type: "ohlcv",
+                                    topic: &topic,
+                                    data: candles.as_ref(),
+                                },
+                            ),
                         },
-                    ) {
-                        close_signal.notify_one();
-                        return;
+                        // Internal ticker acquisition is projected by the revisioned
+                        // statistics forwarder, never emitted as a public realtime topic.
+                        RealtimeUpdate::Statistics(_) => {
+                            unreachable!("statistics demand is internal")
+                        }
+                        // Source lifecycle error: surface it as a WS error envelope and
+                        // never invent a successful update.
+                        RealtimeUpdate::Error(error) => {
+                            send_ws_error(&outgoing_sender, "UPSTREAM_ERROR", error.to_string())
+                        }
                     }
                 }
-                Ok(RealtimeUpdate::Ohlcv(candles)) => {
-                    if !send_ws_json(
-                        &outgoing_sender,
-                        &WsOhlcvUpdate {
-                            message_type: "ohlcv",
-                            topic: &topic,
-                            data: candles.as_ref(),
-                        },
-                    ) {
-                        close_signal.notify_one();
-                        return;
-                    }
-                }
-                // Internal ticker acquisition is projected by the revisioned
-                // statistics forwarder, never emitted as a public realtime topic.
-                Ok(RealtimeUpdate::Statistics(_)) => unreachable!("statistics demand is internal"),
-                // Source lifecycle error: surface it as a WS error envelope and
-                // never invent a successful update.
-                Ok(RealtimeUpdate::Error(error)) => {
-                    if !send_ws_error(&outgoing_sender, "UPSTREAM_ERROR", error.to_string()) {
-                        close_signal.notify_one();
-                        return;
-                    }
-                }
-                Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    if !send_ws_json(
-                        &outgoing_sender,
-                        &WsLagWarning {
-                            message_type: "warning",
-                            code: "CLIENT_LAGGED",
-                            message: "client lagged behind realtime stream".to_string(),
-                            topic: &topic,
-                            dropped_messages: skipped,
-                        },
-                    ) {
-                        close_signal.notify_one();
-                        return;
-                    }
-                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => send_ws_json(
+                    &outgoing_sender,
+                    &WsLagWarning {
+                        message_type: "warning",
+                        code: "CLIENT_LAGGED",
+                        message: "client lagged behind realtime stream".to_string(),
+                        topic: &topic,
+                        dropped_messages: skipped,
+                    },
+                ),
                 Err(broadcast::error::RecvError::Closed) => {
                     return;
                 }
+            };
+            if !delivered {
+                close_signal.notify_one();
+                return;
             }
         }
     })
+}
+
+/// Send `{"type":<kind>,"topic":<topic>,"data":<data>}` where the serialized
+/// `data` is shared across the publication's viewers. Byte-identical to
+/// serializing the corresponding `Ws*Update` envelope directly.
+fn send_shared_frame<T: Serialize>(
+    outgoing_sender: &Sender<Message>,
+    kind: &str,
+    topic_json: &str,
+    encoded: &EncodedPayloads,
+    variant: (usize, BookAmountMode),
+    data: &T,
+) -> bool {
+    let Some(data) = encoded.get_or_encode(variant, || match serde_json::to_string(data) {
+        Ok(data) => Some(data),
+        Err(err) => {
+            warn!(error = %err, "failed to serialize websocket message");
+            None
+        }
+    }) else {
+        return false;
+    };
+    send_ws_text(outgoing_sender, data_frame(kind, topic_json, &data))
+}
+
+fn data_frame(kind: &str, topic_json: &str, data: &str) -> String {
+    const TYPE: &str = "{\"type\":\"";
+    const TOPIC: &str = "\",\"topic\":";
+    const DATA: &str = ",\"data\":";
+    let mut frame = String::with_capacity(
+        TYPE.len() + kind.len() + TOPIC.len() + topic_json.len() + DATA.len() + data.len() + 1,
+    );
+    frame.push_str(TYPE);
+    frame.push_str(kind);
+    frame.push_str(TOPIC);
+    frame.push_str(topic_json);
+    frame.push_str(DATA);
+    frame.push_str(data);
+    frame.push('}');
+    frame
 }
 
 fn parse_stream_command(payload: &str) -> Result<ParsedStreamCommand, String> {
@@ -1252,6 +1362,10 @@ fn send_ws_json<T: Serialize>(outgoing_sender: &Sender<Message>, payload: &T) ->
         }
     };
 
+    send_ws_text(outgoing_sender, encoded)
+}
+
+fn send_ws_text(outgoing_sender: &Sender<Message>, encoded: String) -> bool {
     match outgoing_sender.try_send(Message::Text(encoded)) {
         Ok(()) => true,
         Err(TrySendError::Full(_)) => {
@@ -1320,6 +1434,87 @@ mod tests {
         // The owned source book stays full-depth; only the view is truncated.
         assert_eq!(source.bids.len(), 30);
         assert_eq!(source.asks.len(), 30);
+    }
+
+    #[test]
+    fn shared_frames_are_byte_identical_to_direct_serialization() {
+        let topic = RealtimeTopic::from_client_request(
+            Some("binance".to_string()),
+            Some("BTC/USDT:USDT".to_string()),
+            json!({"levels": 3, "category": "linear \"quoted\""}),
+        )
+        .expect("topic should be valid");
+        let topic_json = serde_json::to_string(&topic).unwrap();
+
+        let book = CcxtOrderBook {
+            asks: (1..=5).map(|level| (100.5 + level as f64, 0.001)).collect(),
+            bids: (1..=5).map(|level| (100.5 - level as f64, 1e-7)).collect(),
+            datetime: Some("2026-01-01T00:00:00.000Z".to_string()),
+            timestamp: Some(1_700_000_000_000),
+            nonce: None,
+            symbol: Some("BTC/USDT:USDT".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            data_frame(
+                "orderbook",
+                &topic_json,
+                &serde_json::to_string(&orderbook_view(&book, 3)).unwrap()
+            ),
+            serde_json::to_string(&WsOrderBookUpdate {
+                message_type: "orderbook",
+                topic: &topic,
+                data: orderbook_view(&book, 3),
+            })
+            .unwrap()
+        );
+
+        let trades = vec![CcxtTrade {
+            info: json!({"native": [1, "two"]}),
+            amount: Some(0.5),
+            datetime: None,
+            id: Some("42".to_string()),
+            order: None,
+            price: Some(101.25),
+            timestamp: Some(1_700_000_000_001),
+            trade_type: None,
+            side: Some("buy".to_string()),
+            symbol: Some("BTC/USDT:USDT".to_string()),
+            taker_or_maker: None,
+            cost: Some(50.625),
+            fee: None,
+        }];
+        assert_eq!(
+            data_frame(
+                "trades",
+                &topic_json,
+                &serde_json::to_string(&trades.as_slice()).unwrap()
+            ),
+            serde_json::to_string(&WsTradesUpdate {
+                message_type: "trades",
+                topic: &topic,
+                data: &trades,
+            })
+            .unwrap()
+        );
+
+        let candles: Vec<CcxtOhlcv> = vec![
+            (1_700_000_000_000, 1.0, 2.0, 0.5, 1.5, Some(10.0)),
+            (1_700_000_060_000, 1.5, 2.5, 1.0, 2.0, None),
+        ];
+        assert_eq!(
+            data_frame(
+                "ohlcv",
+                &topic_json,
+                &serde_json::to_string(&candles.as_slice()).unwrap()
+            ),
+            serde_json::to_string(&WsOhlcvUpdate {
+                message_type: "ohlcv",
+                topic: &topic,
+                data: &candles,
+            })
+            .unwrap()
+        );
     }
 
     #[test]

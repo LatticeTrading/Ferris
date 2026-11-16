@@ -125,7 +125,7 @@ fn live_subscription() -> (
 }
 
 fn publish(sender: &broadcast::Sender<Publication>, update: RealtimeUpdate) {
-    assert!(sender.send(Publication { epoch: 0, update }).is_ok());
+    assert!(sender.send(Publication::new(update)).is_ok());
 }
 
 fn patch(name: MarketStatsFieldName, at: Instant) -> RealtimeUpdate {

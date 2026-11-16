@@ -406,6 +406,7 @@ fn config(base: &str) -> Config {
         host: "127.0.0.1".into(),
         port: 0,
         hyperliquid_base_url: base.to_string(),
+        hyperliquid_catalog_ttl_ms: 30_000,
         extended_rest_base_url: "http://127.0.0.1:1/api/v1".into(),
         extended_ws_url: "ws://127.0.0.1:1".into(),
         lighter_rest_base_url: "http://127.0.0.1:1".into(),

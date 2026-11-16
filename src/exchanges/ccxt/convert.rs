@@ -237,7 +237,7 @@ fn nonnegative(value: Option<f64>, name: &str) -> Result<Option<f64>, ExchangeEr
 }
 
 mod snapshot;
-pub(super) use snapshot::{convert_book, convert_candles, convert_trades};
+pub(super) use snapshot::{convert_book, convert_book_to_depth, convert_candles, convert_trades};
 
 #[cfg(test)]
 mod market_tests;

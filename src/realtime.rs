@@ -3,7 +3,7 @@ use std::{
     collections::BTreeMap,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
 };
 
@@ -233,6 +233,8 @@ pub struct RealtimeReceiver {
     released: Arc<Notify>,
     initial: Option<Publication>,
     book_amount_mode: BookAmountMode,
+    /// Display depth registered as demand on the shared feed; 0 when none.
+    book_depth: usize,
 }
 
 impl RealtimeReceiver {
@@ -248,6 +250,7 @@ impl RealtimeReceiver {
             released,
             initial: None,
             book_amount_mode: BookAmountMode::Native,
+            book_depth: 0,
         }
     }
 
@@ -269,6 +272,7 @@ impl RealtimeReceiver {
             released,
             initial: None,
             book_amount_mode: BookAmountMode::Native,
+            book_depth: 0,
         })
     }
 
@@ -282,7 +286,36 @@ impl RealtimeReceiver {
         self
     }
 
+    /// Register this viewer's display depth as demand on the shared feed. The
+    /// owner then converts only as deep as the deepest current viewer, and this
+    /// receiver never observes a book truncated below its own depth.
+    pub(crate) fn with_book_depth(mut self, levels: usize) -> Self {
+        if levels != 0 && self.book_depth == 0 {
+            self.state.depth.register(levels);
+            self.book_depth = levels;
+        }
+        self
+    }
+
+    pub(crate) fn book_amount_mode(&self) -> BookAmountMode {
+        self.book_amount_mode
+    }
+
+    /// Whether another receiver currently shares this feed, i.e. whether an
+    /// encoded payload can be reused by anyone else.
+    pub(crate) fn is_shared(&self) -> bool {
+        self.state.viewers.load(Ordering::Relaxed) > 1
+    }
+
     pub async fn recv(&mut self) -> Result<RealtimeUpdate, broadcast::error::RecvError> {
+        self.recv_shared().await.map(|(update, _)| update)
+    }
+
+    /// Like [`Self::recv`], plus the publication's shared encoding cache so
+    /// that every viewer of one publication can reuse a single serialization.
+    pub(crate) async fn recv_shared(
+        &mut self,
+    ) -> Result<(RealtimeUpdate, Arc<EncodedPayloads>), broadcast::error::RecvError> {
         loop {
             let publication = match self.initial.take() {
                 Some(publication) => publication,
@@ -295,15 +328,22 @@ impl RealtimeReceiver {
             if matches!(&publication.update, RealtimeUpdate::Error(_))
                 || publication.epoch == self.state.epoch.load(Ordering::Acquire)
             {
-                return Ok(match publication.update {
+                let update = match publication.update {
                     RealtimeUpdate::OrderBook(book) => {
+                        // Converted before this viewer's deeper demand was
+                        // visible to the owner: wait for the next publication
+                        // rather than deliver a too-shallow book.
+                        if publication.book_depth < self.book_depth {
+                            continue;
+                        }
                         match book.amount_view(self.book_amount_mode) {
                             Ok(view) => RealtimeUpdate::OrderBook(view),
                             Err(error) => RealtimeUpdate::Error(error.to_string().into()),
                         }
                     }
                     other => other,
-                });
+                };
+                return Ok((update, publication.encoded));
             }
         }
     }
@@ -311,6 +351,9 @@ impl RealtimeReceiver {
 
 impl Drop for RealtimeReceiver {
     fn drop(&mut self) {
+        if self.book_depth != 0 {
+            self.state.depth.release(self.book_depth);
+        }
         if self.state.viewers.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.state.epoch.fetch_add(1, Ordering::AcqRel);
             self.released.notify_one();
@@ -322,6 +365,90 @@ impl Drop for RealtimeReceiver {
 pub(crate) struct DeliveryState {
     pub viewers: AtomicUsize,
     pub epoch: AtomicU64,
+    pub(crate) depth: DepthDemand,
+}
+
+/// Display depths requested by a feed's current book viewers. The acquisition
+/// owner reads only the cached maximum, once per update.
+#[derive(Default)]
+pub(crate) struct DepthDemand {
+    levels: parking_lot::Mutex<BTreeMap<usize, usize>>,
+    deepest: AtomicUsize,
+}
+
+impl DepthDemand {
+    fn register(&self, levels: usize) {
+        let mut all = self.levels.lock();
+        *all.entry(levels).or_insert(0) += 1;
+        self.deepest.store(
+            all.keys().next_back().copied().unwrap_or(0),
+            Ordering::Release,
+        );
+    }
+
+    fn release(&self, levels: usize) {
+        let mut all = self.levels.lock();
+        if let Some(viewers) = all.get_mut(&levels) {
+            *viewers -= 1;
+            if *viewers == 0 {
+                all.remove(&levels);
+            }
+        }
+        self.deepest.store(
+            all.keys().next_back().copied().unwrap_or(0),
+            Ordering::Release,
+        );
+    }
+
+    /// Depth the owner must publish to satisfy every current viewer. Without
+    /// registered demand the whole book is required.
+    pub(crate) fn required(&self) -> usize {
+        match self.deepest.load(Ordering::Acquire) {
+            0 => usize::MAX,
+            levels => levels,
+        }
+    }
+}
+
+/// Maximum distinct payload variants (display depth x amount unit) cached per
+/// publication. Further variants are encoded per viewer, as before.
+const ENCODED_VARIANTS: usize = 8;
+
+type EncodedSlot = Arc<OnceLock<Option<Arc<str>>>>;
+
+/// Serialized `data` payloads of one publication, shared by all its viewers so
+/// fan-out costs one serialization per distinct view instead of one per client.
+#[derive(Default)]
+pub(crate) struct EncodedPayloads {
+    slots: parking_lot::Mutex<Vec<((usize, BookAmountMode), EncodedSlot)>>,
+}
+
+impl EncodedPayloads {
+    /// The cached payload for `key`, encoding it at most once. `None` when the
+    /// encoder fails. Concurrent viewers of the same variant wait for the
+    /// first encoder; different variants encode in parallel.
+    pub(crate) fn get_or_encode(
+        &self,
+        key: (usize, BookAmountMode),
+        encode: impl FnOnce() -> Option<String>,
+    ) -> Option<Arc<str>> {
+        let slot = {
+            let mut slots = self.slots.lock();
+            match slots.iter().find(|(existing, _)| *existing == key) {
+                Some((_, slot)) => Some(Arc::clone(slot)),
+                None if slots.len() < ENCODED_VARIANTS => {
+                    let slot = EncodedSlot::default();
+                    slots.push((key, Arc::clone(&slot)));
+                    Some(slot)
+                }
+                None => None,
+            }
+        };
+        match slot {
+            Some(slot) => slot.get_or_init(|| encode().map(Arc::from)).clone(),
+            None => encode().map(Arc::from),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -331,10 +458,23 @@ mod tests;
 pub(crate) struct Publication {
     pub(crate) epoch: u64,
     pub(crate) update: RealtimeUpdate,
+    /// Deepest display depth a book publication can serve. `usize::MAX` unless
+    /// the owner converted fewer levels than the source book holds.
+    pub(crate) book_depth: usize,
+    pub(crate) encoded: Arc<EncodedPayloads>,
 }
 
 impl Publication {
     pub(crate) fn new(update: RealtimeUpdate) -> Self {
-        Self { epoch: 0, update }
+        Self::at(0, update)
+    }
+
+    pub(crate) fn at(epoch: u64, update: RealtimeUpdate) -> Self {
+        Self {
+            epoch,
+            update,
+            book_depth: usize::MAX,
+            encoded: Arc::default(),
+        }
     }
 }

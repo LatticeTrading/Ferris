@@ -28,7 +28,6 @@ use super::{
 };
 
 const COMMAND_CAPACITY: usize = 32;
-const CATALOG_TTL: Duration = Duration::from_secs(30);
 
 /// A successful source observation. Cache hits share this allocation and retain
 /// its original receipt timestamp and generation.
@@ -98,9 +97,9 @@ struct CatalogState {
 }
 
 impl CatalogState {
-    fn is_fresh(&self) -> bool {
+    fn is_fresh(&self, ttl: Duration) -> bool {
         self.loaded_at
-            .is_some_and(|loaded_at| loaded_at.elapsed() < CATALOG_TTL)
+            .is_some_and(|loaded_at| loaded_at.elapsed() < ttl)
     }
 }
 
@@ -362,7 +361,7 @@ async fn run_owner(
                 let state = catalogs.entry(scope).or_default();
                 if let Some(snapshot) = &state.snapshot {
                     if observed_generation.map_or_else(
-                        || state.is_fresh(),
+                        || state.is_fresh(config.catalog_ttl()),
                         |observed| observed < snapshot.generation,
                     ) {
                         let _ = reply.send(Ok(Arc::clone(snapshot)));
@@ -477,7 +476,7 @@ async fn run_snapshot(
             }
             return Err(error);
         }
-        let snapshot = if new_provider || !state.is_fresh() {
+        let snapshot = if new_provider || !state.is_fresh(config.catalog_ttl()) {
             load_catalog(venue, scope, config, state).await?
         } else {
             Arc::clone(state.snapshot.as_ref().expect("loaded catalog"))
@@ -519,7 +518,7 @@ async fn run_statistics(
     params: FetchMarketStatsParams,
 ) -> Result<MarketStatsSourceSnapshot, ExchangeError> {
     let result = std::panic::AssertUnwindSafe(async {
-        let snapshot = if state.provider.is_none() || !state.is_fresh() {
+        let snapshot = if state.provider.is_none() || !state.is_fresh(config.catalog_ttl()) {
             load_catalog(venue, scope, config, state).await?
         } else {
             Arc::clone(state.snapshot.as_ref().expect("loaded catalog"))

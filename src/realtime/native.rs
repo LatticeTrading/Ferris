@@ -48,10 +48,7 @@ pub(crate) struct Feed<S> {
 impl<S> Feed<S> {
     pub fn publish(&self, update: RealtimeUpdate) {
         let mut latest = self.latest.lock();
-        let publication = Publication {
-            epoch: self.delivery.epoch.load(Ordering::Acquire),
-            update,
-        };
+        let publication = Publication::at(self.delivery.epoch.load(Ordering::Acquire), update);
         *latest = Some(publication.clone());
         let _ = self.sender.send(publication);
     }
@@ -59,19 +56,13 @@ impl<S> Feed<S> {
     /// Native trade updates use this so a later viewer receives the latest
     /// snapshot, not a duplicate of an arbitrary update.
     pub fn publish_update(&self, update: RealtimeUpdate) {
-        let publication = Publication {
-            epoch: self.delivery.epoch.load(Ordering::Acquire),
-            update,
-        };
+        let publication = Publication::at(self.delivery.epoch.load(Ordering::Acquire), update);
         let _ = self.sender.send(publication);
     }
     pub fn invalidate(&self, error: &str) {
         let mut latest = self.latest.lock();
         let epoch = self.delivery.epoch.fetch_add(1, Ordering::AcqRel) + 1;
-        let publication = Publication {
-            epoch,
-            update: RealtimeUpdate::Error(error.into()),
-        };
+        let publication = Publication::at(epoch, RealtimeUpdate::Error(error.into()));
         *latest = Some(publication.clone());
         let _ = self.sender.send(publication);
     }

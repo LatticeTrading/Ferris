@@ -109,7 +109,7 @@ pub(in crate::exchanges::ccxt) fn data_default() -> (Option<UnifiedMarketType>, 
 pub(in crate::exchanges::ccxt) use super::coin_override as symbol_override;
 
 pub(in crate::exchanges::ccxt) use super::defaults::{
-    configure, display_quote, raw_symbol, trading_metadata,
+    catalog_ttl, configure, display_quote, raw_symbol, trading_metadata,
 };
 
 pub(in crate::exchanges::ccxt) const DATA_SCOPE: CatalogScope = CatalogScope::Linear;

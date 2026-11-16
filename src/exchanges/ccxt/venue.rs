@@ -86,6 +86,7 @@ pub enum CatalogScope {
 #[derive(Clone)]
 pub(super) struct ProviderConfig {
     value: Value,
+    catalog_ttl: std::time::Duration,
 }
 
 impl ProviderConfig {
@@ -102,7 +103,17 @@ impl ProviderConfig {
             "options": {"defaultType": "swap", "defaultSubType": "linear"}
         });
         super::venues::dispatch!(venue, exchange => exchange::configure(config, &mut value))?;
-        Ok(Self { value })
+        let catalog_ttl =
+            super::venues::dispatch!(venue, exchange => exchange::catalog_ttl(config));
+        if catalog_ttl.is_zero() {
+            return Err(ExchangeError::Internal("invalid CCXT catalog TTL".into()));
+        }
+        Ok(Self { value, catalog_ttl })
+    }
+
+    /// Age at which this venue's loaded metadata is reloaded on demand.
+    pub(super) fn catalog_ttl(&self) -> std::time::Duration {
+        self.catalog_ttl
     }
 
     pub(super) fn for_scope(&self, venue: Venue, scope: CatalogScope) -> ccxt::Value {

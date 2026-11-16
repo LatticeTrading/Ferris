@@ -59,6 +59,7 @@ async fn trade_owner_delivers_new_rows(venue: Venue) {
             "enableRateLimit":true, "urls":{"api":{"ws":ws}},
             "options":{"defaultType":"swap", "defaultSubType":"linear"}
         }),
+        catalog_ttl: Duration::from_secs(30),
     };
     let market = json!({
         "id":"BTCUSDT", "symbol":"BTC/USDT:USDT", "base":"BTC", "quote":"USDT", "settle":"USDT",

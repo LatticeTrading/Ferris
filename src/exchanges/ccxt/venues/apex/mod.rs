@@ -96,6 +96,6 @@ pub(in crate::exchanges::ccxt) fn trading_metadata(
 
 pub(in crate::exchanges::ccxt) use super::coin_override as symbol_override;
 pub(in crate::exchanges::ccxt) use super::defaults::{
-    catalog_default, category, data_default, display_quote, market_types, raw_symbol,
+    catalog_default, catalog_ttl, category, data_default, display_quote, market_types, raw_symbol,
 };
 pub(in crate::exchanges::ccxt) const DATA_SCOPE: CatalogScope = CatalogScope::Default;

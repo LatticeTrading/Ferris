@@ -11,7 +11,7 @@
 //! opaque catalog marketIds, client-side window filtering, missing values and
 //! the supported depth/limit boundaries.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
 use ferris_market_data_backend::{
@@ -209,6 +209,10 @@ struct Harness {
 
 impl Harness {
     async fn start() -> Self {
+        Self::start_with_catalog_ttl(30_000).await
+    }
+
+    async fn start_with_catalog_ttl(hyperliquid_catalog_ttl_ms: u64) -> Self {
         let mock = Mock::default();
         let upstream = Router::new()
             .route("/info", post(info))
@@ -226,6 +230,7 @@ impl Harness {
             port: 0,
             request_timeout_ms: 2_000,
             hyperliquid_base_url: format!("http://{upstream_addr}"),
+            hyperliquid_catalog_ttl_ms,
             extended_rest_base_url: "http://127.0.0.1:1/api/v1".into(),
             extended_ws_url: "ws://127.0.0.1:1".into(),
             lighter_rest_base_url: "http://127.0.0.1:1".into(),
@@ -808,5 +813,40 @@ async fn hyperliquid_books_route_primary_hip3_and_spot_with_depth_bounds() {
     )
     .await;
     assert_eq!(h.mock.calls.lock().await.len(), before);
+    h.stop().await;
+}
+
+/// One catalog load asks `perpDexs` exactly once, so its call count is the
+/// number of metadata loads the owner performed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hyperliquid_catalog_is_reloaded_only_after_its_configured_ttl() {
+    let book = json!({"symbol": "BTC/USDC:USDC", "limit": 1});
+
+    // Within the TTL every snapshot reuses the loaded metadata.
+    let h = Harness::start_with_catalog_ttl(600_000).await;
+    h.post("fetchOrderBook", book.clone(), StatusCode::OK).await;
+    assert_eq!(h.calls("perpDexs").await.len(), 1);
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    h.post("fetchOrderBook", book.clone(), StatusCode::OK).await;
+    h.post("fetchMarkets", json!({}), StatusCode::OK).await;
+    assert_eq!(
+        h.calls("perpDexs").await.len(),
+        1,
+        "metadata younger than the TTL must not be reloaded"
+    );
+    assert_eq!(h.calls("l2Book").await.len(), 2);
+    h.stop().await;
+
+    // Once it has expired, the next snapshot reloads it on demand, once.
+    let h = Harness::start_with_catalog_ttl(500).await;
+    h.post("fetchOrderBook", book.clone(), StatusCode::OK).await;
+    assert_eq!(h.calls("perpDexs").await.len(), 1);
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    h.post("fetchOrderBook", book, StatusCode::OK).await;
+    assert_eq!(
+        h.calls("perpDexs").await.len(),
+        2,
+        "expired metadata must be reloaded by the next request"
+    );
     h.stop().await;
 }

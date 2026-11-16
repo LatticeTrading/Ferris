@@ -29,12 +29,13 @@ fn snapshot(generation: u64, ids: &[u64]) -> Arc<CatalogSnapshot> {
     })
 }
 
-pub(super) fn provider_config(venue: Venue) -> ProviderConfig {
-    let config = Config {
+fn config() -> Config {
+    Config {
         host: "127.0.0.1".into(),
         port: 0,
         request_timeout_ms: 100,
         hyperliquid_base_url: "http://127.0.0.1:1".into(),
+        hyperliquid_catalog_ttl_ms: 30_000,
         extended_rest_base_url: "http://127.0.0.1:1/api/v1".into(),
         extended_ws_url: "ws://127.0.0.1:1".into(),
         lighter_rest_base_url: "http://127.0.0.1:1".into(),
@@ -53,8 +54,34 @@ pub(super) fn provider_config(venue: Venue) -> ProviderConfig {
         nado_gateway_base_url: "http://127.0.0.1:1".into(),
         nado_archive_base_url: "http://127.0.0.1:1".into(),
         nado_ws_url: "ws://127.0.0.1:1".into(),
-    };
-    ProviderConfig::new(venue, &config).unwrap()
+    }
+}
+
+pub(super) fn provider_config(venue: Venue) -> ProviderConfig {
+    ProviderConfig::new(venue, &config()).unwrap()
+}
+
+#[test]
+fn only_hyperliquid_metadata_follows_the_configured_catalog_ttl() {
+    let mut config = config();
+    config.hyperliquid_catalog_ttl_ms = 300_000;
+    for venue in Venue::ALL {
+        let expected = if venue == Venue::Hyperliquid {
+            Duration::from_secs(300)
+        } else {
+            Duration::from_secs(30)
+        };
+        assert_eq!(
+            ProviderConfig::new(venue, &config).unwrap().catalog_ttl(),
+            expected,
+            "{}",
+            venue.public_id()
+        );
+    }
+    // A zero TTL would reload metadata on every request.
+    config.hyperliquid_catalog_ttl_ms = 0;
+    assert!(ProviderConfig::new(Venue::Hyperliquid, &config).is_err());
+    assert!(ProviderConfig::new(Venue::Binance, &config).is_ok());
 }
 
 #[tokio::test]

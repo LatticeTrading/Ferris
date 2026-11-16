@@ -25,6 +25,11 @@ pub(in crate::exchanges::ccxt) fn configure(
     Ok(())
 }
 
+/// How long loaded stock metadata is reused before a request reloads it.
+pub(in crate::exchanges::ccxt) fn catalog_ttl(_config: &Config) -> std::time::Duration {
+    std::time::Duration::from_secs(30)
+}
+
 /// Default interpretation, deliberately shared by every existing venue.
 /// A venue with a justified exception can wrap/replace this function locally;
 /// it receives the loaded market (including raw unified fields) and its info.

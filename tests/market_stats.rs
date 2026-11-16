@@ -220,6 +220,7 @@ fn disabled_config(timeout_ms: u64) -> Config {
         host: "127.0.0.1".into(),
         port: 0,
         hyperliquid_base_url: "http://127.0.0.1:1".into(),
+        hyperliquid_catalog_ttl_ms: 30_000,
         extended_rest_base_url: "http://127.0.0.1:1/api/v1".into(),
         extended_ws_url: "ws://127.0.0.1:1".into(),
         lighter_rest_base_url: "http://127.0.0.1:1".into(),
@@ -553,6 +554,76 @@ async fn hyperliquid_mixed_primary_and_hip3_scopes_share_http_and_ws_acquisition
         ws_unsubscribe(&mut socket, &view.topic).await;
         ws_disconnect(socket).await;
     }
+    state.shutdown_market_stats().await;
+    let _ = stop.send(());
+    server.await.unwrap();
+    let _ = up_stop.send(());
+    up_server.await.unwrap();
+}
+
+/// Production reuses Hyperliquid metadata for minutes. A statistics poll must
+/// still observe fresh values without reloading it; catalog membership (here a
+/// new listing) follows the next metadata load instead of the next poll.
+#[tokio::test]
+async fn hyperliquid_statistics_polls_reuse_metadata_within_its_ttl() {
+    let (mock, upstream, up_stop, up_server) = hyperliquid_server().await;
+    let mut config = disabled_config(2_000);
+    config.hyperliquid_base_url = upstream;
+    config.hyperliquid_catalog_ttl_ms = 600_000;
+    let source = Arc::new(CcxtExchange::new(
+        Venue::Hyperliquid,
+        CcxtService::start(&config).unwrap(),
+    ));
+    let (url, state, stop, server) = backend(source).await;
+    let btc = native_id("BTC");
+
+    let mut socket = stats_socket(&url).await;
+    ws_send(
+        &mut socket,
+        stats_command("subscribe", &json!({"fields": ["markPrice"]})),
+    )
+    .await;
+    let mut view = ws_initial(&mut socket).await;
+    assert_eq!(
+        view.markets[&btc]["fields"]["markPrice"]["value"]["amount"],
+        "60000"
+    );
+    assert_eq!(
+        mock.primary_calls(),
+        2,
+        "one metadata load and one ticker poll"
+    );
+
+    {
+        let mut primary = mock.primary.write().await;
+        primary.body[1][2]["markPx"] = json!("61000");
+        primary.body[0]["universe"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"name":"NEW","szDecimals":2}));
+        primary.body[1].as_array_mut().unwrap().push(json!(
+            {"funding":"0","markPx":"5","oraclePx":"5","dayNtlVlm":"1","openInterest":"1"}
+        ));
+    }
+    tokio::time::sleep(Duration::from_secs(31)).await;
+    let delta = ws_delta(&mut socket, &mut view).await;
+    assert_eq!(delta["removedMarketIds"], json!([]));
+    assert_eq!(
+        view.markets[&btc]["fields"]["markPrice"]["value"]["amount"], "61000",
+        "values come from the poll, not from the retained metadata"
+    );
+    assert!(
+        !view.markets.contains_key(&native_id("NEW")),
+        "membership follows the metadata load, not the statistics poll"
+    );
+    assert_eq!(
+        mock.primary_calls(),
+        3,
+        "a poll must not reload metadata that is still within its TTL"
+    );
+
+    ws_unsubscribe(&mut socket, &view.topic).await;
+    ws_disconnect(socket).await;
     state.shutdown_market_stats().await;
     let _ = stop.send(());
     server.await.unwrap();

@@ -114,7 +114,7 @@ pub(in crate::exchanges::ccxt) fn symbol_override(
 }
 
 pub(in crate::exchanges::ccxt) use super::defaults::{
-    catalog_default, category, configure, data_default, display_quote, market_types,
+    catalog_default, catalog_ttl, category, configure, data_default, display_quote, market_types,
     trading_metadata,
 };
 

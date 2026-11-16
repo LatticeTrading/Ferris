@@ -65,6 +65,14 @@ pub(in crate::exchanges::ccxt) fn configure(
     Ok(())
 }
 
+/// Loading this catalog costs one default-weight `info` request per deployer
+/// DEX (see `HIP3_DEX_LIMIT`) against a small per-IP budget that snapshots and
+/// statistics share. It is therefore reused for minutes; listings and
+/// delistings are observed at this cadence, not every 30 seconds.
+pub(in crate::exchanges::ccxt) fn catalog_ttl(config: &Config) -> std::time::Duration {
+    std::time::Duration::from_millis(config.hyperliquid_catalog_ttl_ms)
+}
+
 pub(in crate::exchanges::ccxt) fn scope(
     scope: CatalogScope,
 ) -> Result<CatalogScope, ExchangeError> {

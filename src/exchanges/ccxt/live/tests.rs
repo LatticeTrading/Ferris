@@ -130,3 +130,34 @@ fn feed_identity_is_native_and_perpetual_only() {
     assert!(feed().accepts_market(&perp));
     assert!(!feed().accepts_market(&spot));
 }
+
+#[test]
+fn shared_stream_is_recycled_only_once_retained_hashes_dominate() {
+    // Below the floor a restart would cost viewers more than it saves.
+    assert!(!recycle_due(0, 80));
+    assert!(!recycle_due(RETAINED_HASH_FLOOR - 1, 80));
+    assert!(recycle_due(RETAINED_HASH_FLOOR, 80));
+    // A large live population tolerates proportionally more retired hashes.
+    assert!(!recycle_due(RETAINED_HASH_FLOOR, 400));
+    assert!(!recycle_due(400 * RETAINED_HASH_RATIO - 1, 400));
+    assert!(recycle_due(400 * RETAINED_HASH_RATIO, 400));
+}
+
+#[test]
+fn retained_hashes_are_read_from_the_stock_client() {
+    let url = "ws://retained-hashes.test";
+    assert_eq!(retained_hashes(url, 0), 0, "no client, nothing retained");
+    ccxt_pro::pro::ws_client::mock_setup(url);
+    let client = ccxt_pro::pro::ws_client::get_client(url).expect("mock client");
+    let hashes: Vec<String> = (0..10).map(|index| format!("trade:M{index}")).collect();
+    client.note_futures(&hashes);
+    // Settling and taking a hash does not make stock forget it: this is the
+    // retention the recycle bounds. If a stock release starts pruning, this
+    // assertion documents that the recycle has become unnecessary.
+    client.resolve(&hashes[0], ccxt::Value::Bool(true));
+    assert!(client.take_settled(&hashes).is_some());
+    assert_eq!(retained_hashes(url, 0), 10);
+    assert_eq!(retained_hashes(url, 4), 6);
+    assert_eq!(retained_hashes(url, 40), 0);
+    ccxt_pro::pro::ws_client::drop_client(url);
+}

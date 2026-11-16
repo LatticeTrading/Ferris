@@ -101,7 +101,8 @@ pub(in crate::exchanges::ccxt) fn rest_provider(config: Option<ccxt::Value>) -> 
 }
 
 pub(in crate::exchanges::ccxt) use super::defaults::{
-    catalog_default, configure, data_default, market_types, raw_symbol, trading_metadata,
+    catalog_default, catalog_ttl, configure, data_default, market_types, raw_symbol,
+    trading_metadata,
 };
 
 pub(in crate::exchanges::ccxt) const DATA_SCOPE: CatalogScope = CatalogScope::Default;

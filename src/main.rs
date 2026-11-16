@@ -22,6 +22,12 @@ use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::{info, Level};
 use tracing_subscriber::{fmt, EnvFilter};
 
+// The stock CCXT engine allocates a dynamic value tree per upstream frame, on
+// one acquisition thread per venue URL. That allocation pattern is markedly
+// cheaper under mimalloc than under glibc malloc.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_tracing();
@@ -79,6 +85,9 @@ async fn main() -> anyhow::Result<()> {
 
     let (stop, stopping) = tokio::sync::oneshot::channel();
     let server = axum::serve(listener, app)
+        // Realtime frames are small, frequent writes. With Nagle's algorithm a
+        // frame waits for the peer's (delayed) ACK of the previous one.
+        .tcp_nodelay(true)
         .with_graceful_shutdown(async {
             let _ = stopping.await;
         })

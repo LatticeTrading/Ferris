@@ -204,6 +204,7 @@ impl Harness {
             port: 0,
             request_timeout_ms: 2000,
             hyperliquid_base_url: "http://127.0.0.1:1".into(),
+            hyperliquid_catalog_ttl_ms: 30_000,
             extended_rest_base_url: "http://127.0.0.1:1/api/v1".into(),
             extended_ws_url: "ws://127.0.0.1:1".into(),
             lighter_rest_base_url: "http://127.0.0.1:1".into(),

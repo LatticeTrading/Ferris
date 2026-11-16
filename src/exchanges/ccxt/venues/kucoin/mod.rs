@@ -127,7 +127,7 @@ pub(in crate::exchanges::ccxt) fn aliases(
 
 pub(in crate::exchanges::ccxt) use super::coin_override as symbol_override;
 pub(in crate::exchanges::ccxt) use super::defaults::{
-    catalog_default, category, display_quote, raw_symbol, trading_metadata,
+    catalog_default, catalog_ttl, category, display_quote, raw_symbol, trading_metadata,
 };
 
 /// KuCoin spot and perpetual display pairs share `BASE/QUOTE`, so a bare

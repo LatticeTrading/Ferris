@@ -20,7 +20,7 @@ use crate::{
 };
 
 use super::{
-    convert::{convert_book, convert_candles, convert_trades},
+    convert::{convert_book_to_depth, convert_candles, convert_trades},
     owner::CatalogSnapshot,
     stream::{
         control::{LiveEvent, UnsubscribeMode},
@@ -36,6 +36,15 @@ const MAX_SHARED_FEEDS: usize = 200;
 const UNSUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(10);
 const INITIAL_RECONNECT: Duration = Duration::from_millis(500);
 const MAX_RECONNECT: Duration = Duration::from_secs(15);
+/// The stock client keeps every message hash a connection has ever awaited
+/// and rebuilds a map of all of them for each frame, so frames get costlier
+/// with every feed that came and went (measured: +0.6us per retained hash and
+/// frame). Only a fresh connection drops them. The shared stream is restarted
+/// once the hashes retained for retired feeds reach both this floor and
+/// `RETAINED_HASH_RATIO` times the hashes still awaited, which bounds a frame
+/// at a few times its cost on a fresh connection.
+const RETAINED_HASH_FLOOR: usize = 512;
+const RETAINED_HASH_RATIO: usize = 4;
 
 /// Shared, owned catalog cell for maintained statistics and book metadata. The coordinator
 /// publishes a fresh snapshot after a REST catalog reload; the live feed merges
@@ -107,6 +116,12 @@ impl LiveHub {
             client_key,
         } = prepared;
         let mode = BookAmountMode::parse(&topic.params)?;
+        // Only book viewers bound the depth the owner has to convert.
+        let depth = if spec.channel == LiveChannel::Client(RealtimeChannel::OrderBook) {
+            levels
+        } else {
+            0
+        };
         loop {
             let waiting = {
                 let mut hub = self.state.lock();
@@ -121,7 +136,7 @@ impl LiveHub {
                             key: client_key,
                             topic,
                             levels_limit: levels,
-                            receiver: receiver.with_book_amount_mode(mode),
+                            receiver: receiver.with_book_amount_mode(mode).with_book_depth(depth),
                         });
                     }
                 }
@@ -139,7 +154,7 @@ impl LiveHub {
                             key: client_key,
                             topic,
                             levels_limit: levels,
-                            receiver: receiver.with_book_amount_mode(mode),
+                            receiver: receiver.with_book_amount_mode(mode).with_book_depth(depth),
                         });
                     }
                     Some(owner.finished.clone())
@@ -156,7 +171,7 @@ impl LiveHub {
                         key: client_key,
                         topic,
                         levels_limit: levels,
-                        receiver: receiver.with_book_amount_mode(mode),
+                        receiver: receiver.with_book_amount_mode(mode).with_book_depth(depth),
                     });
                 }
             };
@@ -389,10 +404,10 @@ impl ActiveFeed {
         }
     }
 
-    fn publish(&self, update: RealtimeUpdate) {
+    fn publish(&self, update: RealtimeUpdate, book_depth: usize) {
         let _ = self.feed.sender.send(Publication {
-            epoch: self.epoch,
-            update,
+            book_depth,
+            ..Publication::at(self.epoch, update)
         });
     }
 
@@ -417,6 +432,8 @@ enum SessionExit {
     Stop,
     Reconnect(ExchangeError),
     Reconfigure(Venue),
+    /// Too many retired message hashes are retained by the stock client.
+    Recycle(Venue),
 }
 
 fn desired_feeds(control: &Mutex<Control>) -> Vec<Arc<Feed>> {
@@ -538,6 +555,19 @@ async fn run_url(
                 // continuity but do not accumulate exponential reconnect delay.
                 delay = INITIAL_RECONNECT;
             }
+            SessionExit::Recycle(venue) => {
+                for feed in desired_feeds(&control) {
+                    publish_error(
+                        &feed,
+                        format!(
+                            "{}: restarting shared stream to release retired subscriptions",
+                            venue.public_id()
+                        ),
+                    );
+                }
+                // Housekeeping, not a transport failure: reconnect immediately.
+                delay = INITIAL_RECONNECT;
+            }
             SessionExit::Reconnect(error) => {
                 for feed in desired_feeds(&control) {
                     publish_error(&feed, error.to_string());
@@ -558,10 +588,10 @@ async fn run_url(
 
 fn publish_error(feed: &Feed, message: String) {
     let epoch = feed.delivery.epoch.fetch_add(1, Ordering::AcqRel) + 1;
-    let _ = feed.sender.send(Publication {
+    let _ = feed.sender.send(Publication::at(
         epoch,
-        update: RealtimeUpdate::Error(message.into()),
-    });
+        RealtimeUpdate::Error(message.into()),
+    ));
 }
 
 async fn run_session(
@@ -676,6 +706,9 @@ async fn run_session(
             cache_routes.retain(|_, key| active.contains_key(key));
             rebuild_hashes(&active, &retiring, &mut hashes);
             reconcile = false;
+            if recycle_due(retained_hashes(url, hashes.len()), hashes.len()) {
+                break 'session SessionExit::Recycle(first.spec.venue);
+            }
         }
         let deadline = retiring.values().map(|feed| feed.deadline).min();
         let result = tokio::select! {
@@ -701,6 +734,9 @@ async fn run_session(
                     provider.clear_feed(&retired.spec);
                 }
                 rebuild_hashes(&active, &retiring, &mut hashes);
+                if recycle_due(retained_hashes(url, hashes.len()), hashes.len()) {
+                    break 'session SessionExit::Recycle(first.spec.venue);
+                }
                 continue;
             },
             result = provider.next(url, &hashes) => result,
@@ -760,6 +796,9 @@ async fn run_session(
                     provider.clear_feed(&retired.spec);
                 }
                 rebuild_hashes(&active, &retiring, &mut hashes);
+                if recycle_due(retained_hashes(url, hashes.len()), hashes.len()) {
+                    break 'session SessionExit::Recycle(first.spec.venue);
+                }
             }
             continue;
         }
@@ -819,11 +858,18 @@ async fn run_session(
         if spec.channel != LiveChannel::Statistics {
             current.retained = Some(raw.clone());
         }
+        // Convert only as deep as the deepest current viewer renders; the
+        // stock book itself stays complete.
+        let mut book_depth = usize::MAX;
         let update = match spec.channel {
             LiveChannel::Client(RealtimeChannel::OrderBook) => {
+                let demanded = current.feed.delivery.depth.required();
                 book_policy(current, &spec)
                     .and_then(|policy| {
-                        convert_book(raw, &spec.symbol).map(|book| book.with_policy(policy))
+                        convert_book_to_depth(raw, &spec.symbol, demanded).map(|(book, served)| {
+                            book_depth = served;
+                            book.with_policy(policy)
+                        })
                     })
                     .map(|book| {
                         // Binance also resolves its REST seed, before a WS bridge. This
@@ -854,7 +900,7 @@ async fn run_session(
         match update {
             Ok(Some(update)) => {
                 current.ready = true;
-                current.publish(update);
+                current.publish(update, book_depth);
             }
             Ok(None) => {}
             Err(error) => break SessionExit::Reconnect(error),
@@ -1020,6 +1066,22 @@ fn statistics_update(
         });
     }
     Ok(rows)
+}
+
+/// Message hashes the stock client at `url` retains beyond the `awaited` ones.
+/// Read from the client itself, so this stays zero if stock ever prunes them.
+fn retained_hashes(url: &str, awaited: usize) -> usize {
+    ccxt_pro::pro::ws_client::get_client(url).map_or(0, |client| {
+        client
+            .futures_value()
+            .as_map()
+            .map_or(0, |hashes| hashes.len())
+            .saturating_sub(awaited)
+    })
+}
+
+fn recycle_due(retained: usize, awaited: usize) -> bool {
+    retained >= RETAINED_HASH_FLOOR.max(awaited.saturating_mul(RETAINED_HASH_RATIO))
 }
 
 fn rebuild_hashes(

@@ -47,6 +47,7 @@ impl Source {
             host: "127.0.0.1".into(),
             port: 0,
             hyperliquid_base_url: base_url.clone(),
+            hyperliquid_catalog_ttl_ms: 30_000,
             extended_rest_base_url: format!("{base_url}/api/v1"),
             extended_ws_url: "ws://127.0.0.1/unused".into(),
             lighter_rest_base_url: base_url.clone(),

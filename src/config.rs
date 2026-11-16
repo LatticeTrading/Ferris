@@ -5,6 +5,9 @@ pub struct Config {
     pub host: String,
     pub port: u16,
     pub hyperliquid_base_url: String,
+    /// How long loaded Hyperliquid market metadata is reused before a request
+    /// reloads it. Every other venue reloads after 30 seconds.
+    pub hyperliquid_catalog_ttl_ms: u64,
     pub extended_rest_base_url: String,
     pub extended_ws_url: String,
     pub lighter_rest_base_url: String,
@@ -46,6 +49,17 @@ impl Config {
             .trim()
             .trim_end_matches('/')
             .to_string();
+
+        // One catalog load is a metadata request per deployer DEX at the
+        // default `info` weight (20 of 1200 per minute and IP), so Hyperliquid
+        // metadata is kept for minutes instead of the usual 30 seconds.
+        let hyperliquid_catalog_ttl_ms = match std::env::var("HYPERLIQUID_CATALOG_TTL_MS") {
+            Ok(value) => value
+                .trim()
+                .parse::<u64>()
+                .with_context(|| format!("invalid HYPERLIQUID_CATALOG_TTL_MS value: {value}"))?,
+            Err(_) => 300_000,
+        };
 
         let extended_rest_base_url = std::env::var("EXTENDED_REST_BASE_URL")
             .unwrap_or_else(|_| "https://api.starknet.extended.exchange/api/v1".to_string())
@@ -157,6 +171,7 @@ impl Config {
             host,
             port,
             hyperliquid_base_url,
+            hyperliquid_catalog_ttl_ms,
             extended_rest_base_url,
             extended_ws_url,
             lighter_rest_base_url,
