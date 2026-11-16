@@ -46,9 +46,9 @@ Frontend apps (including Electron and web frontends) often cannot directly use s
 - Realtime endpoint:
   - `GET /v1/ws` (channels `trades`, `orderbook`, `ohlcv`, `marketstats`)
 - Realtime channel support:
-  - `trades`: `hyperliquid`, `binance`, `bybit`, `aster`, `extended`, `lighterxyz`, `apex`, `bitfinex`, `kucoin`, `nado`, `phoenix` (Nado production handshake blocked; see below)
-  - `orderbook`: `hyperliquid`, `binance`, `bybit`, `aster`, `extended`, `lighterxyz`, `apex`, `bitfinex`, `kucoin`, `phoenix`
-  - `ohlcv`: `hyperliquid`, `binance`, `bybit`, `aster`, `extended`, `apex`, `bitfinex`, `kucoin`, `nado`, `phoenix` (Nado production handshake blocked; see below)
+  - `trades`: `hyperliquid`, `binance`, `bybit`, `aster`, `extended`, `lighterxyz`, `apex`, `bitfinex`, `kucoin`, `nado`, `phoenix`, `perpl` (Nado production handshake blocked; see below)
+  - `orderbook`: `hyperliquid`, `binance`, `bybit`, `aster`, `extended`, `lighterxyz`, `apex`, `bitfinex`, `kucoin`, `phoenix`, `perpl`
+  - `ohlcv`: `hyperliquid`, `binance`, `bybit`, `aster`, `extended`, `apex`, `bitfinex`, `kucoin`, `nado`, `phoenix`, `perpl` (Nado production handshake blocked; see below)
   - `marketstats`: `hyperliquid`, `binance`, `bybit`, `extended`, `aster`, `apex`, `bitfinex` (`sharedPolling`), `lighterxyz` (`sharedPollingAndWebSocket`), `kucoin`, `nado` (`sharedPolling`), `variational` (`sharedPolling`), `phoenix` (`sharedPolling`)
 - exchange supported:
   - `hyperliquid` (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`, `fetchMarkets`, `fetchMarketStats`)
@@ -62,9 +62,9 @@ Frontend apps (including Electron and web frontends) often cannot directly use s
   - `kucoin` spot and perpetuals: all five snapshot endpoints and all four realtime channels; see [KuCoin support](#kucoin-support)
   - `phoenix` Eternal perpetuals: native `fetchMarkets`, `fetchTickers`, `fetchTrades`, `fetchOHLCV`, `fetchOrderBook`, and exchange-snapshot-backed market stats; ticker prices use a shared `allMids` WebSocket subscription and are explicitly mid-prices, with open interest from the bulk exchange snapshot. Funding, 24h volume, mark/index prices in bulk stats, and last price remain unavailable. Market symbols accept `BASE`, `BASE/USD`, and `BASE/USD:USD` and display as `BASE/USD`.
   - `variational` perpetual and swap listings: `fetchMarkets` and polling-backed `fetchMarketStats`
-  - `perpl` isolated perpetuals: native `fetchMarkets`, bulk `fetchTickers`, OHLCV, L2 order books (maximum 100 levels), and polling-backed market stats. Perpl's all-market ticker endpoint is shared for mark/index/last prices, volume, and open interest; public REST trade history and native realtime channels are explicitly unsupported until their contracts are verified.
+  - `perpl` isolated perpetuals: native `fetchMarkets`, bulk `fetchTickers`, OHLCV, L2 order books (maximum 100 levels), polling-backed market stats, and shared native realtime trades, books, and candles. Runtime catalog metadata supplies numeric market IDs and decimal scales; REST trade history remains explicitly unsupported.
   - market-data only (no private trading endpoints yet)
-- Extended's standard websocket order book is indicative, not the RFQ real-book stream. Spot, private trading/account, funding history, and account streams are not supported.
+- For Extended RFQ markets (`info.isRfq: true`), the standard REST and websocket books are indicative, not the RFQ real-book stream. Ordinary order-book markets are distinct; this is not an exchange-wide liquidity limitation. Spot, private trading/account, funding history, and account streams are not supported.
 - Extended REST and websocket URLs are configurable for testnet deployments.
 
 ## CCXT REST snapshot contract
@@ -84,6 +84,7 @@ Deployment note: `/v1/ws` is a required HTTP WebSocket-upgrade route. A plain `G
 - Trades are newest-first; candles are oldest-first. `since` and end bounds are inclusive milliseconds. Recent-only trade APIs filter their returned window; requesting an old time does not create historical coverage.
 - Candles remain `[timestamp, open, high, low, close, volume]`; volume is `null` when stock omits it, including Bybit mark/index/premium-index and Extended mark/index candles. Missing/nonfinite required prices or invalid book levels produce `UPSTREAM_DATA_INVALID`, not zero-filled data.
 - Book timestamps/nonces retain stock provenance. Extended REST book time is CCXT receipt time, not exchange time; Lighter REST book time/nonce are absent; Bybit full/RPI books have no nonce from the stock parser. Lighter returns individual orders, so multiple rows can share a price; these are not aggregated price levels.
+- Book amounts are not universally base-asset quantities: current REST and live paths retain venue/product units. See the [amount-unit audit and opt-in normalization proposal](ORDER_BOOK_AMOUNTS.md), including multiplier pitfalls and separate liquidity/integrity semantics. The proposed API fields are not implemented.
 
 ### Limits and optional sources
 
@@ -97,6 +98,20 @@ Book display depth uses top-level `limit`, then `params.levels`, `depth`, `limit
 - Lighter retains `set_timestamp_to_end`/`setTimestampToEnd`. Hyperliquid books retain `nSigFigs` and `mantissa`. Binance linear and Bybit contract books expose `rpi: true`; Bybit RPI is capped at 1,000.
 - Unknown/unavailable options return 501 / `UNSUPPORTED_FEATURE`; invalid symbols or conflicting selectors return 400 / `BAD_SYMBOL`. Catalog errors retain the nested `{error:{code,message}}` envelope; ordinary snapshot errors remain flat `{code,message}`.
 - The public catalog response cache remains 30 seconds, keyed by exchange, `includeInactive`, and canonical params, including its response timestamp. CCXT metadata is shared separately per acquisition profile and refreshed on demand after 30 seconds; refresh failure returns an error without overwriting the prior owned observation.
+
+## Perpl native realtime contract
+
+`trades`, `orderbook`, and `ohlcv` use an exchange-neutral shared native owner, not CCXT or one socket per downstream client. Symbols resolve through the runtime catalog to numeric market IDs. Topic identity includes chain and endpoint identity; separate mainnet/testnet adapter instances have independent caches and owners.
+
+- Identical topics share a feed. Book `params.levels`, `depth`, or `limit` (1–100, default 100) is only a downstream projection; the native snapshot-plus-delta state is not truncated. REST books remain capped at 100.
+- Connections pack up to 16 streams, coalesce requests in 25ms batches, and allow at most ten subscription/unsubscription frames in any rolling minute. Retiring streams occupy slots until acknowledged. Reconfiguration beyond that budget waits; it does not open sockets to evade the limit.
+- Last-receiver drop releases demand; idle connections close. Shutdown cancels pending connects, reads, backoff, and rate-limited reconfiguration, joins workers, and closes receivers. Broadcast queues hold 128 publications; existing downstream queues hold 256 messages and close slow clients. Lag is explicit.
+- Reconnect uses 250ms–15s exponential backoff and resubscribes for fresh snapshots. Invalid book updates clear native state and invalidate queued old publications before unsubscribe/resubscribe. Per-entry subscription errors are surfaced without killing healthy streams; retry a rejected topic by releasing and resubscribing it.
+- Perpl book `sn` values are **not guaranteed contiguous**. Ordinary sequence jumps are accepted, not misclassified as missing deltas. Regressing provenance and malformed state trigger resynchronization; undetectable upstream omissions cannot be proven absent without a reliable sequence/checksum contract.
+- Candles support `1m`, `5m`, `15m`, `30m`, `1h`, `2h`, `4h`, `8h`, `12h`, `1d`. The documented upstream name is `candles@id*seconds`. Snapshot/update rows replace by timestamp in a bounded 1024-row oldest-first window, retaining the mutable candle. Prices, sizes, and collateral volume scales come from context metadata.
+- `market-state@chain` is all-market. Native WS statistics are intentionally deferred: marketstats remains shared bulk REST polling (30s), with Ferris snapshot/delta delivery. REST trade history, private/account streams, RPC and SDK sources remain unsupported.
+
+Protocol tests use deterministic peers based on [Perpl API docs](https://github.com/PerplFoundation/api-docs/blob/main/websocket.md). The public protocol does not establish continuous book sequence numbers. Unsubscribe acknowledgement and snapshot-before/after-ACK ordering should be reconfirmed against production when the upstream contract changes; no live-production continuity guarantee is implied.
 
 ## CCXT realtime contract
 
@@ -115,7 +130,7 @@ Book display depth uses `params.levels`, then `depth`, then `limit`. Zero is inv
 | Hyperliquid | 20 / 20 | Stock full snapshots; `nSigFigs` and `mantissa` retain distinct acquisition identity |
 | Aster | 20 / 20 | Stock partial-depth 20 stream; the former deep diff-book path is removed |
 | Lighter (`lighterxyz`) | 20 / all retained source levels | Stock full book; nonce is `offset`, not the old native `nonce` |
-| Extended | 20 / 1,000 | Stock standard indicative book; not RFQ liquidity; depth 1 is a view, not a different endpoint |
+| Extended | 20 / 1,000 | Stock standard book; indicative for RFQ markets, not their real-book liquidity; depth 1 is a view, not a different endpoint |
 | Apex | 25 / 200 | Fixed `orderBook200` topic; all display depths share the same backing book |
 | Bitfinex | 25 / 100 | Fixed 100-level `P0` price-aggregated book; stock checksum covers only top 25 |
 | KuCoin | 25 / 100 | Fixed incremental topic per symbol; the REST snapshot is seeded on the first delta and replayed; stock owns sequence maintenance |
@@ -752,7 +767,7 @@ Websocket subscription (`GET /v1/ws`):
 {"op":"subscribe","channel":"orderbook","exchange":"extended","symbol":"BTC/USD:USD","params":{"levels":10}}
 ```
 
-Extended realtime book depth must be 1–1,000; zero/over-depth requests fail rather than clamp. Depth 1 is a view of the maintained standard indicative book, not a different upstream endpoint. WS time/nonce follow stock `ts`/`seq`; accepted stock continuity/retention risks remain, so updates do not prove synchronization correctness. REST depth must be 1–1,000; its timestamp is CCXT receipt time and nonce is null.
+Extended realtime book depth must be 1–1,000; zero/over-depth requests fail rather than clamp. Depth 1 is a view of the maintained standard book, not a different upstream endpoint. For RFQ markets (`info.isRfq: true`), both this stream and REST return indicative quotes, not the separate `/orderbooks/rfq/{market}` real book. Non-RFQ markets use ordinary order books; see the [amount/liquidity audit](ORDER_BOOK_AMOUNTS.md). WS time/nonce follow stock `ts`/`seq`; accepted stock continuity/retention risks remain, so updates do not prove synchronization correctness. REST depth must be 1–1,000; its timestamp is CCXT receipt time and nonce is null.
 
 ## Running locally
 
@@ -792,7 +807,8 @@ Defaults:
 - `PHOENIX_API_URL` (default: `https://perp-api.phoenix.trade`)
 - `PHOENIX_WS_URL` (default: `wss://perp-api.phoenix.trade/v1/ws`)
 - `PERPL_API_URL` (default: `https://app.perpl.xyz/api`; use the testnet API URL and `PERPL_CHAIN_ID=10143` together for testnet)
-- `PERPL_CHAIN_ID` (default: `143`; catalog identity is rejected when the context chain differs)
+- `PERPL_CHAIN_ID` (default: `143`, or `10143` for the testnet API host; catalog identity is rejected when the context chain differs)
+- `PERPL_WS_URL` (default: `wss://app.perpl.xyz/ws/v1/market-data`, or the testnet host for chain `10143`; a host-only URL also gets the market-data path)
 - `REQUEST_TIMEOUT_MS` (default: `10000`)
 - `RUST_LOG` (default: `info`)
 - `LIGHTER_REST_BASE_URL` (default: `https://mainnet.zklighter.elliot.ai`; CCXT catalog, snapshots, and statistics polling)

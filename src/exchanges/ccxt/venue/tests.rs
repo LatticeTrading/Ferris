@@ -50,7 +50,7 @@ async fn trade_owner_delivers_new_rows(venue: Venue) {
         }
     });
     let ws = if venue == Venue::Binance {
-        json!({"future":url})
+        json!({"linear":url})
     } else {
         json!({"public":{"linear":url}})
     };

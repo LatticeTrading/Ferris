@@ -43,12 +43,14 @@ async fn main() -> anyhow::Result<()> {
         registry.register(Arc::new(CcxtExchange::new(venue, ccxt.clone())));
     }
     registry.register(phoenix.clone());
-    registry.register(perpl);
+    registry.register(perpl.clone());
     registry.register(Arc::new(
         VariationalExchange::new().context("failed to start Variational adapter")?,
     ));
 
-    let realtime = RealtimeService::new(ccxt.clone()).with_phoenix(phoenix);
+    let realtime = RealtimeService::new(ccxt.clone())
+        .with_native(phoenix)
+        .with_native(perpl);
 
     let state = AppState::new(Arc::new(registry), realtime);
 

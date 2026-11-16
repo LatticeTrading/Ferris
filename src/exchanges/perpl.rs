@@ -27,6 +27,9 @@ use std::{
 };
 use tokio::sync::Mutex;
 use tokio::time::Instant;
+mod realtime;
+mod wire;
+
 const API: &str = "https://app.perpl.xyz/api";
 const SOURCE: &str = "perpl:v1/market-data/ticker";
 const POLL: Duration = Duration::from_secs(30);
@@ -39,11 +42,17 @@ pub struct PerplExchange {
     cache: Arc<Mutex<Option<(Instant, Arc<Vec<Market>>)>>>,
     stats_cache: Arc<Mutex<Option<(Instant, Arc<(Instant, Vec<MarketStatsRow>)>)>>>,
     chain_id: u64,
+    live: Arc<crate::realtime::native::SharedHub<realtime::PerplProtocol>>,
+    network_key: String,
 }
 #[derive(Debug, Clone, Deserialize)]
 struct Market {
     id: u64,
     perpetual_id: u64,
+    instance_id: u64,
+    #[serde(default)]
+    #[serde(skip)]
+    collateral_decimals: u32,
     name: String,
     #[allow(dead_code)]
     size_units: String,
@@ -107,6 +116,21 @@ struct Context {
     markets: Vec<Market>,
     #[serde(default)]
     chain: Option<Chain>,
+    #[serde(default)]
+    instances: Vec<Instance>,
+    #[serde(default)]
+    tokens: Vec<Token>,
+}
+#[derive(Deserialize)]
+struct Instance {
+    id: u64,
+    collateral_token_id: u64,
+}
+#[derive(Deserialize)]
+struct Token {
+    #[serde(default)]
+    id: u64,
+    decimals: u32,
 }
 #[derive(Deserialize)]
 struct Chain {
@@ -150,10 +174,46 @@ struct Candle {
 }
 impl PerplExchange {
     pub fn new() -> Result<Self, ExchangeError> {
-        Self::with_base_url(std::env::var("PERPL_API_URL").unwrap_or_else(|_| API.into()))
+        let api = std::env::var("PERPL_API_URL").unwrap_or_else(|_| API.into());
+        let chain = std::env::var("PERPL_CHAIN_ID")
+            .ok()
+            .map(|v| v.parse::<u64>())
+            .transpose()
+            .map_err(|_| ExchangeError::Internal("invalid PERPL_CHAIN_ID".into()))?
+            .unwrap_or(if api.contains("testnet.perpl.xyz") {
+                10143
+            } else {
+                143
+            });
+        let ws = std::env::var("PERPL_WS_URL").unwrap_or_else(|_| default_ws(chain).into());
+        Self::with_urls(api, ws, chain)
     }
     pub fn with_base_url(url: impl Into<String>) -> Result<Self, ExchangeError> {
-        let api = url.into().trim_end_matches('/').to_string();
+        let api = url.into();
+        let chain = if api.contains("testnet.perpl.xyz") {
+            10143
+        } else {
+            143
+        };
+        Self::with_urls(api, default_ws(chain), chain)
+    }
+    /// Independent network-scoped adapter/cache/owner, also used by mock servers.
+    pub fn with_urls(
+        api: impl Into<String>,
+        ws: impl Into<String>,
+        chain_id: u64,
+    ) -> Result<Self, ExchangeError> {
+        let api = api.into().trim_end_matches('/').to_string();
+        let mut ws =
+            reqwest::Url::parse(&ws.into()).map_err(|e| ExchangeError::Internal(e.to_string()))?;
+        if !matches!(ws.scheme(), "ws" | "wss") {
+            return Err(ExchangeError::Internal(
+                "Perpl WS URL must use ws/wss".into(),
+            ));
+        }
+        if ws.path() == "/" {
+            ws.set_path("/ws/v1/market-data");
+        }
         if api.is_empty() {
             return Err(ExchangeError::Internal(
                 "Perpl API URL must not be empty".into(),
@@ -166,13 +226,15 @@ impl PerplExchange {
             .map_err(|e| ExchangeError::Internal(e.to_string()))?;
         Ok(Self {
             client,
-            api,
+            api: api.clone(),
             cache: Arc::new(Mutex::new(None)),
             stats_cache: Arc::new(Mutex::new(None)),
-            chain_id: std::env::var("PERPL_CHAIN_ID")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(143),
+            chain_id,
+            network_key: json!([chain_id, &api, ws.as_str()]).to_string(),
+            live: Arc::new(crate::realtime::native::SharedHub::new(
+                ws.to_string(),
+                realtime::PerplProtocol,
+            )),
         })
     }
     async fn get<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T, ExchangeError> {
@@ -199,19 +261,40 @@ impl PerplExchange {
                 return Ok(v.clone());
             }
         }
-        let context: Context = self.get("/v1/pub/context").await?;
+        let mut context: Context = self.get("/v1/pub/context").await?;
+        if context.instances.is_empty() || context.tokens.is_empty() {
+            return Err(ExchangeError::UpstreamData(
+                "Perpl context has no collateral catalog".into(),
+            ));
+        }
         if context
             .chain
             .as_ref()
-            .is_some_and(|x| x.chain_id != self.chain_id)
+            .is_none_or(|x| x.chain_id != self.chain_id)
         {
             return Err(ExchangeError::UpstreamData(
                 "Perpl context chain ID does not match configured PERPL_CHAIN_ID".into(),
             ));
         }
         let mut ids = HashSet::new();
-        for m in &context.markets {
-            if !ids.insert(m.id)
+        for m in &mut context.markets {
+            m.collateral_decimals = context
+                .instances
+                .iter()
+                .find(|i| i.id == m.instance_id)
+                .and_then(|i| {
+                    context
+                        .tokens
+                        .iter()
+                        .find(|t| t.id == i.collateral_token_id)
+                })
+                .map(|t| t.decimals)
+                .filter(|d| *d <= 18)
+                .ok_or_else(|| {
+                    ExchangeError::UpstreamData("missing Perpl collateral scale".into())
+                })?;
+            if m.id == 0
+                || !ids.insert(m.id)
                 || m.id != m.perpetual_id
                 || m.name.trim().is_empty()
                 || m.config.price_decimals > 18
@@ -229,15 +312,32 @@ impl PerplExchange {
     async fn resolve(&self, s: &str) -> Result<Market, ExchangeError> {
         let input = s.trim();
         let name = alias_name(input);
-        self.markets()
-            .await?
-            .iter()
-            .find(|m| m.name.eq_ignore_ascii_case(name) || m.id.to_string() == input)
-            .cloned()
-            .ok_or_else(|| ExchangeError::BadSymbol(format!("unknown Perpl market `{s}`")))
+        let markets = self.markets().await?;
+        if let Ok(id) = input.parse::<u64>() {
+            return markets
+                .iter()
+                .find(|m| m.id == id)
+                .cloned()
+                .ok_or_else(|| ExchangeError::BadSymbol(format!("unknown Perpl market `{s}`")));
+        }
+        let mut matches = markets.iter().filter(|m| m.name.eq_ignore_ascii_case(name));
+        let found = matches.next().cloned();
+        if matches.next().is_some() {
+            return Err(ExchangeError::BadSymbol(
+                "ambiguous Perpl symbol; use numeric market ID".into(),
+            ));
+        }
+        found.ok_or_else(|| ExchangeError::BadSymbol(format!("unknown Perpl market `{s}`")))
     }
     async fn ticker(&self) -> Result<TickerEnvelope, ExchangeError> {
         self.get("/v1/market-data/ticker").await
+    }
+}
+fn default_ws(chain: u64) -> &'static str {
+    if chain == 10143 {
+        "wss://testnet.perpl.xyz/ws/v1/market-data"
+    } else {
+        "wss://app.perpl.xyz/ws/v1/market-data"
     }
 }
 fn scale(n: i64, d: u32) -> Option<f64> {
@@ -324,6 +424,9 @@ impl MarketDataExchange for PerplExchange {
     fn id(&self) -> &'static str {
         "perpl"
     }
+    fn market_stats_source(&self) -> Option<&dyn MarketStatsSource> {
+        Some(self)
+    }
     fn capabilities(&self) -> ExchangeDataCapabilities {
         let p = vec![UnifiedMarketType::Perp];
         ExchangeDataCapabilities {
@@ -337,17 +440,23 @@ impl MarketDataExchange for PerplExchange {
             fetch_order_book: DataCapability::supported(p.clone(), MarketScope::MarketSpecific),
             fetch_market_stats: DataCapability::supported(p.clone(), MarketScope::AllMarkets),
             realtime: RealtimeCapabilities {
-                trades: RealtimeCapability::unsupported(
-                    CapabilityReason::AdapterNotImplemented,
-                    "Perpl realtime requires a native shared-stream owner",
+                trades: RealtimeCapability::supported(
+                    p.clone(),
+                    MarketScope::MarketSpecific,
+                    RealtimeMode::Websocket,
+                    None,
                 ),
-                orderbook: RealtimeCapability::unsupported(
-                    CapabilityReason::AdapterNotImplemented,
-                    "Perpl realtime requires a native shared-stream owner",
+                orderbook: RealtimeCapability::supported(
+                    p.clone(),
+                    MarketScope::MarketSpecific,
+                    RealtimeMode::Websocket,
+                    None,
                 ),
-                ohlcv: RealtimeCapability::unsupported(
-                    CapabilityReason::AdapterNotImplemented,
-                    "Perpl realtime requires a native shared-stream owner",
+                ohlcv: RealtimeCapability::supported(
+                    p.clone(),
+                    MarketScope::MarketSpecific,
+                    RealtimeMode::Websocket,
+                    None,
                 ),
                 marketstats: RealtimeCapability::supported(
                     p,
@@ -411,12 +520,16 @@ impl MarketDataExchange for PerplExchange {
                     change: None,
                     percentage: None,
                     average: price,
-                    base_volume: s.dv.and_then(|v| scale(v, m.config.size_decimals)),
+                    base_volume: s
+                        .dv
+                        .and_then(|v| scale(v, m.config.size_decimals))
+                        .filter(|v| *v >= 0.0),
                     quote_volume: s
                         .dva
                         .as_ref()
                         .and_then(|v| v.parse::<f64>().ok())
-                        .map(|v| v / 1_000_000.0),
+                        .map(|v| v / 10_f64.powi(m.collateral_decimals as i32))
+                        .filter(|v| v.is_finite() && *v >= 0.0),
                 })
             })
             .collect())
@@ -475,25 +588,36 @@ impl MarketDataExchange for PerplExchange {
             );
             let e: CandleEnvelope = self.get(&path).await?;
             for c in e.d {
-                let Some(o) = scale(c.o, m.config.price_decimals) else {
-                    continue;
-                };
-                let Some(close) = scale(c.c, m.config.price_decimals) else {
-                    continue;
-                };
-                let Some(h) = scale(c.h, m.config.price_decimals) else {
-                    continue;
-                };
-                let Some(l) = scale(c.l, m.config.price_decimals) else {
-                    continue;
-                };
+                let o = scale(c.o, m.config.price_decimals).ok_or_else(|| {
+                    ExchangeError::UpstreamData("invalid Perpl candle open".into())
+                })?;
+                let close = scale(c.c, m.config.price_decimals).ok_or_else(|| {
+                    ExchangeError::UpstreamData("invalid Perpl candle close".into())
+                })?;
+                let h = scale(c.h, m.config.price_decimals).ok_or_else(|| {
+                    ExchangeError::UpstreamData("invalid Perpl candle high".into())
+                })?;
+                let l = scale(c.l, m.config.price_decimals).ok_or_else(|| {
+                    ExchangeError::UpstreamData("invalid Perpl candle low".into())
+                })?;
                 let volume =
-                    c.v.and_then(|v| v.parse::<f64>().ok())
-                        .map(|v| v / 1_000_000.0)
-                        .filter(|v| v.is_finite() && *v >= 0.0);
-                if l <= h && o >= l && o <= h && close >= l && close <= h {
-                    out.push((c.t, o, h, l, close, volume));
+                    c.v.map(|v| {
+                        v.parse::<f64>()
+                            .ok()
+                            .filter(|v| v.is_finite() && *v >= 0.0)
+                            .map(|v| v / 10_f64.powi(m.collateral_decimals as i32))
+                            .filter(|v| v.is_finite())
+                            .ok_or_else(|| {
+                                ExchangeError::UpstreamData("invalid Perpl candle volume".into())
+                            })
+                    })
+                    .transpose()?;
+                if !(l > 0.0 && l <= h && o >= l && o <= h && close >= l && close <= h) {
+                    return Err(ExchangeError::UpstreamData(
+                        "invalid Perpl candle range".into(),
+                    ));
                 }
+                out.push((c.t, o, h, l, close, volume));
             }
             if page_to <= page_from {
                 break;
@@ -522,20 +646,26 @@ impl MarketDataExchange for PerplExchange {
             .get(&format!("/v1/market-data/{}/book?levels={depth}", m.id))
             .await?;
         let convert = |ls: Vec<Level>| {
+            let mut previous = None;
             ls.into_iter()
                 .map(|x| {
-                    Ok((
-                        scale(x.p, m.config.price_decimals)
-                            .filter(|v| *v > 0.0)
-                            .ok_or_else(|| {
-                                ExchangeError::UpstreamData("invalid Perpl book price".into())
-                            })?,
-                        scale(x.s, m.config.size_decimals)
-                            .filter(|v| *v >= 0.0)
-                            .ok_or_else(|| {
-                                ExchangeError::UpstreamData("invalid Perpl book size".into())
-                            })?,
-                    ))
+                    let price = scale(x.p, m.config.price_decimals)
+                        .filter(|v| *v > 0.0)
+                        .ok_or_else(|| {
+                            ExchangeError::UpstreamData("invalid Perpl book price".into())
+                        })?;
+                    let size = scale(x.s, m.config.size_decimals)
+                        .filter(|v| *v > 0.0)
+                        .ok_or_else(|| {
+                            ExchangeError::UpstreamData("invalid Perpl book size".into())
+                        })?;
+                    if previous.is_some_and(|prior| prior <= price) {
+                        return Err(ExchangeError::UpstreamData(
+                            "unordered Perpl book levels".into(),
+                        ));
+                    }
+                    previous = Some(price);
+                    Ok((price, size))
                 })
                 .collect::<Result<Vec<_>, ExchangeError>>()
         };
@@ -611,10 +741,12 @@ impl MarketStatsSource for PerplExchange {
             upstream_mode: "sharedPolling".into(),
             poll_interval_ms: 30_000,
             stale_after_ms: 90_000,
+            // `market-state@chain` is intentionally not wired into the
+            // statistics coordinator yet. Do not advertise native WS stats.
             ws: MarketStatsWsCapability {
-                snapshot: true,
-                delta: true,
-                max_subscriptions_per_connection: 16,
+                snapshot: false,
+                delta: false,
+                max_subscriptions_per_connection: 0,
             },
             funding_kinds: vec![FundingKind::CurrentUnclassified],
             rate_interval_ms: None,
@@ -683,7 +815,7 @@ fn volume(state: Option<&State>, market: &Market) -> MarketStatsField {
     let quote = state
         .and_then(|s| s.dva.as_deref())
         .and_then(|v| v.parse::<f64>().ok())
-        .map(|v| v / 1_000_000.0)
+        .map(|v| v / 10_f64.powi(market.collateral_decimals as i32))
         .filter(|v| v.is_finite() && *v >= 0.0);
     if base.is_none() && quote.is_none() {
         return unavailable("missing-or-invalid-volume");

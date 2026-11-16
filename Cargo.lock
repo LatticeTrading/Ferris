@@ -274,9 +274,9 @@ dependencies = [
 
 [[package]]
 name = "ccxt"
-version = "4.5.85"
+version = "4.5.92"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "557abb5e32f4627bc5b3863853a9789c632d7666ead88e5a27de57727fa49fb1"
+checksum = "a0c87b116910d135d8954bd2c06860fa7c8463bea1efd10893e4ccaf7bf432e9"
 dependencies = [
  "async-trait",
  "ccxt-base",
@@ -284,9 +284,20 @@ dependencies = [
 
 [[package]]
 name = "ccxt-base"
-version = "4.5.85"
+version = "4.5.92"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8902a02c142b6e338703c4681e67a3eeaf058addab283b62ecd3d45aff8daa6e"
+checksum = "918228630d42f8da44fc6375e4d4b363458da9a012180fe64916640a972a09a4"
+dependencies = [
+ "ccxt-common",
+ "futures",
+ "indexmap",
+]
+
+[[package]]
+name = "ccxt-common"
+version = "4.5.92"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c1b57dc10d3bab4f6d82819c34d634b50d7da2f73db3222a1e3346089e9d51c5"
 dependencies = [
  "async-trait",
  "base64",
@@ -319,9 +330,9 @@ dependencies = [
 
 [[package]]
 name = "ccxt-pro"
-version = "4.5.85"
+version = "4.5.92"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cfa2b255b95a1c036804b15fb97bec80a951e18fc2154ead80d09aed735b3e57"
+checksum = "bbc30e025187d61247df15b2ccd5bd7c31a9b1c848db3faf3bcc8328ce96c7ac"
 dependencies = [
  "async-trait",
  "ccxt-base",

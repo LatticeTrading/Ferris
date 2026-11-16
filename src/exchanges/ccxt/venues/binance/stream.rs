@@ -119,7 +119,9 @@ pub(in crate::exchanges::ccxt) async fn url(
         };
         core.get_ws_url(
             Value::from(kind),
-            core.get_future_ws_category(Value::from(name)),
+            core.get_future_ws_category(Value::from(name))
+                .map(Value::from)
+                .unwrap_or(Value::Null),
         )
     })
 }
@@ -133,9 +135,9 @@ fn binance_kind(spec: &LiveSpec) -> &'static str {
         }
     } else if spec.market["contract"] == true {
         if spec.market["linear"] == true {
-            "future"
+            "linear"
         } else {
-            "delivery"
+            "inverse"
         }
     } else {
         "spot"
@@ -148,7 +150,9 @@ pub(in crate::exchanges::ccxt) fn slots(
 ) -> Result<Option<usize>, ExchangeError> {
     let slots = field(&core.options, &["streamLimits", binance_kind(spec)])
         .as_i64()
-        .and_then(|slots| usize::try_from(slots).ok());
+        .unwrap_or(50)
+        .try_into()
+        .ok();
     if slots.is_none_or(|slots| slots <= 0) {
         return Err(ExchangeError::Internal(
             "invalid stock Binance stream allocator".into(),

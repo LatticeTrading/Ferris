@@ -31,8 +31,8 @@ use crate::{
         RealtimeMode, UnifiedMarket, UnifiedMarketInfo, UnifiedMarketType,
     },
     realtime::{
-        DeliveryState, Publication, RealtimeChannel, RealtimeReceiver, RealtimeSubscription,
-        RealtimeTopic, RealtimeUpdate,
+        DeliveryState, NativeRealtimeOwner, NativeSubscriptionPlan, Publication, RealtimeChannel,
+        RealtimeReceiver, RealtimeSubscription, RealtimeTopic, RealtimeUpdate,
     },
 };
 
@@ -419,6 +419,84 @@ impl PhoenixExchange {
         Ok(())
     }
 }
+// Transitional owner: Phoenix keeps its existing transport policy, but no
+// Phoenix parsing/validation remains in the exchange-neutral service.
+struct PhoenixPlan {
+    exchange: PhoenixExchange,
+    channel: RealtimeChannel,
+    topic: RealtimeTopic,
+    levels: usize,
+    key: String,
+}
+#[async_trait]
+impl NativeSubscriptionPlan for PhoenixPlan {
+    fn client_key(&self) -> &str {
+        &self.key
+    }
+    async fn subscribe(self: Box<Self>) -> Result<RealtimeSubscription, ExchangeError> {
+        self.exchange
+            .subscribe_live(self.channel, self.topic, self.levels, self.key)
+            .await
+    }
+}
+#[async_trait]
+impl NativeRealtimeOwner for PhoenixExchange {
+    fn exchange_id(&self) -> &'static str {
+        "phoenix"
+    }
+    async fn prepare_native(
+        &self,
+        channel: RealtimeChannel,
+        topic: RealtimeTopic,
+    ) -> Result<Box<dyn NativeSubscriptionPlan>, ExchangeError> {
+        validate_params(&topic.params)?;
+        let levels = topic
+            .params
+            .get("levels")
+            .or_else(|| topic.params.get("depth"))
+            .or_else(|| topic.params.get("limit"))
+            .and_then(Value::as_u64)
+            .map(usize::try_from)
+            .transpose()
+            .map_err(|_| ExchangeError::BadSymbol("Phoenix depth is too large".into()))?
+            .unwrap_or(usize::MAX);
+        if levels == 0 {
+            return Err(ExchangeError::BadSymbol(
+                "Phoenix depth must be positive".into(),
+            ));
+        }
+        let timeframe = (channel == RealtimeChannel::Ohlcv).then(|| {
+            topic
+                .params
+                .get("timeframe")
+                .or_else(|| topic.params.get("interval"))
+                .and_then(Value::as_str)
+                .unwrap_or("1m")
+        });
+        if let Some(tf) = timeframe {
+            validate_timeframe(tf)?;
+        }
+        let key = serde_json::to_string(&(
+            &topic.exchange,
+            &topic.symbol,
+            channel.as_str(),
+            timeframe,
+            levels,
+        ))
+        .map_err(|e| ExchangeError::Internal(e.to_string()))?;
+        Ok(Box::new(PhoenixPlan {
+            exchange: self.clone(),
+            channel,
+            topic,
+            levels,
+            key,
+        }))
+    }
+    async fn shutdown_native(&self) -> Result<(), ExchangeError> {
+        self.shutdown_live().await
+    }
+}
+
 fn spawn_mids_worker(cache: Arc<PhoenixMidCache>) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
