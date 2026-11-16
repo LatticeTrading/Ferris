@@ -18,6 +18,7 @@ use crate::{
         traits::ExchangeError,
     },
     models::{CcxtOhlcv, CcxtOrderBook, CcxtTrade, MarketStatsField, MarketStatsFieldName},
+    orderbook::BookAmountMode,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -231,6 +232,7 @@ pub struct RealtimeReceiver {
     state: Arc<DeliveryState>,
     released: Arc<Notify>,
     initial: Option<Publication>,
+    book_amount_mode: BookAmountMode,
 }
 
 impl RealtimeReceiver {
@@ -245,6 +247,7 @@ impl RealtimeReceiver {
             state,
             released,
             initial: None,
+            book_amount_mode: BookAmountMode::Native,
         }
     }
 
@@ -265,7 +268,13 @@ impl RealtimeReceiver {
             state,
             released,
             initial: None,
+            book_amount_mode: BookAmountMode::Native,
         })
+    }
+
+    pub(crate) fn with_book_amount_mode(mut self, mode: BookAmountMode) -> Self {
+        self.book_amount_mode = mode;
+        self
     }
 
     pub(crate) fn with_initial(mut self, initial: Option<Publication>) -> Self {
@@ -286,7 +295,15 @@ impl RealtimeReceiver {
             if matches!(&publication.update, RealtimeUpdate::Error(_))
                 || publication.epoch == self.state.epoch.load(Ordering::Acquire)
             {
-                return Ok(publication.update);
+                return Ok(match publication.update {
+                    RealtimeUpdate::OrderBook(book) => {
+                        match book.amount_view(self.book_amount_mode) {
+                            Ok(view) => RealtimeUpdate::OrderBook(view),
+                            Err(error) => RealtimeUpdate::Error(error.to_string().into()),
+                        }
+                    }
+                    other => other,
+                });
             }
         }
     }

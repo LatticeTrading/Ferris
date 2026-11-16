@@ -29,8 +29,7 @@ fn snapshot(generation: u64, ids: &[u64]) -> Arc<CatalogSnapshot> {
     })
 }
 
-#[tokio::test]
-async fn maintained_feed_refreshes_identity_without_freshening_held_rows() {
+pub(super) fn provider_config(venue: Venue) -> ProviderConfig {
     let config = Config {
         host: "127.0.0.1".into(),
         port: 0,
@@ -55,7 +54,12 @@ async fn maintained_feed_refreshes_identity_without_freshening_held_rows() {
         nado_archive_base_url: "http://127.0.0.1:1".into(),
         nado_ws_url: "ws://127.0.0.1:1".into(),
     };
-    let config = ProviderConfig::new(Venue::Lighter, &config).unwrap();
+    ProviderConfig::new(venue, &config).unwrap()
+}
+
+#[tokio::test]
+async fn maintained_feed_refreshes_identity_without_freshening_held_rows() {
+    let config = provider_config(Venue::Lighter);
     let watch = Arc::new(CatalogWatch::new(snapshot(1, &[0])));
     let prepared = feed()
         .prepare(watch.load(), &config, watch.clone())

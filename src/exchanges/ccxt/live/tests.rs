@@ -1,3 +1,4 @@
+mod books;
 mod catalog;
 
 use super::*;

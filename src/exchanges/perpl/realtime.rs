@@ -4,6 +4,7 @@ use super::{
 };
 use crate::{
     exchanges::traits::ExchangeError,
+    orderbook::BookAmountMode,
     realtime::{
         native::{Feed, Protocol, Session, SharedHub},
         NativeRealtimeOwner, NativeSubscriptionPlan, RealtimeChannel, RealtimeSubscription,
@@ -26,6 +27,7 @@ struct Plan {
     feed_key: String,
     client_key: String,
     levels: usize,
+    amount_mode: BookAmountMode,
 }
 #[async_trait]
 impl NativeSubscriptionPlan for Plan {
@@ -38,7 +40,7 @@ impl NativeSubscriptionPlan for Plan {
             key: self.client_key,
             topic: self.topic,
             levels_limit: self.levels,
-            receiver,
+            receiver: receiver.with_book_amount_mode(self.amount_mode),
         })
     }
 }
@@ -82,9 +84,10 @@ impl NativeRealtimeOwner for PerplExchange {
         }
         let allowed: &[&str] = match channel {
             RealtimeChannel::Trades => &[],
-            RealtimeChannel::OrderBook => &["levels", "depth", "limit"],
+            RealtimeChannel::OrderBook => &["levels", "depth", "limit", "amountUnit"],
             RealtimeChannel::Ohlcv => &["timeframe", "interval"],
         };
+        let amount_mode = BookAmountMode::parse(&topic.params)?;
         let params = topic.params.as_object().expect("normalized params");
         if let Some(key) = params.keys().find(|k| !allowed.contains(&k.as_str())) {
             return Err(ExchangeError::BadSymbol(format!(
@@ -92,7 +95,7 @@ impl NativeRealtimeOwner for PerplExchange {
             )));
         }
         let mut value: Option<&Value> = None;
-        for key in allowed {
+        for key in allowed.iter().filter(|key| **key != "amountUnit") {
             if let Some(v) = params.get(*key) {
                 if value.is_some_and(|old| old != v) {
                     return Err(ExchangeError::BadSymbol(
@@ -135,6 +138,9 @@ impl NativeRealtimeOwner for PerplExchange {
         };
         let resolution = timeframe.as_deref().map(resolution).transpose()?;
         let market = self.resolve(&topic.symbol).await?;
+        if channel == RealtimeChannel::OrderBook {
+            super::book_policy(&market).validate_mode(amount_mode)?;
+        }
         if !market.config.is_open {
             return Err(ExchangeError::BadSymbol("Perpl market is inactive".into()));
         }
@@ -145,13 +151,16 @@ impl NativeRealtimeOwner for PerplExchange {
         };
         let feed_key =
             json!([self.network_key, market.id, channel.as_str(), resolution]).to_string();
-        let client_key = json!([feed_key, levels]).to_string();
+        let client_key = json!([feed_key, levels, amount_mode]).to_string();
         topic.symbol = format!("{}/AUSD:AUSD", market.name);
         topic.params = match channel {
             RealtimeChannel::OrderBook => json!({"levels":levels}),
             RealtimeChannel::Ohlcv => json!({"timeframe":timeframe}),
             _ => json!({}),
         };
+        if channel == RealtimeChannel::OrderBook && amount_mode == BookAmountMode::Base {
+            topic.params["amountUnit"] = json!("base");
+        }
         Ok(Box::new(Plan {
             hub: self.live.clone(),
             spec: Spec {
@@ -165,6 +174,7 @@ impl NativeRealtimeOwner for PerplExchange {
             feed_key,
             client_key,
             levels,
+            amount_mode,
         }))
     }
     async fn shutdown_native(&self) -> Result<(), ExchangeError> {

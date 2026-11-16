@@ -407,7 +407,16 @@ async fn run_owner(
                         } else {
                             Arc::clone(state.snapshot.as_ref().expect("loaded catalog"))
                         };
-                        prepare_live(venue, channel, topic, snapshot, state.provider.as_ref().expect("loaded provider"), &config).await
+                        let watch = (channel == RealtimeChannel::OrderBook).then(|| {
+                            state.watch.get_or_insert_with(|| {
+                                Arc::new(CatalogWatch::new(Arc::clone(&snapshot)))
+                            }).clone()
+                        });
+                        let mut prepared = prepare_live(venue, channel, topic, snapshot, state.provider.as_ref().expect("loaded provider"), &config).await?;
+                        if let Some(watch) = watch {
+                            Arc::get_mut(&mut prepared.spec).expect("unpublished live plan").book_catalog = Some(watch);
+                        }
+                        Ok(prepared)
                     }).catch_unwind() => result.unwrap_or_else(|panic| Err(ExchangeError::UpstreamRequest(panic_message(panic)))),
                 };
                 let _ = reply.send(result);
@@ -477,6 +486,7 @@ async fn run_snapshot(
             venue,
             state.provider.as_mut().expect("loaded provider"),
             &snapshot.catalog,
+            snapshot.timestamp,
             request,
         )
         .await

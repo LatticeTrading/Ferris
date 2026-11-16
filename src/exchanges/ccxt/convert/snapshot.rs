@@ -154,6 +154,7 @@ pub(in crate::exchanges::ccxt) fn convert_book(
         timestamp: integer("timestamp")?,
         nonce: integer("nonce")?,
         symbol: actual_symbol,
+        ..Default::default()
     })
 }
 

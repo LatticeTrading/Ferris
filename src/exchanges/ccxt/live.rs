@@ -12,6 +12,7 @@ use tokio::sync::{broadcast, oneshot, watch, Notify};
 
 use crate::{
     exchanges::traits::ExchangeError,
+    orderbook::{BookAmountMode, BookPolicy},
     realtime::{
         DeliveryState, Publication, RealtimeChannel, RealtimeReceiver, RealtimeSubscription,
         RealtimeUpdate, StatisticsRowUpdate, StatisticsUpdate,
@@ -36,7 +37,7 @@ const UNSUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(10);
 const INITIAL_RECONNECT: Duration = Duration::from_millis(500);
 const MAX_RECONNECT: Duration = Duration::from_secs(15);
 
-/// Shared, owned catalog cell for maintained statistics feeds. The coordinator
+/// Shared, owned catalog cell for maintained statistics and book metadata. The coordinator
 /// publishes a fresh snapshot after a REST catalog reload; the live feed merges
 /// newly listed markets without restarting the shared URL. Owned Ferris rows
 /// only — never a stock `Value` or a second book copy.
@@ -105,6 +106,7 @@ impl LiveHub {
             levels,
             client_key,
         } = prepared;
+        let mode = BookAmountMode::parse(&topic.params)?;
         loop {
             let waiting = {
                 let mut hub = self.state.lock();
@@ -119,7 +121,7 @@ impl LiveHub {
                             key: client_key,
                             topic,
                             levels_limit: levels,
-                            receiver,
+                            receiver: receiver.with_book_amount_mode(mode),
                         });
                     }
                 }
@@ -137,7 +139,7 @@ impl LiveHub {
                             key: client_key,
                             topic,
                             levels_limit: levels,
-                            receiver,
+                            receiver: receiver.with_book_amount_mode(mode),
                         });
                     }
                     Some(owner.finished.clone())
@@ -154,7 +156,7 @@ impl LiveHub {
                         key: client_key,
                         topic,
                         levels_limit: levels,
-                        receiver,
+                        receiver: receiver.with_book_amount_mode(mode),
                     });
                 }
             };
@@ -369,6 +371,7 @@ struct ActiveFeed {
     /// with, so newly listed markets resolve without restarting the URL.
     catalog: Option<Arc<CatalogSnapshot>>,
     market_index: HashMap<String, usize>,
+    book_policy: Option<BookPolicy>,
 }
 
 impl ActiveFeed {
@@ -382,6 +385,7 @@ impl ActiveFeed {
             ticker_marks: HashMap::new(),
             catalog: None,
             market_index: HashMap::new(),
+            book_policy: None,
         }
     }
 
@@ -400,6 +404,7 @@ impl ActiveFeed {
         self.ticker_marks.clear();
         self.catalog = None;
         self.market_index.clear();
+        self.book_policy = None;
     }
 }
 
@@ -816,15 +821,19 @@ async fn run_session(
         }
         let update = match spec.channel {
             LiveChannel::Client(RealtimeChannel::OrderBook) => {
-                convert_book(raw, &spec.symbol).map(|book| {
-                    // Binance also resolves its REST seed, before a WS bridge. This
-                    // observable gate excludes that seed; it does NOT claim to fix
-                    // the user's accepted upstream post-bridge continuity defect.
-                    if spec.venue == Venue::Binance && book.timestamp.is_none() {
-                        return None;
-                    }
-                    Some(RealtimeUpdate::OrderBook(Arc::new(book)))
-                })
+                book_policy(current, &spec)
+                    .and_then(|policy| {
+                        convert_book(raw, &spec.symbol).map(|book| book.with_policy(policy))
+                    })
+                    .map(|book| {
+                        // Binance also resolves its REST seed, before a WS bridge. This
+                        // observable gate excludes that seed; it does NOT claim to fix
+                        // the user's accepted upstream post-bridge continuity defect.
+                        if spec.venue == Venue::Binance && book.timestamp.is_none() {
+                            return None;
+                        }
+                        Some(RealtimeUpdate::OrderBook(Arc::new(book)))
+                    })
             }
             LiveChannel::Client(RealtimeChannel::Trades) => provider
                 .incremental(&spec, raw)
@@ -860,6 +869,41 @@ async fn run_session(
         provider.clear_feed(&retired.spec);
     }
     exit
+}
+
+/// Refresh conversion and liquidity semantics from the owned catalog. A changed
+/// definition requires a new upstream snapshot; do not reinterpret retained
+/// levels from a previous contract definition/RFQ regime.
+fn book_policy(current: &mut ActiveFeed, spec: &LiveSpec) -> Result<BookPolicy, ExchangeError> {
+    let snapshot = spec
+        .book_catalog
+        .as_ref()
+        .ok_or_else(|| ExchangeError::Internal("book feed has no metadata watch".into()))?
+        .load();
+    if current.catalog.as_ref().map(|c| c.generation) != Some(snapshot.generation) {
+        let market = snapshot
+            .catalog
+            .by_ccxt_symbol(&spec.symbol)
+            .ok_or_else(|| {
+                ExchangeError::UpstreamData("book market disappeared from catalog".into())
+            })?;
+        let policy = super::book::policy(spec.venue, market, snapshot.timestamp);
+        if current
+            .book_policy
+            .as_ref()
+            .is_some_and(|old| !old.same_definition(&policy))
+        {
+            return Err(ExchangeError::UpstreamData(
+                "book amount/liquidity definition changed; fresh snapshot required".into(),
+            ));
+        }
+        current.book_policy = Some(policy);
+        current.catalog = Some(snapshot);
+    }
+    Ok(current
+        .book_policy
+        .clone()
+        .expect("book policy initialized"))
 }
 
 /// Cache identity: unchanged symbols keep the same inner `Arc`, so a pointer

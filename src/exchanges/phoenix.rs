@@ -329,7 +329,9 @@ impl PhoenixExchange {
         topic: RealtimeTopic,
         levels: usize,
         client_key: String,
+        feed_key: String,
     ) -> Result<RealtimeSubscription, ExchangeError> {
+        let mode = crate::orderbook::BookAmountMode::parse(&topic.params)?;
         let symbol = self.resolve(&topic.symbol).await?.symbol;
         let timeframe = (channel == RealtimeChannel::Ohlcv).then(|| {
             topic
@@ -340,7 +342,7 @@ impl PhoenixExchange {
                 .unwrap_or("1m")
                 .to_string()
         });
-        let key = client_key.clone();
+        let key = feed_key;
         let mut live = self.live.inner.lock().await;
         if live.stopped {
             return Err(ExchangeError::Internal(
@@ -361,10 +363,10 @@ impl PhoenixExchange {
                 )
                 .ok_or_else(|| ExchangeError::Internal("Phoenix live feed stopped".into()))?;
                 return Ok(RealtimeSubscription {
-                    key,
+                    key: client_key,
                     topic,
                     levels_limit: levels,
-                    receiver,
+                    receiver: receiver.with_book_amount_mode(mode),
                 });
             }
         }
@@ -390,10 +392,10 @@ impl PhoenixExchange {
         *feed.worker.lock().await = Some(worker);
         live.feeds.insert(key.clone(), feed);
         Ok(RealtimeSubscription {
-            key,
+            key: client_key,
             topic,
             levels_limit: levels,
-            receiver,
+            receiver: receiver.with_book_amount_mode(mode),
         })
     }
     pub(crate) async fn shutdown_live(&self) -> Result<(), ExchangeError> {
@@ -427,6 +429,7 @@ struct PhoenixPlan {
     topic: RealtimeTopic,
     levels: usize,
     key: String,
+    feed_key: String,
 }
 #[async_trait]
 impl NativeSubscriptionPlan for PhoenixPlan {
@@ -435,7 +438,13 @@ impl NativeSubscriptionPlan for PhoenixPlan {
     }
     async fn subscribe(self: Box<Self>) -> Result<RealtimeSubscription, ExchangeError> {
         self.exchange
-            .subscribe_live(self.channel, self.topic, self.levels, self.key)
+            .subscribe_live(
+                self.channel,
+                self.topic,
+                self.levels,
+                self.key,
+                self.feed_key,
+            )
             .await
     }
 }
@@ -449,7 +458,12 @@ impl NativeRealtimeOwner for PhoenixExchange {
         channel: RealtimeChannel,
         topic: RealtimeTopic,
     ) -> Result<Box<dyn NativeSubscriptionPlan>, ExchangeError> {
-        validate_params(&topic.params)?;
+        let mode = if channel == RealtimeChannel::OrderBook {
+            validate_book_params(&topic.params)?
+        } else {
+            validate_params(&topic.params)?;
+            crate::orderbook::BookAmountMode::Native
+        };
         let levels = topic
             .params
             .get("levels")
@@ -476,7 +490,7 @@ impl NativeRealtimeOwner for PhoenixExchange {
         if let Some(tf) = timeframe {
             validate_timeframe(tf)?;
         }
-        let key = serde_json::to_string(&(
+        let feed_key = serde_json::to_string(&(
             &topic.exchange,
             &topic.symbol,
             channel.as_str(),
@@ -484,12 +498,15 @@ impl NativeRealtimeOwner for PhoenixExchange {
             levels,
         ))
         .map_err(|e| ExchangeError::Internal(e.to_string()))?;
+        let key = serde_json::to_string(&(&feed_key, mode))
+            .map_err(|e| ExchangeError::Internal(e.to_string()))?;
         Ok(Box::new(PhoenixPlan {
             exchange: self.clone(),
             channel,
             topic,
             levels,
             key,
+            feed_key,
         }))
     }
     async fn shutdown_native(&self) -> Result<(), ExchangeError> {
@@ -604,6 +621,17 @@ async fn run_live_feed(ws: String, feed: Arc<PhoenixFeed>) {
             };
             match parse_live_message(feed.channel, &text) {
                 Ok(Some(update)) => {
+                    let update = match update {
+                        RealtimeUpdate::OrderBook(book) => RealtimeUpdate::OrderBook(Arc::new(
+                            Arc::unwrap_or_clone(book).with_policy(
+                                crate::orderbook::BookPolicy::base(
+                                    &feed.symbol,
+                                    "phoenix:human_unit_book",
+                                ),
+                            ),
+                        )),
+                        other => other,
+                    };
                     let _ = feed.sender.send(Publication::new(update));
                 }
                 Ok(None) => {}
@@ -693,6 +721,7 @@ fn parse_live_message(
                     .or_else(|| book.get("symbol"))
                     .and_then(Value::as_str)
                     .map(|s| format!("{s}/USD")),
+                ..Default::default()
             }))))
         }
     }
@@ -991,21 +1020,27 @@ impl MarketDataExchange for PhoenixExchange {
         &self,
         params: FetchOrderBookParams,
     ) -> Result<CcxtOrderBook, ExchangeError> {
-        validate_params(&params.params)?;
+        let mode = validate_book_params(&params.params)?;
         let market = self.resolve(&params.symbol).await?;
         let book = self
             .get_json::<PhoenixBook>(&format!("/v1/view/orderbook/{}", market.symbol), &[])
             .await?;
         let (bids, asks) = validate_levels(book.bids, book.asks)?;
         let limit = params.limit.unwrap_or(usize::MAX);
-        Ok(CcxtOrderBook {
+        CcxtOrderBook {
             asks: asks.into_iter().take(limit).collect(),
             bids: bids.into_iter().take(limit).collect(),
             datetime: None,
             timestamp: None,
             nonce: Some(book.slot),
             symbol: Some(format!("{}/USD", market.symbol)),
-        })
+            ..Default::default()
+        }
+        .with_policy(crate::orderbook::BookPolicy::base(
+            &market.symbol,
+            "phoenix:human_unit_book",
+        ))
+        .into_amount_mode(mode)
     }
 }
 
@@ -1214,6 +1249,12 @@ fn stats_capabilities() -> MarketStatsCapabilities {
         ],
     })
 }
+fn validate_book_params(value: &Value) -> Result<crate::orderbook::BookAmountMode, ExchangeError> {
+    let mode = crate::orderbook::BookAmountMode::parse(value)?;
+    validate_params(&crate::orderbook::BookAmountMode::without_selector(value))?;
+    Ok(mode)
+}
+
 fn validate_params(value: &Value) -> Result<(), ExchangeError> {
     let Some(map) = value.as_object() else {
         if value.is_null() {

@@ -84,7 +84,7 @@ Deployment note: `/v1/ws` is a required HTTP WebSocket-upgrade route. A plain `G
 - Trades are newest-first; candles are oldest-first. `since` and end bounds are inclusive milliseconds. Recent-only trade APIs filter their returned window; requesting an old time does not create historical coverage.
 - Candles remain `[timestamp, open, high, low, close, volume]`; volume is `null` when stock omits it, including Bybit mark/index/premium-index and Extended mark/index candles. Missing/nonfinite required prices or invalid book levels produce `UPSTREAM_DATA_INVALID`, not zero-filled data.
 - Book timestamps/nonces retain stock provenance. Extended REST book time is CCXT receipt time, not exchange time; Lighter REST book time/nonce are absent; Bybit full/RPI books have no nonce from the stock parser. Lighter returns individual orders, so multiple rows can share a price; these are not aggregated price levels.
-- Book amounts are not universally base-asset quantities: current REST and live paths retain venue/product units. See the [amount-unit audit and opt-in normalization proposal](ORDER_BOOK_AMOUNTS.md), including multiplier pitfalls and separate liquidity/integrity semantics. The proposed API fields are not implemented.
+- Book amounts retain venue/product units by default. Set `params.amountUnit: "base"` on REST books or live `orderbook` subscriptions to opt into base-asset amounts. Every book reports `amountUnit`, `amountCurrency`, `sourceAmountUnit`, `amountConversion`, `liquidityKind`, and `liquidityTimestamp`; native and base views share upstream acquisition. Missing/unverified multipliers fail explicitly, not by silently returning contracts as base. Bybit inverse normalization remains unavailable pending verified face sizes.
 
 ### Limits and optional sources
 
@@ -639,7 +639,7 @@ Use with `/v1/fetchOHLCV`. Timeframes: `1m`, `3m`, `5m`, `15m`, `30m`, `1h`, `2h
 
 Live trades, books, and candles use stock Pro. The public WebSocket URL is **not** a static value: every (re)connect mints a tokenized URL from `POST /api/v1/bullet-public` (spot) or the futures equivalent, and Ferris seeds that session URL into stock's `options.urls` so the watches and the driver share one connection. The configured `KUCOIN_WS_URL`/`KUCOIN_FUTURES_WS_URL` are stable owner identities, not the connected URL. Unsubscribe is stock-owned (`unsubscribe:{hash}`). `Controlled` also schedules stock’s required JSON heartbeat on the existing worker/client and reconnects on missed Pong; no second reader or heartbeat socket is used.
 
-Two pinned-port defects required the existing `Controlled` outer driver: the incremental book cache is measured by the handle Dict's length (always 1), so Ferris sets `options.watchOrderBook.snapshotDelay = 1` to request the REST snapshot on the first delta; and the base `get_cache_index`/`handle_deltas` path is incomplete for KuCoin, so `KucoinControl` calls pinned KuCoin’s `get_cache_index` and replays each cached delta, in order, through its exposed `handle_book_delta(orderbook, delta)` method. Stock still owns transport, subscriptions, parsing, reset, cache clearing, resolution, and book maintenance.
+The existing `Controlled` outer driver retains stock-owned parsing and synchronization. With CCXT 4.5.92 the incremental cache length is measured correctly, before appending the incoming delta, so Ferris sets `options.watchOrderBook.snapshotDelay = 0` to request the REST seed on the first delta (replacing the old 4.5.85 Dict-length workaround of 1). `KucoinControl` calls pinned KuCoin’s `get_cache_index` and replays each cached delta, in order, through its exposed `handle_book_delta(orderbook, delta)` method. Stock still owns transport, subscriptions, parsing, reset, cache clearing, resolution, and book maintenance.
 
 ```json
 {"exchange":"kucoin","fields":["funding","markPrice","indexPrice","lastPrice","volume24h","openInterest"],"params":{}}
@@ -767,7 +767,7 @@ Websocket subscription (`GET /v1/ws`):
 {"op":"subscribe","channel":"orderbook","exchange":"extended","symbol":"BTC/USD:USD","params":{"levels":10}}
 ```
 
-Extended realtime book depth must be 1–1,000; zero/over-depth requests fail rather than clamp. Depth 1 is a view of the maintained standard book, not a different upstream endpoint. For RFQ markets (`info.isRfq: true`), both this stream and REST return indicative quotes, not the separate `/orderbooks/rfq/{market}` real book. Non-RFQ markets use ordinary order books; see the [amount/liquidity audit](ORDER_BOOK_AMOUNTS.md). WS time/nonce follow stock `ts`/`seq`; accepted stock continuity/retention risks remain, so updates do not prove synchronization correctness. REST depth must be 1–1,000; its timestamp is CCXT receipt time and nonce is null.
+Extended realtime book depth must be 1–1,000; zero/over-depth requests fail rather than clamp. Depth 1 is a view of the maintained standard book, not a different upstream endpoint. For RFQ markets (`info.isRfq: true`), both this stream and REST return indicative quotes, not the separate `/orderbooks/rfq/{market}` real book. Non-RFQ markets use ordinary order books. WS time/nonce follow stock `ts`/`seq`; accepted stock continuity/retention risks remain, so updates do not prove synchronization correctness. REST depth must be 1–1,000; its timestamp is CCXT receipt time and nonce is null.
 
 ## Running locally
 

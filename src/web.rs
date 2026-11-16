@@ -597,6 +597,8 @@ struct WsOrderBookUpdate<'a> {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct WsOrderBookView<'a> {
+    #[serde(flatten)]
+    metadata: &'a crate::orderbook::BookMetadata,
     asks: &'a [(f64, f64)],
     bids: &'a [(f64, f64)],
     datetime: Option<&'a str>,
@@ -1046,6 +1048,7 @@ fn topics_equal(left: &RealtimeTopic, right: &RealtimeTopic) -> bool {
 /// never clones the full-depth vectors merely to truncate them per client.
 fn orderbook_view(orderbook: &CcxtOrderBook, levels_limit: usize) -> WsOrderBookView<'_> {
     WsOrderBookView {
+        metadata: &orderbook.metadata,
         asks: &orderbook.asks[..orderbook.asks.len().min(levels_limit)],
         bids: &orderbook.bids[..orderbook.bids.len().min(levels_limit)],
         datetime: orderbook.datetime.as_deref(),
@@ -1283,6 +1286,7 @@ mod tests {
             timestamp: Some(1_700_000_000_000),
             nonce: Some(123),
             symbol: Some("BTC/USDT:USDT".to_string()),
+            ..Default::default()
         });
 
         let view = orderbook_view(&source, 21);
@@ -1301,6 +1305,18 @@ mod tests {
         assert_eq!(value["data"]["asks"].as_array().unwrap().len(), 21);
         assert_eq!(value["data"]["nonce"], 123);
         assert_eq!(value["data"]["symbol"], "BTC/USDT:USDT");
+        let rest = serde_json::to_value(source.as_ref()).unwrap();
+        for field in [
+            "amountUnit",
+            "amountCurrency",
+            "sourceAmountUnit",
+            "amountConversion",
+            "liquidityKind",
+            "liquidityTimestamp",
+        ] {
+            assert_eq!(value["data"][field], rest[field]);
+        }
+        assert_eq!(value["data"]["amountUnit"], "unknown");
         // The owned source book stays full-depth; only the view is truncated.
         assert_eq!(source.bids.len(), 30);
         assert_eq!(source.asks.len(), 30);

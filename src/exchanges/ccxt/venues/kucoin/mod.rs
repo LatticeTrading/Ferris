@@ -63,11 +63,11 @@ pub(in crate::exchanges::ccxt) fn configure(
     value["options"]["fetchMarkets"] = json!({"fetchTickersFees": false});
     // `load_markets` keys currencies off `has.fetchCurrencies`, not the option.
     value["has"] = json!({"fetchCurrencies": false});
-    // The pinned Rust port measures the incremental book cache with the cache
-    // handle Dict's length (always 1), not the backing buffer. With stock's
-    // default delay of 5 the REST snapshot is never requested. One triggers it
-    // on the first delta; stock still owns the snapshot and delta replay.
-    value["options"]["watchOrderBook"] = json!({"snapshotDelay": 1});
+    // 4.5.92 reports the actual buffered length and checks it BEFORE appending
+    // the incoming delta. Zero requests the seed on the first delta (the old
+    // 4.5.85 Dict-handle workaround used one and now waits for a second delta).
+    // Stock still owns the snapshot and delta replay.
+    value["options"]["watchOrderBook"] = json!({"snapshotDelay": 0});
     Ok(())
 }
 

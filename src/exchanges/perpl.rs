@@ -54,7 +54,6 @@ struct Market {
     #[serde(skip)]
     collateral_decimals: u32,
     name: String,
-    #[allow(dead_code)]
     size_units: String,
     funding_interval_sec: u64,
     config: Config,
@@ -373,6 +372,19 @@ fn market(m: &Market) -> Result<UnifiedMarket, ExchangeError> {
         }),
     })
 }
+fn book_policy(m: &Market) -> crate::orderbook::BookPolicy {
+    if m.size_units == m.name {
+        crate::orderbook::BookPolicy::base(&m.name, "perpl:size_units/size_decimals")
+    } else {
+        crate::orderbook::BookPolicy::unavailable(
+            crate::orderbook::AmountUnit::Unknown,
+            &m.name,
+            "perpl:size_units/size_decimals",
+            "size_units_disagree_with_base",
+        )
+    }
+}
+
 fn validate_params(v: &Value) -> Result<(), ExchangeError> {
     if v.is_null() || v.as_object().is_some_and(|o| o.is_empty()) {
         Ok(())
@@ -634,8 +646,13 @@ impl MarketDataExchange for PerplExchange {
         &self,
         p: FetchOrderBookParams,
     ) -> Result<CcxtOrderBook, ExchangeError> {
-        validate_params(&p.params)?;
+        let mode = crate::orderbook::BookAmountMode::parse(&p.params)?;
+        validate_params(&crate::orderbook::BookAmountMode::without_selector(
+            &p.params,
+        ))?;
         let m = self.resolve(&p.symbol).await?;
+        let policy = book_policy(&m);
+        policy.validate_mode(mode)?;
         let depth = p.limit.unwrap_or(100);
         if !(1..=100).contains(&depth) {
             return Err(ExchangeError::BadSymbol(
@@ -669,14 +686,17 @@ impl MarketDataExchange for PerplExchange {
                 })
                 .collect::<Result<Vec<_>, ExchangeError>>()
         };
-        Ok(CcxtOrderBook {
+        CcxtOrderBook {
             asks: convert(b.ask)?,
             bids: convert(b.bid)?,
             datetime: None,
             timestamp: b.at.and_then(|x| x.t),
             nonce: b.sn,
             symbol: Some(format!("{}/AUSD:AUSD", m.name)),
-        })
+            ..Default::default()
+        }
+        .with_policy(policy)
+        .into_amount_mode(mode)
     }
 }
 #[async_trait]
@@ -946,6 +966,26 @@ mod tests {
     fn scale_decimals() {
         assert_eq!(scale(796504, 1), Some(79650.4));
         assert_eq!(scale(861741, 5), Some(8.61741));
+    }
+    #[test]
+    fn book_unit_metadata_requires_size_units_to_match_catalog_base() {
+        let mut market: Market = serde_json::from_value(json!({
+            "id":1,"perpetual_id":1,"instance_id":1,"name":"BTC","size_units":"contracts",
+            "funding_interval_sec":3600,"config":{"is_open":true,"price_decimals":2,"size_decimals":3}
+        })).unwrap();
+        let policy = book_policy(&market);
+        assert!(policy
+            .validate_mode(crate::orderbook::BookAmountMode::Base)
+            .is_err());
+        let native = CcxtOrderBook::default().with_policy(policy);
+        assert_eq!(
+            native.metadata.amount_unit,
+            crate::orderbook::AmountUnit::Unknown
+        );
+        market.size_units = "BTC".into();
+        assert!(book_policy(&market)
+            .validate_mode(crate::orderbook::BookAmountMode::Base)
+            .is_ok());
     }
     #[test]
     fn resolver_aliases_share_one_name_parser() {

@@ -146,6 +146,7 @@ pub(in crate::exchanges::ccxt) async fn prepare_statistics(
         hash: String::new(),
         slots: None,
         catalog: Some(Arc::clone(&watch)),
+        book_catalog: None,
         config: config.clone(),
         candle_cache_key: None,
     };

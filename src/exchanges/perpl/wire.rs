@@ -144,14 +144,18 @@ impl State {
                 scaled(*s, m.config.size_decimals),
             )
         };
-        Ok(Some(RealtimeUpdate::OrderBook(Arc::new(CcxtOrderBook {
-            bids: self.bids.iter().rev().map(convert).collect(),
-            asks: self.asks.iter().map(convert).collect(),
-            nonce,
-            timestamp,
-            datetime: None,
-            symbol: Some(symbol(m)),
-        }))))
+        Ok(Some(RealtimeUpdate::OrderBook(Arc::new(
+            CcxtOrderBook {
+                bids: self.bids.iter().rev().map(convert).collect(),
+                asks: self.asks.iter().map(convert).collect(),
+                nonce,
+                timestamp,
+                datetime: None,
+                symbol: Some(symbol(m)),
+                ..Default::default()
+            }
+            .with_policy(super::book_policy(m)),
+        ))))
     }
     fn trades(
         &mut self,

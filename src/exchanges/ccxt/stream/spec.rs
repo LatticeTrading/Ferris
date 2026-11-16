@@ -47,6 +47,9 @@ pub(crate) struct LiveSpec {
     /// Statistics only: shared owned catalog cell so newly listed markets resolve
     /// without restarting the URL. Never a stock `Value`; no book copy.
     pub catalog: Option<Arc<CatalogWatch>>,
+    /// Output semantics only; unlike the statistics catalog this must not alter
+    /// stock market loading/indexing or upstream acquisition identity.
+    pub book_catalog: Option<Arc<CatalogWatch>>,
     pub(in crate::exchanges::ccxt) config: ProviderConfig,
     pub(in crate::exchanges::ccxt) candle_cache_key: Option<String>,
 }

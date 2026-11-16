@@ -219,7 +219,7 @@ pub struct CcxtFee {
 
 pub type CcxtOhlcv = (u64, f64, f64, f64, f64, Option<f64>);
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CcxtOrderBook {
     pub asks: Vec<(f64, f64)>,
@@ -228,6 +228,14 @@ pub struct CcxtOrderBook {
     pub timestamp: Option<u64>,
     pub nonce: Option<u64>,
     pub symbol: Option<String>,
+    #[serde(flatten)]
+    pub metadata: crate::orderbook::BookMetadata,
+    #[serde(skip)]
+    pub(crate) amount_policy: Option<crate::orderbook::BookPolicy>,
+    #[serde(skip)]
+    pub(crate) base_view: std::sync::OnceLock<
+        Result<std::sync::Arc<CcxtOrderBook>, crate::exchanges::traits::ExchangeError>,
+    >,
 }
 
 #[derive(Debug, Serialize)]

@@ -1358,7 +1358,7 @@ async fn extended_delivers_trades_and_separate_price_candle_caches() {
             {"id":1,"name":"USD","symbol":"USD","precision":6,"isActive":true,"type":"SPOT"}
         ]})) }))
         .route("/api/v1/info/markets", get(|| async { Json(json!({"status":"OK","data":[{
-            "name":"BTC-USD","assetName":"BTC","collateralAssetName":"USD","status":"ACTIVE","active":true,
+            "name":"BTC-USD","assetName":"BTC","collateralAssetName":"USD","status":"ACTIVE","active":true,"isRfq":false,
             "tradingConfig":{"minOrderSize":"0.0001","minOrderSizeChange":"0.00001","minPriceChange":"1"}
         }]})) }))
         .route("/stream/orderbooks/:market", get(extended_stream))
@@ -1381,9 +1381,12 @@ async fn extended_delivers_trades_and_separate_price_candle_caches() {
         )
     };
     let mut trades = subscribe(RealtimeChannel::Trades, json!({})).await.unwrap();
-    let mut book = subscribe(RealtimeChannel::OrderBook, json!({"levels":1}))
-        .await
-        .unwrap();
+    let mut book = subscribe(
+        RealtimeChannel::OrderBook,
+        json!({"levels":1,"amountUnit":"base"}),
+    )
+    .await
+    .unwrap();
     let mut candles = subscribe(RealtimeChannel::Ohlcv, json!({"timeframe":"1m"}))
         .await
         .unwrap();
@@ -1415,6 +1418,13 @@ async fn extended_delivers_trades_and_separate_price_candle_caches() {
         let snapshot = recv_order_book(&mut book.receiver).await;
         assert_eq!(snapshot.bids, [(60_000.0, sequence as f64)]);
         assert_eq!(snapshot.nonce, Some(sequence));
+        let metadata = serde_json::to_value(&*snapshot).unwrap();
+        assert_eq!(metadata["amountUnit"], "base");
+        assert_eq!(metadata["liquidityKind"], "orderBook");
+        assert_eq!(
+            metadata["amountConversion"]["contractSizeApplied"],
+            Value::Null
+        );
         assert_eq!(
             serde_json::to_value(recv_candles(&mut candles.receiver).await).unwrap(),
             json!([[

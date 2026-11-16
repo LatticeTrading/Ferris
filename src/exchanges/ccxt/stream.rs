@@ -6,6 +6,7 @@ use serde_json::{json, Value as JsonValue};
 
 use crate::{
     exchanges::traits::ExchangeError,
+    orderbook::BookAmountMode,
     realtime::{RealtimeChannel, RealtimeTopic},
 };
 
@@ -32,6 +33,9 @@ pub(super) fn live_scope(
     params: &JsonValue,
 ) -> Result<CatalogScope, ExchangeError> {
     use RealtimeChannel::*;
+    if channel == OrderBook {
+        BookAmountMode::parse(params)?;
+    }
     if channel == Ohlcv && !venues::dispatch!(venue, exchange => exchange::stream::CANDLES) {
         return Err(unsupported(venue, "stock CCXT Pro has no candle watcher"));
     }
@@ -41,7 +45,7 @@ pub(super) fn live_scope(
     for key in map.keys().map(String::as_str) {
         let allowed = match key {
             "type" | "category" | "subType" | "settle" => true,
-            "levels" | "depth" | "limit" => channel == OrderBook,
+            "levels" | "depth" | "limit" | "amountUnit" => channel == OrderBook,
             "timeframe" | "interval" => channel == Ohlcv,
             _ => venues::dispatch!(venue, exchange => exchange::stream::allows(channel, key)),
         };
@@ -74,6 +78,8 @@ pub(super) async fn prepare_live(
     let mut levels = usize::MAX;
     match channel {
         OrderBook => {
+            super::book::policy(venue, market, catalog.timestamp)
+                .validate_mode(BookAmountMode::parse(&topic.params)?)?;
             let (default, maximum, acquisition) =
                 venues::dispatch!(venue, exchange => exchange::stream::book_depth(market));
             levels = integer(&topic.params, &["levels", "depth", "limit"])?
@@ -158,6 +164,8 @@ pub(super) async fn prepare_live(
         hash: String::new(),
         slots: None,
         catalog: None,
+        book_catalog: (channel == OrderBook)
+            .then(|| Arc::new(super::live::CatalogWatch::new(Arc::clone(&catalog)))),
         config: config.clone(),
         candle_cache_key,
     };
@@ -166,8 +174,10 @@ pub(super) async fn prepare_live(
     spec.url = pro.url(&spec).await?;
     spec.hash = venues::dispatch!(venue, exchange => exchange::stream::message_hash(&spec));
     topic.symbol = symbol;
-    let client_key = serde_json::to_string(&(&spec.key, (channel == OrderBook).then_some(levels)))
-        .map_err(|e| ExchangeError::Internal(e.to_string()))?;
+    let mode = BookAmountMode::parse(&topic.params)?;
+    let client_key =
+        serde_json::to_string(&(&spec.key, (channel == OrderBook).then_some((levels, mode))))
+            .map_err(|e| ExchangeError::Internal(e.to_string()))?;
     Ok(PreparedTopic {
         spec: Arc::new(spec),
         topic,

@@ -1,4 +1,6 @@
 //! Actual pinned stock acquisition/parsers over loopback HTTP and WebSocket.
+#[path = "kucoin/amounts.rs"]
+mod amounts;
 use axum::{
     extract::{
         ws::{Message as ServerMessage, WebSocketUpgrade},
@@ -139,7 +141,7 @@ async fn http(State(mock): State<Mock>, uri: Uri) -> axum::response::Response {
         }]})
     } else if path == "/api/v1/kline/query" {
         json!({"code":"200000","data":[[1700000000000i64,"67191","67210","67180","67200","10"]]})
-    } else if path == "/api/v1/level2/depth100" || path == "/api/v1/level2/depth20" {
+    } else if matches!(path, "/api/v1/level2/depth100" | "/api/v1/level2/depth20" | "/api/v1/level2/snapshot") {
         json!({"code":"200000","data":{
             "symbol": PERP_NATIVE, "sequence": 1,
             "asks": [["67192","1"],["67193","2"]], "bids": [["67190","2"],["67189","3"]],
@@ -825,9 +827,10 @@ async fn live_trades_candles_and_books_use_the_negotiated_url() {
                 rows.bids.iter().find(|(price, _)| *price == 67190.0),
                 Some(&(67190.0, 2.0))
             );
-            // The first cached update was sequence 2..3; seeing nonce 3
-            // proves the REST snapshot was replayed before publication.
-            assert_eq!(rows.nonce, Some(3));
+            // CCXT 4.5.92 can drain multiple buffered deltas before the first
+            // publication. It must have replayed the seed, without inventing a
+            // nonce beyond the injected sequence range.
+            assert!(rows.nonce.is_some_and(|nonce| (3..=8).contains(&nonce)));
             assert_eq!(
                 rows.asks.iter().find(|(price, _)| *price == 67192.0),
                 Some(&(67192.0, 1.0))

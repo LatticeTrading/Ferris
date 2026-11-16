@@ -9,6 +9,7 @@ use crate::{
         CcxtOhlcv, CcxtOrderBook, CcxtTrade, FetchOhlcvParams, FetchOrderBookParams,
         FetchTradesParams, UnifiedMarketType,
     },
+    orderbook::BookAmountMode,
 };
 
 use super::{
@@ -123,6 +124,9 @@ pub(super) fn validate_params(
     operation: Operation,
     params: &JsonValue,
 ) -> Result<(), ExchangeError> {
+    if operation == Operation::Book {
+        BookAmountMode::parse(params)?;
+    }
     let Some(params) = params.as_object() else {
         return if params.is_null() {
             Ok(())
@@ -137,7 +141,7 @@ pub(super) fn validate_params(
             "type" | "category" | "subType" | "settle" => true,
             "until" | "endTime" => matches!(operation, Operation::Trades | Operation::Ohlcv),
             "timeframe" | "interval" => operation == Operation::Ohlcv,
-            "levels" | "depth" | "limit" => operation == Operation::Book,
+            "levels" | "depth" | "limit" | "amountUnit" => operation == Operation::Book,
             _ => venues::dispatch!(venue, exchange => exchange::rest::allows(operation, key)),
         };
         if !allowed {
@@ -154,6 +158,7 @@ pub(super) async fn fetch_snapshot(
     venue: Venue,
     provider: &mut Provider,
     catalog: &Catalog,
+    catalog_timestamp: u64,
     request: SnapshotRequest,
 ) -> Result<SnapshotResponse, ExchangeError> {
     match request {
@@ -235,7 +240,10 @@ pub(super) async fn fetch_snapshot(
             Ok(SnapshotResponse::Ohlcv(candles))
         }
         SnapshotRequest::Book(request) => {
+            let mode = BookAmountMode::parse(&request.params)?;
             let market = catalog.resolve(&request.symbol, &request.params)?;
+            let policy = super::book::policy(venue, market, catalog_timestamp);
+            policy.validate_mode(mode)?;
             let max = venues::dispatch!(venue, exchange => exchange::rest::book_max(market));
             let requested = match request.limit {
                 Some(limit) => limit as u64,
@@ -254,10 +262,10 @@ pub(super) async fn fetch_snapshot(
                 ));
             }
             let raw = venues::dispatch!(venue, exchange => exchange::rest::book(provider, market, requested, &request.params).await)?;
-            let mut book = convert_book(raw, &market.ccxt_symbol)?;
+            let mut book = convert_book(raw, &market.ccxt_symbol)?.with_policy(policy);
             book.bids.truncate(requested as usize);
             book.asks.truncate(requested as usize);
-            Ok(SnapshotResponse::Book(book))
+            Ok(SnapshotResponse::Book(book.into_amount_mode(mode)?))
         }
     }
 }

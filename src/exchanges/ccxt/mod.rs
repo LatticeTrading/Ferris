@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+mod book;
 mod capabilities;
 mod catalog;
 mod convert;

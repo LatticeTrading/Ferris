@@ -213,7 +213,13 @@ async fn resolves_numeric_identity_shares_depths_batches_and_cleans_up_final_lea
     let mut mock = Mock::start(143).await;
     let e = mock.exchange(143);
     let mut a = sub(&e, RealtimeChannel::OrderBook, "BTC", json!({"levels":1})).await;
-    let mut b = sub(&e, RealtimeChannel::OrderBook, "42", json!({"depth":2})).await;
+    let mut b = sub(
+        &e,
+        RealtimeChannel::OrderBook,
+        "42",
+        json!({"depth":2,"amountUnit":"base"}),
+    )
+    .await;
     let mut t = sub(&e, RealtimeChannel::Trades, "BTC/AUSD:AUSD", json!({})).await;
     assert_ne!(a.key, b.key);
     assert_eq!(a.levels_limit, 1);
@@ -232,6 +238,13 @@ async fn resolves_numeric_identity_shares_depths_batches_and_cleans_up_final_lea
         assert_eq!(v.bids, vec![(100., 2.), (99., 3.)]);
         assert_eq!(v.nonce, Some(100));
         assert_eq!(v.timestamp, Some(123456));
+        let serialized = serde_json::to_value(&*v).unwrap();
+        assert_eq!(serialized["amountUnit"], "base");
+        assert_eq!(serialized["amountCurrency"], "BTC");
+        assert_eq!(
+            serialized["amountConversion"]["contractSizeApplied"],
+            Value::Null
+        );
     }
     // Late subscriber gets the maintained baseline without any network request.
     let mut late = sub(

@@ -102,6 +102,13 @@ impl Catalog {
         &self.entries
     }
 
+    /// Exact identity of an already-resolved live feed, without request defaults.
+    pub(super) fn by_ccxt_symbol(&self, symbol: &str) -> Option<&CatalogMarket> {
+        self.ccxt_symbols
+            .get(symbol)
+            .map(|index| &self.entries[*index])
+    }
+
     /// Resolve a client symbol to exactly one loaded market.
     ///
     /// Accepts CCXT symbols, native ids, Ferris market ids and public aliases.
