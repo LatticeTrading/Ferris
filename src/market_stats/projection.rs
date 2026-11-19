@@ -33,6 +33,7 @@ fn catalog_source(exchange: &str, _product: UnifiedMarketType, _params: &Value) 
         .unwrap_or(match exchange {
             "phoenix" => "phoenix:v1/view/exchange/markets",
             "perpl" => "perpl:v1/pub/context",
+            "txflow" => "txflow:info/perpMeta",
             "variational" => "variational:metadata/v2/stats",
             _ => "ccxt:loadMarkets",
         })

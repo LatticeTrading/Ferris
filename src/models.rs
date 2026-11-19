@@ -265,6 +265,10 @@ pub struct UnifiedMarketInfo {
     pub is_rfq: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_off_hours: Option<bool>,
+    /// Venue-native metadata preserved verbatim by native adapters (catalog
+    /// responses only; statistics rows omit it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

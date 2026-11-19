@@ -28,6 +28,19 @@ pub(crate) trait Protocol: Send + Sync + 'static {
     type Session: Session<Self::Spec>;
     fn capacity(&self) -> usize;
     fn session(&self) -> Self::Session;
+    /// Upper bound on concurrent upstream sockets for this hub. Venues with a
+    /// small per-IP connection budget (shared with other processes on the
+    /// host) override the generic cap.
+    fn max_connections(&self) -> usize {
+        MAX_CONNECTIONS
+    }
+    /// Client-initiated keepalive: `(interval, text frame)`, sent on its own
+    /// timer independent of reconcile traffic. For venues that close sockets
+    /// which send nothing (rather than relying on server pings). Sessions must
+    /// drop the corresponding pong frames themselves.
+    fn keepalive(&self) -> Option<(Duration, String)> {
+        None
+    }
 }
 pub(crate) trait Session<S>: Send {
     /// Reconcile desired leases, including native unsubscribe ACKs and rate
@@ -150,7 +163,7 @@ impl<P: Protocol> SharedHub<P> {
                 return Ok(receiver);
             }
         }
-        if hub.owners.len() >= MAX_CONNECTIONS {
+        if hub.owners.len() >= self.protocol.max_connections() {
             return Err(ExchangeError::UpstreamRequest(
                 "native realtime connection capacity reached".into(),
             ));
@@ -243,7 +256,7 @@ async fn run<P: Protocol>(
         let started = tokio::time::Instant::now();
         let result = tokio::select! {
             _ = stop.changed() => return,
-            result = session(&url, protocol.session(), &control, &changed) => result,
+            result = session(&url, protocol.session(), protocol.keepalive(), &control, &changed) => result,
         };
         let Err(error) = result else {
             return;
@@ -271,6 +284,7 @@ async fn run<P: Protocol>(
 async fn session<S: Send + Sync, T: Session<S>>(
     url: &str,
     mut protocol: T,
+    keepalive: Option<(Duration, String)>,
     control: &Mutex<Control<S>>,
     changed: &Notify,
 ) -> Result<(), String> {
@@ -292,8 +306,20 @@ async fn session<S: Send + Sync, T: Session<S>>(
     };
     let mut tick = tokio::time::interval(TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let (ping_every, ping_text) = match keepalive {
+        Some((every, text)) => (Some(every), text),
+        None => (None, String::new()),
+    };
+    // Without a keepalive the timer exists only for `select!` and is never polled.
+    let every = ping_every.unwrap_or(TICK);
+    let mut ping = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
+            _ = ping.tick(), if ping_every.is_some() => {
+                tokio::time::timeout(Duration::from_secs(5), socket.send(Message::Text(ping_text.clone()))).await
+                    .map_err(|_| "native websocket keepalive write timeout".to_string())?.map_err(|e| e.to_string())?;
+            },
             _ = changed.notified() => {
                 if desired(control).is_empty() {
                     let _ = tokio::time::timeout(Duration::from_secs(1), socket.close(None)).await;

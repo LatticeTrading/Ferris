@@ -1,0 +1,9 @@
+{"channel": "candle", "data": {"t": 1794877920000, "o": "64581.7", "h": "64662", "l": "64581.7", "c": "64662", "v": "0.0100", "n": 11, "s": "1", "i": "1m", "T": 1794877979999, "priceType": "last"}}
+{"channel": "subscriptionResponse", "data": {"method": "subscribe", "subscription": {"type": "candle", "coin": "1", "interval": "1m", "priceType": "last"}}}
+{"channel": "candle", "data": {"t": 1794877920000, "o": "64581.7", "h": "64662", "l": "64581.7", "c": "64660.3", "v": "0.0115", "n": 12, "s": "BTC", "i": "1m", "T": 1794877979999, "priceType": "last"}}
+{"channel": "pong"}
+{"channel": "candle", "data": {"t": 1794877920000, "o": "64581.7", "h": "64662", "l": "64581.7", "c": "64659.5", "v": "0.0122", "n": 14, "s": "BTC", "i": "1m", "T": 1794877979999, "priceType": "last"}}
+{"channel": "pong"}
+{"channel": "candle", "data": {"t": 1794877980000, "o": "64642.3", "h": "64642.3", "l": "64642.3", "c": "64642.3", "v": "0", "n": 0, "s": "BTC", "i": "1m", "T": 1794878039999, "priceType": "last"}}
+{"channel": "candle", "data": {"t": 1794877980000, "o": "64638.4", "h": "64638.4", "l": "64638.4", "c": "64638.4", "v": "0.0006", "n": 2, "s": "BTC", "i": "1m", "T": 1794878039999, "priceType": "last"}}
+{"channel": "pong"}

@@ -1,0 +1,372 @@
+{
+ "success": true,
+ "code": 0,
+ "data": {
+  "universe": [
+   {
+    "name": "BTC-USDC",
+    "currencyType": "usdc",
+    "baseCurrency": "BTC",
+    "quoteCurrency": "USDC",
+    "basePrecision": "0.0001",
+    "quotePrecision": "0.01",
+    "szDecimals": 4,
+    "maxLeverage": 75,
+    "tokens": [
+     2,
+     1
+    ],
+    "index": 1,
+    "priceTick": "0.1",
+    "pricePrecision": "0.1",
+    "bookTicks": [
+     "0.1",
+     "1",
+     "10"
+    ],
+    "maxLimitOrderSize": 1000,
+    "maxMarketOrderSize": 100,
+    "haltTrading": false,
+    "onlyIsolated": false,
+    "delisted": false,
+    "useNotionalMargin": true
+   },
+   {
+    "name": "ETH-USDC",
+    "currencyType": "usdc",
+    "baseCurrency": "ETH",
+    "quoteCurrency": "USDC",
+    "basePrecision": "0.001",
+    "quotePrecision": "0.01",
+    "szDecimals": 3,
+    "maxLeverage": 75,
+    "tokens": [
+     3,
+     1
+    ],
+    "index": 2,
+    "priceTick": "0.01",
+    "pricePrecision": "0.01",
+    "bookTicks": [
+     "0.01",
+     "0.1",
+     "1"
+    ],
+    "maxLimitOrderSize": 6000,
+    "maxMarketOrderSize": 2000,
+    "haltTrading": false,
+    "onlyIsolated": false,
+    "delisted": false,
+    "useNotionalMargin": true
+   },
+   {
+    "name": "DOGE-USDC",
+    "currencyType": "usdc",
+    "baseCurrency": "DOGE",
+    "quoteCurrency": "USDC",
+    "basePrecision": "10",
+    "quotePrecision": "0.01",
+    "szDecimals": -1,
+    "maxLeverage": 50,
+    "tokens": [
+     11,
+     1
+    ],
+    "index": 10,
+    "priceTick": "0.00001",
+    "pricePrecision": "0.00001",
+    "bookTicks": [
+     "0.00001",
+     "0.0001",
+     "0.001"
+    ],
+    "maxLimitOrderSize": 49700000,
+    "maxMarketOrderSize": 12000000,
+    "haltTrading": false,
+    "onlyIsolated": false,
+    "delisted": false,
+    "useNotionalMargin": false
+   },
+   {
+    "name": "TON-USDC",
+    "currencyType": "usdc",
+    "baseCurrency": "TON",
+    "quoteCurrency": "USDC",
+    "basePrecision": "1",
+    "quotePrecision": "0.01",
+    "szDecimals": 0,
+    "maxLeverage": 50,
+    "tokens": [
+     32,
+     1
+    ],
+    "index": 31,
+    "priceTick": "0.0001",
+    "pricePrecision": "0.0001",
+    "bookTicks": [
+     "0.0001",
+     "0.001",
+     "0.01"
+    ],
+    "maxLimitOrderSize": 3000000,
+    "maxMarketOrderSize": 40000,
+    "haltTrading": true,
+    "onlyIsolated": false,
+    "delisted": true,
+    "useNotionalMargin": false
+   },
+   {
+    "name": "1000BONK-USDC",
+    "currencyType": "usdc",
+    "baseCurrency": "1000BONK",
+    "quoteCurrency": "USDC",
+    "basePrecision": "100",
+    "quotePrecision": "0.01",
+    "szDecimals": -2,
+    "maxLeverage": 50,
+    "tokens": [
+     36,
+     1
+    ],
+    "index": 35,
+    "priceTick": "0.000001",
+    "pricePrecision": "0.000001",
+    "bookTicks": [
+     "0.000001",
+     "0.00001",
+     "0.0001"
+    ],
+    "maxLimitOrderSize": 40000000,
+    "maxMarketOrderSize": 6000000,
+    "haltTrading": false,
+    "onlyIsolated": false,
+    "delisted": false,
+    "useNotionalMargin": true
+   },
+   {
+    "name": "XAU-USDC",
+    "currencyType": "usdc",
+    "baseCurrency": "XAU",
+    "quoteCurrency": "USDC",
+    "basePrecision": "0.001",
+    "quotePrecision": "0.01",
+    "szDecimals": 3,
+    "maxLeverage": 60,
+    "tokens": [
+     52,
+     1
+    ],
+    "index": 51,
+    "priceTick": "0.01",
+    "pricePrecision": "0.01",
+    "bookTicks": [
+     "0.01",
+     "0.1",
+     "1"
+    ],
+    "maxLimitOrderSize": 10000,
+    "maxMarketOrderSize": 1000,
+    "haltTrading": false,
+    "onlyIsolated": false,
+    "delisted": false,
+    "useNotionalMargin": true
+   },
+   {
+    "name": "CL-USDC",
+    "currencyType": "usdc",
+    "baseCurrency": "CL",
+    "quoteCurrency": "USDC",
+    "basePrecision": "0.01",
+    "quotePrecision": "0.01",
+    "szDecimals": 2,
+    "maxLeverage": 25,
+    "tokens": [
+     54,
+     1
+    ],
+    "index": 53,
+    "priceTick": "0.01",
+    "pricePrecision": "0.01",
+    "bookTicks": [
+     "0.01",
+     "0.1",
+     "1"
+    ],
+    "maxLimitOrderSize": 285714,
+    "maxMarketOrderSize": 1000,
+    "haltTrading": false,
+    "onlyIsolated": false,
+    "delisted": false,
+    "useNotionalMargin": true
+   },
+   {
+    "name": "NG-USDC",
+    "currencyType": "usdc",
+    "baseCurrency": "NG",
+    "quoteCurrency": "USDC",
+    "basePrecision": "1",
+    "quotePrecision": "0.01",
+    "szDecimals": 0,
+    "maxLeverage": 15,
+    "tokens": [
+     56,
+     1
+    ],
+    "index": 55,
+    "priceTick": "0.001",
+    "pricePrecision": "0.001",
+    "bookTicks": [
+     "0.001",
+     "0.01",
+     "0.1"
+    ],
+    "maxLimitOrderSize": 6493500,
+    "maxMarketOrderSize": 50000,
+    "haltTrading": true,
+    "onlyIsolated": false,
+    "delisted": true,
+    "useNotionalMargin": false
+   },
+   {
+    "name": "TSLA-USDC",
+    "currencyType": "usdc",
+    "baseCurrency": "TSLA",
+    "quoteCurrency": "USDC",
+    "basePrecision": "0.01",
+    "quotePrecision": "0.01",
+    "szDecimals": 2,
+    "maxLeverage": 20,
+    "tokens": [
+     60,
+     1
+    ],
+    "index": 59,
+    "priceTick": "0.01",
+    "pricePrecision": "0.01",
+    "bookTicks": [
+     "0.01",
+     "0.1",
+     "1"
+    ],
+    "maxLimitOrderSize": 3000,
+    "maxMarketOrderSize": 300,
+    "haltTrading": false,
+    "onlyIsolated": false,
+    "delisted": false,
+    "useNotionalMargin": true
+   },
+   {
+    "name": "SPY-USDC",
+    "currencyType": "usdc",
+    "baseCurrency": "SPY",
+    "quoteCurrency": "USDC",
+    "basePrecision": "0.01",
+    "quotePrecision": "0.01",
+    "szDecimals": 2,
+    "maxLeverage": 20,
+    "tokens": [
+     81,
+     1
+    ],
+    "index": 80,
+    "priceTick": "0.01",
+    "pricePrecision": "0.01",
+    "bookTicks": [
+     "0.01",
+     "0.1",
+     "1"
+    ],
+    "maxLimitOrderSize": 32749,
+    "maxMarketOrderSize": 200,
+    "haltTrading": false,
+    "onlyIsolated": false,
+    "delisted": false,
+    "useNotionalMargin": true
+   },
+   {
+    "name": "PEPE-USDC",
+    "currencyType": "usdc",
+    "baseCurrency": "PEPE",
+    "quoteCurrency": "USDC",
+    "basePrecision": "100000",
+    "quotePrecision": "0.01",
+    "szDecimals": -5,
+    "maxLeverage": 40,
+    "tokens": [
+     147,
+     1
+    ],
+    "index": 146,
+    "priceTick": "0.000000001",
+    "pricePrecision": "0.000000001",
+    "bookTicks": [
+     "0.000000001",
+     "0.00000001",
+     "0.0000001"
+    ],
+    "maxLimitOrderSize": 1000000000000,
+    "maxMarketOrderSize": 100000000000,
+    "haltTrading": false,
+    "onlyIsolated": false,
+    "delisted": false,
+    "useNotionalMargin": false
+   },
+   {
+    "name": "OPENAI-USDC",
+    "currencyType": "usdc",
+    "baseCurrency": "OPENAI",
+    "quoteCurrency": "USDC",
+    "basePrecision": "0.01",
+    "quotePrecision": "0.01",
+    "szDecimals": 2,
+    "maxLeverage": 20,
+    "tokens": [
+     185,
+     1
+    ],
+    "index": 184,
+    "priceTick": "0.01",
+    "pricePrecision": "0.01",
+    "bookTicks": [
+     "0.01",
+     "0.1",
+     "1"
+    ],
+    "maxLimitOrderSize": 4000,
+    "maxMarketOrderSize": 400,
+    "haltTrading": false,
+    "onlyIsolated": false,
+    "delisted": false,
+    "useNotionalMargin": true
+   },
+   {
+    "name": "EURUSD-USDC",
+    "currencyType": "usdc",
+    "baseCurrency": "EURUSD",
+    "quoteCurrency": "USDC",
+    "basePrecision": "1",
+    "quotePrecision": "0.01",
+    "szDecimals": 0,
+    "maxLeverage": 50,
+    "tokens": [
+     241,
+     1
+    ],
+    "index": 240,
+    "priceTick": "0.0001",
+    "pricePrecision": "0.0001",
+    "bookTicks": [
+     "0.0001",
+     "0.001",
+     "0.01"
+    ],
+    "maxLimitOrderSize": 300000,
+    "maxMarketOrderSize": 50000,
+    "haltTrading": false,
+    "onlyIsolated": false,
+    "delisted": false,
+    "useNotionalMargin": true
+   }
+  ]
+ }
+}

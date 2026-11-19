@@ -32,6 +32,7 @@ pub(in crate::exchanges::ccxt) fn market(
             exchange_symbol: None,
             is_rfq: None,
             is_off_hours: None,
+            native: None,
         },
         identity: Some(crate::models::MarketIdentity {
             market_id: format!("test:{base}/{quote}"),

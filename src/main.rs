@@ -12,6 +12,7 @@ use ferris_market_data_backend::{
         perpl::PerplExchange,
         phoenix::PhoenixExchange,
         registry::ExchangeRegistry,
+        txflow::TxflowExchange,
         variational::VariationalExchange,
     },
     realtime::RealtimeService,
@@ -43,6 +44,7 @@ async fn main() -> anyhow::Result<()> {
     let ccxt = CcxtService::start(&config).context("failed to start CCXT owners")?;
     let phoenix = Arc::new(PhoenixExchange::new().context("failed to start Phoenix adapter")?);
     let perpl = Arc::new(PerplExchange::new().context("failed to start Perpl adapter")?);
+    let txflow = Arc::new(TxflowExchange::new().context("failed to start TxFlow adapter")?);
 
     let mut registry = ExchangeRegistry::new();
     for venue in Venue::ALL {
@@ -50,13 +52,15 @@ async fn main() -> anyhow::Result<()> {
     }
     registry.register(phoenix.clone());
     registry.register(perpl.clone());
+    registry.register(txflow.clone());
     registry.register(Arc::new(
         VariationalExchange::new().context("failed to start Variational adapter")?,
     ));
 
     let realtime = RealtimeService::new(ccxt.clone())
         .with_native(phoenix)
-        .with_native(perpl);
+        .with_native(perpl)
+        .with_native(txflow);
 
     let state = AppState::new(Arc::new(registry), realtime);
 

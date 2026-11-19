@@ -72,6 +72,7 @@ pub(super) fn convert_market(
             exchange_symbol: Some(exchange_market_id),
             is_rfq: json_bool(raw_info, "isRfq"),
             is_off_hours: json_bool(raw_info, "isOffHours"),
+            native: None,
         },
         identity: Some(identity),
     };

@@ -46,10 +46,10 @@ Frontend apps (including Electron and web frontends) often cannot directly use s
 - Realtime endpoint:
   - `GET /v1/ws` (channels `trades`, `orderbook`, `ohlcv`, `marketstats`)
 - Realtime channel support:
-  - `trades`: `hyperliquid`, `binance`, `bybit`, `aster`, `extended`, `lighterxyz`, `apex`, `bitfinex`, `kucoin`, `nado`, `phoenix`, `perpl` (Nado production handshake blocked; see below)
-  - `orderbook`: `hyperliquid`, `binance`, `bybit`, `aster`, `extended`, `lighterxyz`, `apex`, `bitfinex`, `kucoin`, `phoenix`, `perpl`
-  - `ohlcv`: `hyperliquid`, `binance`, `bybit`, `aster`, `extended`, `apex`, `bitfinex`, `kucoin`, `nado`, `phoenix`, `perpl` (Nado production handshake blocked; see below)
-  - `marketstats`: `hyperliquid`, `binance`, `bybit`, `extended`, `aster`, `apex`, `bitfinex` (`sharedPolling`), `lighterxyz` (`sharedPollingAndWebSocket`), `kucoin`, `nado` (`sharedPolling`), `variational` (`sharedPolling`), `phoenix` (`sharedPolling`)
+  - `trades`: `hyperliquid`, `binance`, `bybit`, `aster`, `extended`, `lighterxyz`, `apex`, `bitfinex`, `kucoin`, `nado`, `phoenix`, `perpl`, `txflow` (Nado production handshake blocked; see below)
+  - `orderbook`: `hyperliquid`, `binance`, `bybit`, `aster`, `extended`, `lighterxyz`, `apex`, `bitfinex`, `kucoin`, `phoenix`, `perpl`, `txflow`
+  - `ohlcv`: `hyperliquid`, `binance`, `bybit`, `aster`, `extended`, `apex`, `bitfinex`, `kucoin`, `nado`, `phoenix`, `perpl`, `txflow` (Nado production handshake blocked; see below)
+  - `marketstats`: `hyperliquid`, `binance`, `bybit`, `extended`, `aster`, `apex`, `bitfinex` (`sharedPolling`), `lighterxyz` (`sharedPollingAndWebSocket`), `kucoin`, `nado` (`sharedPolling`), `variational` (`sharedPolling`), `phoenix` (`sharedPolling`), `txflow` (`sharedWebSocketCache`, polled locally)
 - exchange supported:
   - `hyperliquid` (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`, `fetchMarkets`, `fetchMarketStats`)
   - `binance` (`fetchTrades`, `fetchOHLCV`, `fetchOrderBook`, `fetchMarkets`, `fetchMarketStats`)
@@ -63,6 +63,7 @@ Frontend apps (including Electron and web frontends) often cannot directly use s
   - `phoenix` Eternal perpetuals: native `fetchMarkets`, `fetchTickers`, `fetchTrades`, `fetchOHLCV`, `fetchOrderBook`, and exchange-snapshot-backed market stats; ticker prices use a shared `allMids` WebSocket subscription and are explicitly mid-prices, with open interest from the bulk exchange snapshot. Funding, 24h volume, mark/index prices in bulk stats, and last price remain unavailable. Market symbols accept `BASE`, `BASE/USD`, and `BASE/USD:USD` and display as `BASE/USD`.
   - `variational` perpetual and swap listings: `fetchMarkets` and polling-backed `fetchMarketStats`
   - `perpl` isolated perpetuals: native `fetchMarkets`, bulk `fetchTickers`, OHLCV, L2 order books (maximum 100 levels), polling-backed market stats, and shared native realtime trades, books, and candles. Runtime catalog metadata supplies numeric market IDs and decimal scales; REST trade history remains explicitly unsupported.
+  - `txflow` perpetuals (spot and outcome markets are out of scope): native `fetchMarkets`, `fetchTickers`, `fetchTrades` (latest 300), `fetchOHLCV`, `fetchOrderBook` (maximum 20 levels), market stats, and shared native realtime trades, books (up to 200 levels), and candles; see [TxFlow native contract](#txflow-native-contract).
   - market-data only (no private trading endpoints yet)
 - For Extended RFQ markets (`info.isRfq: true`), the standard REST and websocket books are indicative, not the RFQ real-book stream. Ordinary order-book markets are distinct; this is not an exchange-wide liquidity limitation. Spot, private trading/account, funding history, and account streams are not supported.
 - Extended REST and websocket URLs are configurable for testnet deployments.
@@ -112,6 +113,22 @@ Book display depth uses top-level `limit`, then `params.levels`, `depth`, `limit
 - `market-state@chain` is all-market. Native WS statistics are intentionally deferred: marketstats remains shared bulk REST polling (30s), with Ferris snapshot/delta delivery. REST trade history, private/account streams, RPC and SDK sources remain unsupported.
 
 Protocol tests use deterministic peers based on [Perpl API docs](https://github.com/PerplFoundation/api-docs/blob/main/websocket.md). The public protocol does not establish continuous book sequence numbers. Unsubscribe acknowledgement and snapshot-before/after-ACK ordering should be reconfirmed against production when the upstream contract changes; no live-production continuity guarantee is implied.
+
+## TxFlow native contract
+
+TxFlow's API resembles Hyperliquid's but is not compatible with it, so it has its own native adapter rather than a CCXT path. Every `/info` request sends `x-api-version: 2026-08-16`, and responses must carry the `{success, code, data}` envelope. Requests use the catalog's numeric instrument id; the `coin` names in responses vary by endpoint and are never used as keys.
+
+- Symbols are `BASE/USDC:USDC`. `BASE`, the native `BASE-USDC`, and the numeric id are accepted aliases. Spot-shaped input (`BASE/USDC`) and spot ids (>= 10000) are rejected with `BAD_SYMBOL`, even though upstream serves spot data for them.
+- The catalog (`perpMeta`) is cached for 5 minutes and the last good copy is kept if a refresh fails. Ticks and size steps stay exact decimals; negative `szDecimals` (e.g. PEPE, size step 100000) are supported. Halted markets that are still listed remain `active`; `info.native.haltTrading` exposes the halt. Only delisted markets are inactive. `info.native` holds the raw `perpMeta` row.
+- `info.category` is a display-only asset-class label from `marketTags`: `stock`, `index`, `commodity`, `fx`, `pre-ipo`, or `crypto`. Unknown or conflicting tags give no label, and a `marketTags` failure keeps the last good labels. The label never changes `marketId`, identity, or stats selection.
+- Tickers and market stats come from one shared `/ws allAssetCtxs` subscription. It starts lazily and is released after 5 minutes without readers. Nothing makes per-market REST calls. Market stats publish mark, oracle (as index), last, base-unit open interest, and current funding in **percent** per settlement interval. The interval comes from each market's `prevFundingTime`/`nextFundingTime`. 24h volume and last settled funding are `unsupported`, because TxFlow has no bulk volume source and no public market funding history. Tickers have no bid/ask (`impactPxs` are impact prices, not top of book) and no volume or 24h change.
+- REST trades are the latest 300, sorted oldest first, with no history paging. **REST and WebSocket trade ids are different id spaces:** the same fill has a different `tid` in each, contrary to TxFlow's docs. Ferris keeps each source's native id; clients that merge the two must dedupe by content (time, price, size, side). Realtime trades publish live fills only, with no snapshot.
+- REST books are capped at 20 levels; `limit` 0 or above 20 is rejected, never clamped. Realtime books use `l2BookDepth` (snapshot plus sequenced deltas, 200 levels; `levels` 1–200, default 200). A delta whose `prevSeq` doesn't continue from the last `seq` invalidates the feed and triggers unsubscribe and resubscribe for a fresh snapshot. The server also sends unsolicited snapshots, which replace the book. If no snapshot arrives within 10 seconds of a resubscribe, the socket reconnects.
+- OHLCV supports `1m 3m 5m 15m 30m 1h 2h 4h 8h 12h 1d`, checked locally. REST pages are at most 2500 bars, because upstream returns an empty success above 3000. Realtime candles (`/api-ws candle`) publish the bars seen since subscription, replacing the current bar in place; use `fetchOHLCV` for history.
+- One multiplexed socket per endpoint (`/ws`, `/api-ws`), capped at 2 per endpoint, because the per-IP budget is 10 and other processes on the host share it. Control frames go out at most every 200 ms. A JSON ping every 10 s keeps quiet sockets alive past TxFlow's ~16 s idle close. Any upstream `error` frame, including `RISK_RATE_LIMITED`, rebuilds the session after backoff, because `/ws` has no acknowledgement to show which frame was dropped.
+- Configure with `TXFLOW_API_URL`, `TXFLOW_WS_URL`, `TXFLOW_API_WS_URL`, and `TXFLOW_NETWORK`. The network is derived from known hosts. Startup fails if the URLs belong to different networks. Every cache and topic key includes the network and endpoints.
+
+Protocol tests (`tests/txflow.rs`) replay mainnet captures from 2026-11-17 (`tests/fixtures/txflow/`) against local peers.
 
 ## CCXT realtime contract
 
@@ -810,6 +827,10 @@ Defaults:
 - `PERPL_API_URL` (default: `https://app.perpl.xyz/api`; use the testnet API URL and `PERPL_CHAIN_ID=10143` together for testnet)
 - `PERPL_CHAIN_ID` (default: `143`, or `10143` for the testnet API host; catalog identity is rejected when the context chain differs)
 - `PERPL_WS_URL` (default: `wss://app.perpl.xyz/ws/v1/market-data`, or the testnet host for chain `10143`; a host-only URL also gets the market-data path)
+- `TXFLOW_API_URL` (default: `https://rpc.txflow.com`; testnet `https://rpc.txflow-testnet.xyz`)
+- `TXFLOW_WS_URL` (default: the network's `wss://…/ws`)
+- `TXFLOW_API_WS_URL` (default: the network's `wss://…/api-ws`)
+- `TXFLOW_NETWORK` (`mainnet` | `testnet`; derived from the API host, required for custom hosts; mixed-network URLs fail at startup)
 - `REQUEST_TIMEOUT_MS` (default: `10000`)
 - `RUST_LOG` (default: `info`)
 - `LIGHTER_REST_BASE_URL` (default: `https://mainnet.zklighter.elliot.ai`; CCXT catalog, snapshots, and statistics polling)
