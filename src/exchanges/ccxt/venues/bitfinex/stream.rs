@@ -146,4 +146,50 @@ impl Protocol for BitfinexControl {
             _ => Incoming::Other,
         }
     }
+    /// Workaround for ccxt 4.5.93 (still on master at 82b5d53fe): stock
+    /// `handle_ohlcv` takes the market ID as `key.split(':')[2]`, truncating
+    /// IDs that contain a colon (every perp such as `tBTCF0:USTF0`, and spot
+    /// pairs such as `tAVAX:USD`). Those candles then resolve
+    /// `candles:1D:tBTCF0` and land in another market's cache, so no watcher
+    /// ever sees them. For exactly those IDs, run stock's own steps (stock
+    /// `parse_ohlcv`, stock cache) with the full ID. Colon-free IDs stay on
+    /// stock. Delete once upstream restores the full key tail.
+    fn handle_data(core: &mut Self::Core, topic: &str, message: &Value) -> Option<Value> {
+        use ccxt::{exchange_generated::ExchangeBase, pro::cache::ArrayCacheByTimestamp};
+        let (interval, id) = topic.strip_prefix("candles:")?.split_once(':')?;
+        if !id.contains(':') {
+            return None;
+        }
+        let data = message.as_array()?.get(1)?.as_array()?;
+        // Snapshot: newest-first list of rows. Update: a single row.
+        let rows: Vec<Value> = if data.first().is_some_and(|row| row.as_array().is_some()) {
+            data.to_vec()
+        } else {
+            vec![Value::from(data.to_vec())]
+        };
+        let market = core.safe_market(&[Value::from(id)]);
+        let symbol = ccxt::value::get_value_k(&market, "symbol");
+        let timeframe = core.find_timeframe(Value::from(interval), &[]);
+        if symbol.as_str().is_none() || timeframe.as_str().is_none() {
+            return None;
+        }
+        let mut by_timeframe = ccxt::get_value(&core.ohlcvs, &symbol);
+        if by_timeframe.as_map().is_none() {
+            by_timeframe = Value::from_json(&json!({}));
+        }
+        let mut stored = ccxt::get_value(&by_timeframe, &timeframe);
+        if stored == Value::Null {
+            let limit = core.safe_integer_k(core.options.clone(), "OHLCVLimit", &[Value::Int(1000)]);
+            stored = ArrayCacheByTimestamp::new(limit);
+            ccxt::set_value(&mut by_timeframe, &timeframe, stored.clone());
+        }
+        if core.ohlcvs.as_map().is_none() {
+            core.ohlcvs = Value::from_json(&json!({}));
+        }
+        ccxt::set_value(&mut core.ohlcvs, &symbol, by_timeframe);
+        for row in rows.into_iter().rev() {
+            stored.append(ExchangeBase::parse_ohlcv(&*core, row, &[market.clone()]));
+        }
+        Some(stored)
+    }
 }

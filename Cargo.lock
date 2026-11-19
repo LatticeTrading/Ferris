@@ -274,9 +274,9 @@ dependencies = [
 
 [[package]]
 name = "ccxt"
-version = "4.5.92"
+version = "4.5.93"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a0c87b116910d135d8954bd2c06860fa7c8463bea1efd10893e4ccaf7bf432e9"
+checksum = "2ed87a48e84d3390cbac86aa32db3534908add6821f28c4328962bb79d6957d7"
 dependencies = [
  "async-trait",
  "ccxt-base",
@@ -284,9 +284,9 @@ dependencies = [
 
 [[package]]
 name = "ccxt-base"
-version = "4.5.92"
+version = "4.5.93"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "918228630d42f8da44fc6375e4d4b363458da9a012180fe64916640a972a09a4"
+checksum = "67f68484066a7db35f6e80c7234ae0b6c72c911b942705c56aac2957e5c02b18"
 dependencies = [
  "ccxt-common",
  "futures",
@@ -295,9 +295,9 @@ dependencies = [
 
 [[package]]
 name = "ccxt-common"
-version = "4.5.92"
+version = "4.5.93"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c1b57dc10d3bab4f6d82819c34d634b50d7da2f73db3222a1e3346089e9d51c5"
+checksum = "4421f282e2373974d7f6fad4223a6f9d2cf61b93d929361be9549358cd53c0d9"
 dependencies = [
  "async-trait",
  "base64",
@@ -305,24 +305,18 @@ dependencies = [
  "ed25519-dalek",
  "flate2",
  "futures",
- "hex",
  "hmac",
  "indexmap",
  "k256",
  "md-5",
  "num-bigint",
  "num-traits",
- "once_cell",
- "rand 0.8.5",
  "reqwest",
- "rmpv",
  "rsa",
- "rust_decimal",
  "serde_json",
  "sha1",
  "sha2",
  "sha3",
- "thiserror 1.0.69",
  "tokio",
  "tokio-tungstenite",
  "url",
@@ -330,9 +324,9 @@ dependencies = [
 
 [[package]]
 name = "ccxt-pro"
-version = "4.5.92"
+version = "4.5.93"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbc30e025187d61247df15b2ccd5bd7c31a9b1c848db3faf3bcc8328ce96c7ac"
+checksum = "dc986b51e3eee774d587e231be7e45ca22341b3f4fec1d9a09bdf7ff2a86fac3"
 dependencies = [
  "async-trait",
  "ccxt-base",
@@ -361,7 +355,6 @@ dependencies = [
  "iana-time-zone",
  "js-sys",
  "num-traits",
- "serde",
  "wasm-bindgen",
  "windows-link",
 ]
@@ -798,12 +791,6 @@ name = "hashbrown"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
-
-[[package]]
-name = "hex"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hmac"
@@ -1697,24 +1684,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rmp"
-version = "0.8.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ba8be72d372b2c9b35542551678538b562e7cf86c3315773cae48dfbfe7790c"
-dependencies = [
- "num-traits",
-]
-
-[[package]]
-name = "rmpv"
-version = "1.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a4e1d4b9b938a26d2996af33229f0ca0956c652c1375067f0b45291c1df8417"
-dependencies = [
- "rmp",
-]
-
-[[package]]
 name = "rsa"
 version = "0.9.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2172,7 +2141,6 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
- "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2",

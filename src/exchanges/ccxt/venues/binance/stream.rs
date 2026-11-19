@@ -117,12 +117,16 @@ pub(in crate::exchanges::ccxt) async fn url(
             }
             LiveChannel::Statistics => unreachable!("statistics is Lighter-only"),
         };
+        // 4.5.93 returns `Option<String>` and an empty string for an unknown
+        // kind; keep the pre-4.5.93 `Null` for a missing URL.
         core.get_ws_url(
             Value::from(kind),
             core.get_future_ws_category(Value::from(name))
                 .map(Value::from)
                 .unwrap_or(Value::Null),
         )
+        .filter(|url| !url.is_empty())
+        .map_or(Value::Null, Value::from)
     })
 }
 

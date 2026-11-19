@@ -625,6 +625,16 @@ async fn run_session(
     }
     let url = url.as_str();
     provider.bind_url(url);
+    // Dial before the reconcile loop: its select! cancels `ws_run`, which in
+    // ccxt 4.5.93 must never happen mid-dial (see `LiveProvider::connect`).
+    let connected = tokio::select! {
+        biased;
+        _ = stop.changed() => return SessionExit::Stop,
+        result = provider.connect(url) => result,
+    };
+    if let Err(error) = connected {
+        return SessionExit::Reconnect(error);
+    }
     let mut active: HashMap<String, ActiveFeed> = HashMap::new();
     let mut retiring: HashMap<String, RetiringFeed> = HashMap::new();
     let mut cache_routes: HashMap<i64, String> = HashMap::new();

@@ -104,6 +104,13 @@ pub(in crate::exchanges::ccxt) trait Protocol: Send {
     fn replay_book_delta(_core: &mut Self::Core, _orderbook: Value, _delta: Value) {
         panic!("buffered book replay has no stock delta dispatcher");
     }
+
+    /// Escape hatch for a stock data handler that is broken upstream: return
+    /// the value to resolve on the held subscription hash to bypass stock for
+    /// this routed message. The default (`None`) leaves stock in charge.
+    fn handle_data(_core: &mut Self::Core, _topic: &str, _message: &Value) -> Option<Value> {
+        None
+    }
 }
 
 struct Held {
@@ -317,7 +324,18 @@ impl<C: ExchangeBase, P: Protocol<Core = C>> Controlled<C, P> {
             Incoming::RoutedData { id, snapshot } => {
                 if let Some((topic, _)) = self.routes.get(&id) {
                     let topic = topic.clone();
-                    self.data(&topic, snapshot)
+                    if self.data(&topic, snapshot) {
+                        return true;
+                    }
+                    let Some(value) = P::handle_data(&mut self.core, &topic, message) else {
+                        return false;
+                    };
+                    // `data` returned false, so the topic is held and live.
+                    let hash = &self.held[&topic].subscription.hash;
+                    if let Some(client) = ccxt_pro::pro::ws_client::get_client(&self.url) {
+                        client.resolve(hash, value);
+                    }
+                    true
                 } else {
                     if !self.seen_ids.contains(&id) {
                         // Without the subscribe ACK there is no safe way to route
@@ -454,8 +472,12 @@ impl<C: ExchangeBase, P: Protocol<Core = C>> ExchangeBase for Controlled<C, P> {
                 }
                 return Value::Null;
             }
-            if method == "handle_message"
-                && args.get(1).is_some_and(|message| self.intercept(message))
+            // Since ccxt 4.5.93 the base router dispatches each inbound frame
+            // by shape (object, JSON array, text); every one must be seen here.
+            if matches!(
+                method,
+                "handle_message" | "handle_list_message" | "handle_text_message"
+            ) && args.get(1).is_some_and(|message| self.intercept(message))
             {
                 return Value::Null;
             }

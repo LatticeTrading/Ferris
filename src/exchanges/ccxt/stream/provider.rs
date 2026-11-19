@@ -168,6 +168,43 @@ impl LiveProvider {
         }
     }
 
+    /// Dial `url` exactly as stock `ws_run` would (same proxy, upgrade headers
+    /// and binary decompression), so the session's cancellable `ws_run` calls
+    /// find the socket already connected.
+    ///
+    /// ccxt 4.5.93 `ensure_client` is not cancel-safe: it claims the dial with
+    /// a `connecting` flag that only its error paths clear. Dropping `ws_run`
+    /// mid-dial (our `select!` does on every subscription change) strands the
+    /// claim and every later `ws_run` on that URL waits forever. Only shutdown
+    /// may cancel this call, and the worker then drops the slot anyway.
+    pub(in crate::exchanges::ccxt) async fn connect(&self, url: &str) -> Result<(), ExchangeError> {
+        let (proxy, headers, decompress) = dispatch!(self, core => {
+            let proxy = [&core.wsProxy, &core.ws_proxy, &core.wssProxy]
+                .into_iter()
+                .find_map(|v| v.as_str().filter(|s| !s.is_empty()).map(str::to_owned));
+            let decompress = ccxt::get_value(&core.options, &Value::from("decompressBinary"))
+                != Value::Bool(false);
+            let headers = field(&core.options, &["ws", "options", "headers"]);
+            (proxy, headers, decompress)
+        });
+        let headers: Vec<(String, String)> = headers
+            .as_map()
+            .map(|map| {
+                map.iter()
+                    .filter_map(|(key, value)| match value {
+                        Value::Str(s) => Some((key.clone(), s.to_string())),
+                        Value::Int(n) => Some((key.clone(), n.to_string())),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        ccxt_pro::pro::ws_client::ensure_client_with_headers(url, &headers, proxy, decompress)
+            .await
+            .map(drop)
+            .map_err(ExchangeError::UpstreamRequest)
+    }
+
     pub(super) fn slots(&self, spec: &LiveSpec) -> Result<Option<usize>, ExchangeError> {
         match self {
             Self::Binance(core) => venues::binance::stream::slots(core, spec),
